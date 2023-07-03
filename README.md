@@ -12,7 +12,7 @@ export VOL=DEMOF12
 export IMG=demof12.fat
 
 rm $IMG
-mformat -f 720 -v KOIDOS -C -i $IMG ::
+mformat -f 720 -v $VOL -C -i $IMG ::
 
 echo "hello world" > hello.txt
 mcopy -i $IMG hello.txt main.c ::

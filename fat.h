@@ -4,7 +4,10 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdio.h>
 
+// structs
+//
 // // FAT32
 // typedef struct {
 //     // extended fat32 stuff
@@ -74,5 +77,8 @@ typedef struct DirectoryEntry {
     unsigned short startingClusterNumber;
     unsigned int fileSize;
 } __attribute__((packed)) DirectoryEntry;
+
+// functions
+bool init_fat_info(FILE* fp /* in */, FatBS* bs /* out */);
 
 #endif

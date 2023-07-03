@@ -152,10 +152,7 @@ void dump(uint8_t* p, int offset, int len) {
 }
 
 int main() {
-    char fat_path[128];
-    /* sprintf(fat_path, "%s/%s", getenv("HOME"), */
-    /*         "koidos.fat"); */
-    strcpy(fat_path, "demof12.fat");
+    char *fat_path = "demof12.fat";
     FILE* fp = fopen(fat_path, "rb");
     if (fp == NULL) {
         printf("failed to open the fat image '%s'.\n", fat_path);

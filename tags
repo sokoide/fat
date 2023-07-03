@@ -1,0 +1,18 @@
+!_TAG_FILE_SORTED	2	/0=unsorted, 1=sorted, 2=foldcase/
+center	/Users/scott/Library/CloudStorage/OneDrive-Personal/workspace/c/c99/main.c	/^Point center(const Point* p1, const Point* p2) {$/;"	f	language:C++
+COMMONFILES	/Users/scott/Library/CloudStorage/OneDrive-Personal/workspace/c/c99/Makefile	/^COMMONFILES =$/;"	m	language:Make
+CXX	/Users/scott/Library/CloudStorage/OneDrive-Personal/workspace/c/c99/Makefile	/^CXX = clang$/;"	m	language:Make
+CXXFLAGS	/Users/scott/Library/CloudStorage/OneDrive-Personal/workspace/c/c99/Makefile	/^CXXFLAGS = -std=c99 -Wall -g -I.$/;"	m	language:Make
+HEADERS	/Users/scott/Library/CloudStorage/OneDrive-Personal/workspace/c/c99/Makefile	/^HEADERS :=  $(shell find . -type f -name '*.h')$/;"	m	language:Make
+is_even	/mnt/c/Users/Scott/OneDrive/workspace/c/c99/main.c	/^bool is_even(int a) { return a % 2 == 0; }$/;"	f	language:C++
+is_even	/Users/scott/Library/CloudStorage/OneDrive-Personal/workspace/c/c99/main.c	/^bool is_even(int a) { return a % 2 == 0; }$/;"	f	language:C++
+main	/mnt/c/Users/Scott/OneDrive/workspace/c/c99/main.c	/^	int main() {$/;"	f	language:C++
+main	/Users/scott/Library/CloudStorage/OneDrive-Personal/workspace/c/c99/main.c	/^int main() {$/;"	f	language:C++
+OBJS	/Users/scott/Library/CloudStorage/OneDrive-Personal/workspace/c/c99/Makefile	/^OBJS = $(SRCS:.c=.o)$/;"	m	language:Make
+OUTDIR	/Users/scott/Library/CloudStorage/OneDrive-Personal/workspace/c/c99/Makefile	/^OUTDIR = ~\/tmp\/hoge$/;"	m	language:Make
+OUTOBJS	/Users/scott/Library/CloudStorage/OneDrive-Personal/workspace/c/c99/Makefile	/^OUTOBJS = $(addprefix $(OUTDIR)\/,$(OBJS))$/;"	m	language:Make
+Point	/Users/scott/Library/CloudStorage/OneDrive-Personal/workspace/c/c99/main.c	/^} Point;$/;"	t	language:C++	typeref:struct:__anon1	file:
+SRCS	/Users/scott/Library/CloudStorage/OneDrive-Personal/workspace/c/c99/Makefile	/^SRCS = main.c$/;"	m	language:Make
+TARGET	/Users/scott/Library/CloudStorage/OneDrive-Personal/workspace/c/c99/Makefile	/^TARGET = c99$/;"	m	language:Make
+x	/Users/scott/Library/CloudStorage/OneDrive-Personal/workspace/c/c99/main.c	/^    int x;$/;"	m	language:C++	struct:__anon1	file:
+y	/Users/scott/Library/CloudStorage/OneDrive-Personal/workspace/c/c99/main.c	/^    int y;$/;"	m	language:C++	struct:__anon1	file:

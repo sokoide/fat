@@ -155,12 +155,13 @@ int main() {
     char fat_path[128];
     /* sprintf(fat_path, "%s/%s", getenv("HOME"), */
     /*         "koidos.fat"); */
-    strcpy(fat_path, "koidos.fat");
+    strcpy(fat_path, "demof12.fat");
     FILE* fp = fopen(fat_path, "rb");
     if (fp == NULL) {
         printf("failed to open the fat image '%s'.\n", fat_path);
         return 1;
     }
+
 
     uint8_t* buffer = malloc(1024 * 1024 + 1); // 1MB
     check_null(buffer);
@@ -170,27 +171,27 @@ int main() {
     // ref: https://free.pjc.co.jp/fat/mem/fatm122.html
     // FAT12
     FatBS* p = (FatBS*)buffer;
-    printf("bytes_per_sector: %d\n", p->bytes_per_sector);
-    printf("sectors_per_cluster: %d\n", p->sectors_per_cluster);
+    printf("bytesPerSector: %d\n", p->bytesPerSector);
+    printf("sectorsPerCluster: %d\n", p->sectorsPerCluster);
     // 1st FAT table's sector
-    printf("reserved_sector_count: %d\n", p->reserved_sector_count);
+    printf("reservedSectorCount: %d\n", p->reservedSectorCount);
     // count of FAT tables
-    printf("table_count: %d\n", p->table_count);
-    printf("root_entry_count: %d\n", p->root_entry_count);
-    int root_dir_sector_count = p->root_entry_count * 32 / p->bytes_per_sector;
-    printf("total_sectors: %d\n", p->total_sectors_16);
+    printf("tableCount: %d\n", p->tableCount);
+    printf("rootEntryCount: %d\n", p->rootEntryCount);
+    int root_dir_sector_count = p->rootEntryCount * 32 / p->bytesPerSector;
+    printf("total_sectors: %d\n", p->totalSectors16);
     // cout of FAT table sectors
-    printf("table_size_16: %d\n", p->table_size_16);
+    printf("tableSize16: %d\n", p->tableSize16);
 
 
-    int fat_start_sector = p->reserved_sector_count;
-    int fat_sectors = p->table_size_16 * p->table_count;
+    int fat_start_sector = p->reservedSectorCount;
+    int fat_sectors = p->tableSize16 * p->tableCount;
     int root_dir_start_sector = fat_start_sector + fat_sectors;
-    int root_dir_sectors = (sizeof(DirectoryEntry) * p->root_entry_count + p->bytes_per_sector -1)/ p->bytes_per_sector;
-    int root_dir_start_addr = root_dir_start_sector * p->bytes_per_sector;
+    int root_dir_sectors = (sizeof(DirectoryEntry) * p->rootEntryCount + p->bytesPerSector -1)/ p->bytesPerSector;
+    int root_dir_start_addr = root_dir_start_sector * p->bytesPerSector;
     int data_start_sector = root_dir_start_sector + root_dir_sectors;
-    int data_sectors = p->total_sectors_16 - data_start_sector;
-    int data_start_addr = data_start_sector * p->bytes_per_sector;
+    int data_sectors = p->totalSectors16 - data_start_sector;
+    int data_start_addr = data_start_sector * p->bytesPerSector;
     printf("* fat start_sector %d\n", fat_start_sector);
     printf("* fat sectors %d\n", fat_sectors);
     printf("* root_dir start_sector %d\n", root_dir_start_sector);
@@ -202,10 +203,10 @@ int main() {
 
     // FAT tables
     printf("*** FAT tables ***\n");
-    for (int i = 0; i < p->table_count; i++) {
+    for (int i = 0; i < p->tableCount; i++) {
         printf("* FAT table %d\n", i);
-        dump_sector(buffer, p->reserved_sector_count + i * p->table_size_16,
-                    p->table_size_16, p->bytes_per_sector);
+        dump_sector(buffer, p->reservedSectorCount + i * p->tableSize16,
+                    p->tableSize16, p->bytesPerSector);
     }
 
     // Seek to the root dir
@@ -215,7 +216,7 @@ int main() {
     DirectoryEntry* directoryEntries = (DirectoryEntry*)p2;
 
     // Traverse the root directory entries
-    for (int i = 0; i < p->root_entry_count; i++) {
+    for (int i = 0; i < p->rootEntryCount; i++) {
         DirectoryEntry* entry = &directoryEntries[i];
 
         // Check if entry is unused or deleted
@@ -244,7 +245,7 @@ int main() {
             char fileName[13];
             memcpy(fileName, entry->name, 11);
             fileName[11] = '\0';
-            int cluster_addr = (data_start_sector +( entry->startingClusterNumber - 2) * p->sectors_per_cluster) * p->bytes_per_sector;
+            int cluster_addr = (data_start_sector +( entry->startingClusterNumber - 2) * p->sectorsPerCluster) * p->bytesPerSector;
 
             printf("File: %s, cluster:%d[0x%08X],  size:%d\n", fileName, entry->startingClusterNumber, cluster_addr, entry->fileSize);
         }

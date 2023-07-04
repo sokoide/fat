@@ -2,9 +2,9 @@
 #define _FAT_H_
 
 #include <stdbool.h>
-#include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 // structs
 //
@@ -79,6 +79,8 @@ typedef struct DirectoryEntry {
 } __attribute__((packed)) DirectoryEntry;
 
 // functions
-bool init_fat_info(FILE* fp /* in */, FatBS* bs /* out */);
+bool fat_init_info(FILE* fp /* in */, FatBS* bs /* out */);
+bool fat_get_sector(FILE* fp /* in */, FatBS* bs /* in */, int sector /* in */,
+                    uint8_t* buffer /* out */, int buffer_size /* in */);
 
 #endif

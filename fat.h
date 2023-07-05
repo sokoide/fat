@@ -6,6 +6,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+// globals
+extern void* _fat_buffer;
+
 // structs
 //
 // // FAT32
@@ -79,8 +82,11 @@ typedef struct DirectoryEntry {
 } __attribute__((packed)) DirectoryEntry;
 
 // functions
-bool fat_init_info(FILE* fp /* in */, FatBS* bs /* out */);
-bool fat_get_sector(FILE* fp /* in */, FatBS* bs /* in */, int sector /* in */,
-                    uint8_t* buffer /* out */, int buffer_size /* in */);
+bool fat_init(FILE* fp /* in */);
+void fat_unint();
+void* fat_get_sector(int sector /* in */);
+bool fat_get_directory_entry_start(FILE* fp /* in */, uint8_t* buffer /* out */,
+                                   int buffer_size /* in */);
+uint32_t fat_get_fat(int cluster);
 
 #endif

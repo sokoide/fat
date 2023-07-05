@@ -4,7 +4,7 @@
 
 void test_fat_init(FILE* fp) {
     bool ret = fat_init(fp);
-    FatBS* bs = (FatBS*)_fat_buffer;
+    FatBS* bs = (FatBS*)fat_get_ptr();
     assert(ret);
     assert(bs->bootJmp[0] == 0xeb);
     assert(bs->bootJmp[1] == 0x3c);
@@ -21,11 +21,11 @@ void test_fat_init(FILE* fp) {
     assert(bs->tableSize16 == 3);
 }
 
-void test_fat_get_sector() {
-    uint8_t* sector = fat_get_sector(0);
+void test_fat_get_sector_ptr() {
+    uint8_t* sector = fat_get_sector_ptr(0);
     assert(sector[0] == 0xeb);
 
-    sector = fat_get_sector(1);
+    sector = fat_get_sector_ptr(1);
     assert(sector[0] == 0xf9);
     assert(sector[1] == 0xff);
 }
@@ -47,13 +47,20 @@ void test_fat_get_fat() {
     assert(fat == 0x007);
 }
 
+void test_fat_get_root_directory_start_sector_ptr() {
+    uint8_t* p = fat_get_root_directory_start_sector_ptr();
+    uint8_t* buffer = fat_get_ptr();
+    assert(p == buffer + 512 * 7);
+}
+
 int main() {
     FILE* fp = fopen("demof12.fat", "rb");
     assert(fp != NULL);
 
     test_fat_init(fp);
-    test_fat_get_sector();
+    test_fat_get_sector_ptr();
     test_fat_get_fat();
+    test_fat_get_root_directory_start_sector_ptr();
     fat_unint();
 
     fclose(fp);

@@ -6,8 +6,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+// enum
+enum FAT_TYPE {
+    FT_UNKNOWN = 0,
+    FT_FAT12 = 1,
+    FT_FAT16 = 2,
+    FT_FAT32 = 3,
+};
+
 // globals
-extern void* _fat_buffer;
 
 // structs
 //
@@ -82,11 +89,28 @@ typedef struct DirectoryEntry {
 } __attribute__((packed)) DirectoryEntry;
 
 // functions
-bool fat_init(FILE* fp /* in */);
+bool fat_init(FILE* fp);
 void fat_unint();
-void* fat_get_sector(int sector /* in */);
-bool fat_get_directory_entry_start(FILE* fp /* in */, uint8_t* buffer /* out */,
-                                   int buffer_size /* in */);
+
+void increment_color();
+void fat_print_info();
+void fat_print_header();
+void fat_print_legend(char* legend);
+void fat_print_idx_wide(uint8_t* base, int* idx, const int* lens);
+void fat_print_idx(uint8_t* base, int* idx, int len);
+void fat_print_idxstr(void* base, int* idxStr, int len);
+void fat_print_fat12();
+void fat_print_directory_entry_header();
+void fat_print_directory_entry(DirectoryEntry* entry);
+void fat_print_directory_entry_directory(DirectoryEntry* entry, bool recursive);
+void fat_print_directory_entry_file(DirectoryEntry* entry);
+
+void* fat_get_ptr();
+enum FAT_TYPE fat_get_type();
+void* fat_get_sector_ptr(int sector);
+void* fat_get_root_directory_start_sector_ptr();
 uint32_t fat_get_fat(int cluster);
+uint32_t fat_get_cluster_addr(int cluster);
+void* fat_get_cluster_ptr(int cluster);
 
 #endif

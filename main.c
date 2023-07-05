@@ -8,13 +8,7 @@
 
 // function declaration
 void check_null(void* p);
-void increment_color(int* color);
-void print_legend(int* color, char* legend);
-void dump_idx(uint8_t* b, int* idx, int len, int* color);
-void dump_header(uint8_t* b);
 void dump_entry(DirectoryEntry* e);
-void dump(uint8_t* p, uint32_t addr, int len);
-void dump_fat12(uint8_t* p, uint32_t addr, int len);
 
 // functions
 void check_null(void* p) {
@@ -22,150 +16,6 @@ void check_null(void* p) {
         fprintf(stderr, "p is NULL.\n");
         exit(1);
     }
-}
-
-void increment_color(int* color) {
-    *color += 1;
-    if (*color >= CL_GRAY + 1)
-        *color = CL_RED;
-}
-
-void print_legend(int* color, char* legend) {
-    cl(*color);
-    printf("- %s\n", legend);
-    increment_color(color);
-}
-
-void dump_idx(uint8_t* b, int* idx, int len, int* color) {
-    cl(*color);
-    /* for (int i = *idx; i < *idx + len; i++) { */
-    /*     printf("%02x ", b[i]); */
-    /* } */
-    for (int i = 0; i < len; i++) {
-        printf("%02x ", b[*idx + i]);
-    }
-    *idx = *idx + len;
-    increment_color(color);
-}
-
-void dump_header(uint8_t* b) {
-    clcl();
-    printf("*** BIOS parameter block ***\n");
-
-    int color = CL_RED;
-    print_legend(&color, "relative jump (eb3c) + nop (90)");
-    print_legend(&color, "OEM Name");
-    print_legend(&color, "bytes per sector");
-    print_legend(&color, "sectors per cluster");
-    print_legend(&color, "FAT table's 1st sector (reserved sectors)");
-    print_legend(&color, "FAT table count");
-    print_legend(&color, "Max entries in root table");
-    print_legend(&color, "Total sector count");
-    print_legend(&color, "Media type");
-    print_legend(&color, "sectors per FAT table");
-    print_legend(&color, "sectors per track");
-    print_legend(&color, "head count");
-    print_legend(&color, "hidden sectors");
-    printf("\n");
-
-    // 1st line
-    int idx = 0;
-    color = CL_RED;
-    dump_idx(b, &idx, 3, &color);
-    dump_idx(b, &idx, 8, &color);
-    dump_idx(b, &idx, 2, &color);
-    dump_idx(b, &idx, 1, &color);
-    dump_idx(b, &idx, 2, &color);
-    printf("\n");
-
-    // 2nd line
-    idx = 16;
-    dump_idx(b, &idx, 1, &color);
-    dump_idx(b, &idx, 2, &color);
-    dump_idx(b, &idx, 2, &color);
-    dump_idx(b, &idx, 1, &color);
-    dump_idx(b, &idx, 2, &color);
-    dump_idx(b, &idx, 2, &color);
-    dump_idx(b, &idx, 2, &color);
-    dump_idx(b, &idx, 4, &color);
-    clcl();
-    printf("\n\n");
-}
-
-void dump_entry(DirectoryEntry* e) {
-    uint8_t* b = (uint8_t*)e;
-    printf("*** entry ***\n");
-    int color = CL_RED;
-    print_legend(&color, "Name");
-    print_legend(&color, "Attributes");
-    print_legend(&color, "(reserved)");
-    print_legend(&color, "Creation time (millisec)");
-    print_legend(&color, "Creation time");
-    print_legend(&color, "Creation date");
-    print_legend(&color, "Last access date");
-    print_legend(&color, "(ignored in FAT12)");
-    print_legend(&color, "Last write time");
-    print_legend(&color, "Last write date");
-    print_legend(&color, "Starting cluster");
-    print_legend(&color, "File size");
-
-    int idx = 0;
-    color = CL_RED;
-    dump_idx(b, &idx, 11, &color);
-    dump_idx(b, &idx, 1, &color);
-    dump_idx(b, &idx, 1, &color);
-    dump_idx(b, &idx, 1, &color);
-    dump_idx(b, &idx, 2, &color);
-    printf("\n");
-    // 2nd line
-    dump_idx(b, &idx, 2, &color);
-    dump_idx(b, &idx, 2, &color);
-    dump_idx(b, &idx, 2, &color);
-    dump_idx(b, &idx, 2, &color);
-    dump_idx(b, &idx, 2, &color);
-    dump_idx(b, &idx, 2, &color);
-    dump_idx(b, &idx, 4, &color);
-
-    clcl();
-    printf("\n\n");
-}
-
-void dump(uint8_t* p, uint32_t addr, int len) {
-    uint8_t* buffer = p;
-    for (int i = 0; i < len; i++) {
-        uint8_t b = buffer[i];
-        if (i % 16 == 0) {
-            printf("%08x: ", addr + i);
-        }
-
-        printf("%02x ", b);
-        if (i % 16 == 15) {
-            printf("\n");
-        }
-    }
-}
-
-void dump_fat12(uint8_t* p, uint32_t addr, int len) {
-    int fat_count = len / 3;
-    for (int i = 0; i < len / 3; i++) {
-        uint32_t value = fat_get_fat(i);
-        printf("%03X ", value);
-        if (i % 8 == 7)
-            printf("\n");
-    }
-    printf("\n");
-    /* uint8_t* buffer = p; */
-    /* for (int i = 0; i < len; i++) { */
-    /*     uint8_t b = buffer[i]; */
-    /*     if (i % 16 == 0) { */
-    /*         printf("%08x: ", addr + i); */
-    /*     } */
-    /*  */
-    /*     printf("%02x ", b); */
-    /*     if (i % 16 == 15) { */
-    /*         printf("\n"); */
-    /*     } */
-    /* } */
 }
 
 int main() {
@@ -176,8 +26,6 @@ int main() {
         return 1;
     }
 
-    fseek(fp, 0, SEEK_SET);
-
     // ref: https://free.pjc.co.jp/fat/mem/fatm122.html
     // FAT12
     bool ret = fat_init(fp);
@@ -185,107 +33,27 @@ int main() {
         fprintf(stderr, "fat_init failed\n");
         return 1;
     }
-    FatBS* _fat_bs = (FatBS*)_fat_buffer;
-    ;
+    fclose(fp);
 
-    printf("bytesPerSector: %d\n", _fat_bs->bytesPerSector);
-    printf("sectorsPerCluster: %d\n", _fat_bs->sectorsPerCluster);
-    // 1st FAT table's sector
-    printf("reservedSectorCount: %d\n", _fat_bs->reservedSectorCount);
-    // count of FAT tables
-    printf("tableCount: %d\n", _fat_bs->tableCount);
-    printf("rootEntryCount: %d\n", _fat_bs->rootEntryCount);
-    int root_dir_sector_count =
-        _fat_bs->rootEntryCount * 32 / _fat_bs->bytesPerSector;
-    printf("total_sectors: %d\n", _fat_bs->totalSectors16);
-    // cout of FAT table sectors
-    printf("tableSize16: %d\n", _fat_bs->tableSize16);
+    printf("*** FAT info ***\n");
+    fat_print_info();
+    printf("*** BIOS parameter block ***\n");
+    fat_print_header();
 
-    int fat_start_sector = _fat_bs->reservedSectorCount;
-    int fat_sectors = _fat_bs->tableSize16 * _fat_bs->tableCount;
-    int root_dir_start_sector = fat_start_sector + fat_sectors;
-    int root_dir_sectors = (sizeof(DirectoryEntry) * _fat_bs->rootEntryCount +
-                            _fat_bs->bytesPerSector - 1) /
-                           _fat_bs->bytesPerSector;
-    int root_dir_start_addr = root_dir_start_sector * _fat_bs->bytesPerSector;
-    int data_start_sector = root_dir_start_sector + root_dir_sectors;
-    int data_sectors = _fat_bs->totalSectors16 - data_start_sector;
-    int data_start_addr = data_start_sector * _fat_bs->bytesPerSector;
-    printf("* fat start_sector %d\n", fat_start_sector);
-    printf("* fat sectors %d\n", fat_sectors);
-    printf("* root_dir start_sector %d\n", root_dir_start_sector);
-    printf("* root_dir sectors %d\n", root_dir_sectors);
-    printf("* data start_sector %d\n", data_start_sector);
-    printf("* data start_addr 0x%X\n", data_start_addr);
-
-    // FAT tables
-    printf("*** FAT tables ***\n");
+    FatBS* _fat_bs = (FatBS*)fat_get_ptr();
     void* sector_data;
-    for (int i = 0; i < _fat_bs->tableCount; i++) {
-        printf("* FAT table %d\n", i);
-        for (int j = 0; j < _fat_bs->tableSize16; j++) {
-            int sector =
-                _fat_bs->reservedSectorCount + i * _fat_bs->tableSize16 + j;
-            printf("* dumping sector %d\n", sector);
-            sector_data = fat_get_sector(sector);
-            /* dump(sector_data, sector * _fat_bs->bytesPerSector, */
-            /*      _fat_bs->bytesPerSector); */
-            dump_fat12(sector_data, sector * _fat_bs->bytesPerSector,
-                       _fat_bs->bytesPerSector);
-        }
-    }
 
-    goto CLEANUP;
+    /* printf("*** FAT table ***\n"); */
+    /* fat_print_fat12(); */
 
-    // Seek to the root dir
-    /* uint8_t* p2 = ((uint8_t*)buffer) + root_dir_start_addr; */
-
-    // Read the root directory entries
-    /* fat_get_directory_entry_start( */
-    /*     fp, sector_data, sizeof(sector_data) / *sizeof(sector_data[0])); */
-    DirectoryEntry* directoryEntries = (DirectoryEntry*)sector_data;
+    printf("*** Files and Directories ***\n");
+    fat_print_directory_entry_header();
+    DirectoryEntry* directoryEntries =
+        (DirectoryEntry*)fat_get_root_directory_start_sector_ptr();
     // Traverse the root directory entries
     for (int i = 0; i < _fat_bs->rootEntryCount; i++) {
-        DirectoryEntry* entry = &directoryEntries[i];
-
-        // Check if entry is unused or deleted
-        if (entry->name[0] == 0x00 || entry->name[0] == 0xE5) {
-            continue;
-        }
-
-        // Check if entry is a directory
-        dump_entry(entry);
-        if (entry->attributes & 0x10) {
-            // Directory entry
-            char directoryName[13];
-            memcpy(directoryName, entry->name, 11);
-            directoryName[11] = '\0';
-
-            // Omit '.' and '..' directories
-            if (strcmp(directoryName, ".") == 0 ||
-                strcmp(directoryName, "..") == 0) {
-                continue;
-            }
-
-            printf("Directory: %s, cluster:%d\n", directoryName,
-                   entry->startingClusterNumber);
-        } else {
-            // File entry
-            char fileName[13];
-            memcpy(fileName, entry->name, 11);
-            fileName[11] = '\0';
-            int cluster_addr =
-                (data_start_sector + (entry->startingClusterNumber - 2) *
-                                         _fat_bs->sectorsPerCluster) *
-                _fat_bs->bytesPerSector;
-
-            printf("File: %s, cluster:%d[0x%08X],  size:%d\n", fileName,
-                   entry->startingClusterNumber, cluster_addr, entry->fileSize);
-        }
+        fat_print_directory_entry(&directoryEntries[i]);
     }
-
-CLEANUP:
-    fclose(fp);
 
     return 0;
 }

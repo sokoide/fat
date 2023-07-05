@@ -57,6 +57,7 @@ fat12:
 	mformat -f 720 -v $(VOL) -C -i $(IMG) ::
 
 	echo "hello world" > hello.txt
+	echo "hello world2" > hello2.txt
 	mcopy -i $(IMG) hello.txt test_5kb.txt ::
 
 	mmd -i $(IMG) dir1 dir2 dir2/subdir1 dir2/subdir2 dir2/subdir3 dir2/subdir4 dir2/subdir5 dir2/subdir6 dir2/subdir7 dir2/subdir8 dir2/subdir9 dir2/subdir10 dir2/subdir11 dir2/subdir12 dir2/subdir13 dir2/subdir14 dir2/subdir15 dir2/subdir16 dir2/subdir17 dir2/subdir18 dir2/subdir19 dir2/subdir20 dir2/subdir21 dir2/subdir22 dir2/subdir23 dir2/subdir24 dir2/subdir25 dir2/subdir26 dir2/subdir27 dir2/subdir28 dir2/subdir29 dir2/subdir30 dir2/subdir31 dir2/subdir32 dir2/subdir33

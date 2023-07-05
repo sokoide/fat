@@ -254,7 +254,7 @@ void fat_print_directory_entry_directory(DirectoryEntry* entry,
     if (recursive && entry->startingClusterNumber > 0) {
         DirectoryEntry* subEntries =
             (DirectoryEntry*)fat_get_cluster_ptr(entry->startingClusterNumber);
-        // TODO: must support a sirectory which has multi clusters
+        // TODO: must support a directory which has multi clusters
         for (int i = 0;
              i < _fat_bs->bytesPerSector * _fat_bs->sectorsPerCluster /
                      sizeof(DirectoryEntry);
@@ -292,7 +292,7 @@ void* fat_get_root_directory_start_sector_ptr() {
     return fat_get_sector_ptr(_root_dir_start_sector);
 }
 
-uint32_t fat_get_fat(int cluster) {
+uint32_t fat_get_fat(uint32_t cluster) {
     uint8_t* fatp = (uint8_t*)fat_get_sector_ptr(_fat_bs->reservedSectorCount);
     uint32_t value = 0;
     if (cluster % 2 == 0) {

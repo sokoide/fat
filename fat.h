@@ -109,7 +109,7 @@ void* fat_get_ptr();
 enum FAT_TYPE fat_get_type();
 void* fat_get_sector_ptr(int sector);
 void* fat_get_root_directory_start_sector_ptr();
-uint32_t fat_get_fat(int cluster);
+uint32_t fat_get_fat(uint32_t cluster);
 uint32_t fat_get_cluster_addr(int cluster);
 void* fat_get_cluster_ptr(int cluster);
 

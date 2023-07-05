@@ -45,12 +45,80 @@ void test_fat_get_fat() {
     assert(fat == 0x006);
     fat = fat_get_fat(6);
     assert(fat == 0x007);
+    fat = fat_get_fat(7);
+    assert(fat == 0xFFF);
+    fat = fat_get_fat(8);
+    assert(fat == 0xFFF);
+    fat = fat_get_fat(9);
+    assert(fat == 0x029);
 }
 
 void test_fat_get_root_directory_start_sector_ptr() {
     uint8_t* p = fat_get_root_directory_start_sector_ptr();
     uint8_t* buffer = fat_get_ptr();
     assert(p == buffer + 512 * 7);
+}
+
+void test_subdirs1() {
+    DirectoryEntry* directoryEntries;
+    FatBS* bs = (FatBS*)fat_get_ptr();
+
+    directoryEntries =
+        (DirectoryEntry*)fat_get_root_directory_start_sector_ptr();
+    int subdirs = 0;
+    int files = 0;
+
+    for (int i = 0; i < bs->rootEntryCount; i++) {
+        DirectoryEntry* entry = &directoryEntries[i];
+        // 0x00 not use, 0xE5 deleted
+        if (entry->name[0] == 0x00 || entry->name[0] == 0xE5)
+            break;
+        if (entry->attributes & 0x10) {
+            if (entry->name[0] != '.') {
+                // Directory
+                subdirs++;
+            }
+        } else {
+            files++;
+        }
+    }
+    assert(subdirs == 2);
+    assert(files == 3);
+}
+
+void test_subdirs2() {
+    uint32_t cluster = 9;
+    uint32_t nextCluster;
+    DirectoryEntry* directoryEntries;
+    FatBS* bs = (FatBS*)fat_get_ptr();
+
+    nextCluster = fat_get_fat(cluster);
+
+    int subdirs = 0;
+    int files = 0;
+    while (cluster < 0xF00) {
+        nextCluster = fat_get_fat(cluster);
+        directoryEntries = (DirectoryEntry*)(fat_get_cluster_ptr(cluster));
+        for (int i = 0; i < bs->bytesPerSector * bs->sectorsPerCluster /
+                                sizeof(DirectoryEntry);
+             i++) {
+            DirectoryEntry* entry = &directoryEntries[i];
+            // 0x00 not use, 0xE5 deleted
+            if (entry->name[0] == 0x00 || entry->name[0] == 0xE5)
+                break;
+            if (entry->attributes & 0x10) {
+                if (entry->name[0] != '.') {
+                    // Directory
+                    subdirs++;
+                }
+            } else {
+                files++;
+            }
+        }
+        cluster = nextCluster;
+    }
+    assert(subdirs == 33);
+    assert(files == 0);
 }
 
 int main() {
@@ -61,6 +129,8 @@ int main() {
     test_fat_get_sector_ptr();
     test_fat_get_fat();
     test_fat_get_root_directory_start_sector_ptr();
+    test_subdirs1();
+    test_subdirs2();
     fat_unint();
 
     fclose(fp);

@@ -43,8 +43,8 @@ int main() {
     FatBS* _fat_bs = (FatBS*)fat_get_ptr();
     void* sector_data;
 
-    /* printf("*** FAT table ***\n"); */
-    /* fat_print_fat12(); */
+    printf("*** FAT table ***\n");
+    fat_print_fat12();
 
     printf("*** Files and Directories ***\n");
     fat_print_directory_entry_header();

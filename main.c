@@ -95,16 +95,33 @@ int main() {
     cluster = fat_get_cluster_for_entry(cluster_dir1, &entry);
     printf("cluster: %u, size: %u\n", cluster, entry.fileSize);
     char* p = fat_get_cluster_ptr(cluster);
-    // TODO: handle multi lines, >1024 byte file
-    printf("%s\n", p);
+
+    char buffer[1025];
+    memcpy(buffer, p, entry.fileSize);
+    buffer[entry.fileSize] = '\0';
+    printf("```%s```\n", buffer);
 
     printf("*** cat /test_5kb.txt *** \n");
     fat_set_entry_name(&entry, "test_5kb.txt");
     cluster = fat_get_cluster_for_entry(0, &entry);
     printf("cluster: %u, size: %u\n", cluster, entry.fileSize);
-    p = fat_get_cluster_ptr(cluster);
-    // TODO: handle multi lines, >1024 byte file
-    printf("%s\n", p);
+    uint32_t fileSize = entry.fileSize;
+    printf("```");
+    while (fileSize > 0) {
+        p = fat_get_cluster_ptr(cluster);
+        if (fileSize >= 1024) {
+            memcpy(buffer, p, 1024);
+            buffer[1024] = '\0';
+            fileSize -= 1024;
+            cluster = fat_get_fat(cluster);
+        } else {
+            memcpy(buffer, p, fileSize);
+            buffer[fileSize] = '\0';
+            fileSize = 0;
+        }
+        printf("%s", buffer);
+    }
+    printf("```");
 
     return 0;
 }

@@ -121,17 +121,30 @@ void test_subdirs2() {
     assert(files == 0);
 }
 
+void test_fat_set_entry_name() {
+    DirectoryEntry entry;
+
+    fat_set_entry_name(&entry, "hoge");
+    assert(memcmp(entry.name, "HOGE       ", 11) == 0);
+
+    fat_set_entry_name(&entry, "page.txt");
+    assert(memcmp(entry.name, "PAGE    TXT", 11) == 0);
+
+    fat_set_entry_name(&entry, "foo.a");
+    assert(memcmp(entry.name, "FOO     A  ", 11) == 0);
+}
+
 void test_fat_get_cluster_for_entry() {
     DirectoryEntry entry;
-    memcpy((char*)entry.name, "           ", 11);
+    fat_set_entry_name(&entry, "           ");
     uint32_t cluster = fat_get_cluster_for_entry(&entry);
     assert(cluster == 0);
 
-    memcpy((char*)entry.name, "DIR1       ", 11);
+    fat_set_entry_name(&entry, "DIR1");
     cluster = fat_get_cluster_for_entry(&entry);
     assert(cluster == 8);
 
-    memcpy((char*)entry.name, "dir2       ", 11);
+    fat_set_entry_name(&entry, "dir2");
     cluster = fat_get_cluster_for_entry(&entry);
     assert(cluster == 11);
 }
@@ -146,6 +159,7 @@ int main() {
     test_fat_get_root_directory_start_sector_ptr();
     test_subdirs1();
     test_subdirs2();
+    test_fat_set_entry_name();
     test_fat_get_cluster_for_entry();
     fat_unint();
 

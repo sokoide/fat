@@ -394,6 +394,37 @@ char* fat_get_entry_name(DirectoryEntry* entry, char* name, int len) {
     return name;
 }
 
+void fat_set_entry_name(DirectoryEntry* entry, char* name) {
+    int name_len = strlen(name);
+    int dotPos = -1;
+    int i = 0;
+    for (i = 0; i < name_len; i++) {
+        if (name[i] == '.') {
+            dotPos = i;
+            break;
+        }
+        entry->name[i] = name[i];
+    }
+    while (i < 11) {
+        entry->name[i] = 0x20;
+        i++;
+    }
+
+    i = 8;
+    if (dotPos >= 0) {
+        for (int j = dotPos + 1; j < name_len; j++) {
+            entry->name[i++] = name[j];
+        }
+    }
+
+    // to upper
+    for (int i = 0; i < 11; i++) {
+        if ('a' <= entry->name[i] && entry->name[i] <= 'z') {
+            entry->name[i] = entry->name[i] - 'a' + 'A';
+        }
+    }
+}
+
 void* fat_get_ptr() { return _fat_buffer; }
 
 enum FAT_TYPE fat_get_type() { return _fat_type; }

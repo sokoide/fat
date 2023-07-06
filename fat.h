@@ -109,9 +109,11 @@ void fat_print_directory_entry_dump(DirectoryEntry* entry, void* p);
 void fat_print_directory_entry(DirectoryEntry* entry);
 void fat_print_directory_entry_directory(DirectoryEntry* entry, bool recursive);
 void fat_print_directory_entry_file(DirectoryEntry* entry);
+
 void iterate_rootdir(iterate_dir_callback callback, void* p);
 void iterate_dir(uint32_t cluster, iterate_dir_callback callback, void* p);
 char* fat_get_entry_name(DirectoryEntry* entry, char* name, int len);
+void fat_set_entry_name(DirectoryEntry* entry, char* name);
 
 void* fat_get_ptr();
 enum FAT_TYPE fat_get_type();

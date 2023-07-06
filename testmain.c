@@ -137,15 +137,15 @@ void test_fat_set_entry_name() {
 void test_fat_get_cluster_for_entry() {
     DirectoryEntry entry;
     fat_set_entry_name(&entry, "           ");
-    uint32_t cluster = fat_get_cluster_for_entry(&entry);
+    uint32_t cluster = fat_get_cluster_for_entry(0, &entry);
     assert(cluster == 0);
 
     fat_set_entry_name(&entry, "DIR1");
-    cluster = fat_get_cluster_for_entry(&entry);
+    cluster = fat_get_cluster_for_entry(0, &entry);
     assert(cluster == 8);
 
     fat_set_entry_name(&entry, "dir2");
-    cluster = fat_get_cluster_for_entry(&entry);
+    cluster = fat_get_cluster_for_entry(0, &entry);
     assert(cluster == 11);
 }
 

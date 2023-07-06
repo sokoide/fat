@@ -496,38 +496,41 @@ void* fat_get_cluster_ptr(int cluster) {
 }
 
 typedef struct {
-    unsigned char name[11];
+    DirectoryEntry* entry;
+    /* unsigned char name[11]; */
     bool found;
-    uint32_t cluster;
+    /* uint32_t cluster; */
 } CallbackFindEntryArg;
 
 void _callback_find_entry(DirectoryEntry* entry, void* p) {
     CallbackFindEntryArg* arg = (CallbackFindEntryArg*)p;
-    if (memcmp(arg->name, entry->name, 11) == 0) {
+    if (memcmp(arg->entry->name, entry->name, 11) == 0) {
         arg->found = true;
-        arg->cluster = entry->startingClusterNumber;
+        arg->entry->fileSize = entry->fileSize;
+        arg->entry->attributes = entry->attributes;
+        arg->entry->creationDate = entry->creationDate;
+        arg->entry->creationTime = entry->creationTime;
+        arg->entry->creationTimeTenthOfSecond =
+            entry->creationTimeTenthOfSecond;
+        arg->entry->lastWriteTime = entry->lastWriteTime;
+        arg->entry->lastWriteDate = entry->lastWriteDate;
+        arg->entry->lastAccessDate = entry->lastAccessDate;
+        arg->entry->startingClusterNumber = entry->startingClusterNumber;
     }
 }
 
-uint32_t fat_get_cluster_for_entry(DirectoryEntry* entry) {
-    // TODO: support subdirs
+uint32_t fat_get_cluster_for_entry(uint32_t parent_cluster,
+                                   DirectoryEntry* entry) {
     if (strlen((char*)entry->name) == 0 || entry->name[0] == 0x20)
         return 0;
 
     CallbackFindEntryArg arg;
-    memcpy(arg.name, entry->name, 11);
-    // to upper
-    for (int i = 0; i < 11; i++) {
-        if ('a' <= arg.name[i] && arg.name[i] <= 'z') {
-            arg.name[i] = arg.name[i] - 'a' + 'A';
-        }
-    }
+    arg.entry = entry;
     arg.found = false;
-    arg.cluster = 0;
 
-    iterate_dir(0, _callback_find_entry, &arg);
+    iterate_dir(parent_cluster, _callback_find_entry, &arg);
     if (arg.found) {
-        return arg.cluster;
+        return arg.entry->startingClusterNumber;
     }
     return 0;
 }

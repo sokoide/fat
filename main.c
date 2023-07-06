@@ -29,7 +29,7 @@ void callback_ls(DirectoryEntry* entry, void* p) {
         printf("V %s\n", name);
     } else {
         // File
-        printf("F %s\n", name);
+        printf("F %s %u\n", name, entry->fileSize);
     }
 }
 
@@ -73,6 +73,38 @@ int main() {
 
     printf("*** ls /dir1 ***\n");
     DirectoryEntry entry;
-    uint32_t cluster = fat_get_cluster_for_entry(&entry);
+    fat_set_entry_name(&entry, "dir1");
+    uint32_t cluster_dir1 = fat_get_cluster_for_entry(0, &entry);
+    printf("cluster: %u\n", cluster_dir1);
+    iterate_dir(cluster_dir1, callback_ls, NULL);
+
+    printf("*** ls /dir2 ***\n");
+    fat_set_entry_name(&entry, "dir2");
+    uint32_t cluster_dir2 = fat_get_cluster_for_entry(0, &entry);
+    printf("cluster: %u\n", cluster_dir2);
+    iterate_dir(cluster_dir2, callback_ls, NULL);
+
+    printf("*** ls /dir2/subbdir1 ***\n");
+    fat_set_entry_name(&entry, "subdir1");
+    uint32_t cluster = fat_get_cluster_for_entry(cluster_dir2, &entry);
+    printf("cluster: %u\n", cluster);
+    iterate_dir(cluster, callback_ls, NULL);
+
+    printf("*** cat /dir1/hoge.txt *** \n");
+    fat_set_entry_name(&entry, "hoge.txt");
+    cluster = fat_get_cluster_for_entry(cluster_dir1, &entry);
+    printf("cluster: %u, size: %u\n", cluster, entry.fileSize);
+    char* p = fat_get_cluster_ptr(cluster);
+    // TODO: handle multi lines, >1024 byte file
+    printf("%s\n", p);
+
+    printf("*** cat /test_5kb.txt *** \n");
+    fat_set_entry_name(&entry, "test_5kb.txt");
+    cluster = fat_get_cluster_for_entry(0, &entry);
+    printf("cluster: %u, size: %u\n", cluster, entry.fileSize);
+    p = fat_get_cluster_ptr(cluster);
+    // TODO: handle multi lines, >1024 byte file
+    printf("%s\n", p);
+
     return 0;
 }

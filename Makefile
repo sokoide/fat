@@ -64,8 +64,8 @@ fat12:
 	mdir -i $(IMG)
 	mdir -i $(IMG) ::dir1
 
-	echo "hoge" > hoge.txt
-	echo "page" > page.txt
+	echo "I am hoge." > hoge.txt
+	echo "You are page." > page.txt
 	mcopy -i $(IMG) hoge.txt ::dir1
 	mcopy -i $(IMG) page.txt ::dir2/subdir1
 	mcopy -i $(IMG) test_5kb.txt ::dir2/subdir1

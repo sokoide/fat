@@ -8,13 +8,28 @@
 
 // function declaration
 void check_null(void* p);
-void dump_entry(DirectoryEntry* e);
+void callback_ls(DirectoryEntry* entry);
 
 // functions
 void check_null(void* p) {
     if (p == NULL) {
         fprintf(stderr, "p is NULL.\n");
         exit(1);
+    }
+}
+
+void callback_ls(DirectoryEntry* entry) {
+    char name[12];
+    fat_get_entry_name(entry, name, sizeof(name) / sizeof(name[0]));
+    if (entry->attributes & 0x10) {
+        // Directory
+        printf("D %s\n", name);
+    } else if (entry->attributes & 0x08) {
+        // Volume Label
+        printf("V %s\n", name);
+    } else {
+        // File
+        printf("F %s\n", name);
     }
 }
 
@@ -46,7 +61,10 @@ int main() {
 
     printf("*** Files and Directories ***\n");
     fat_print_directory_entry_header_legend();
-    iterate_dir(0);
+    iterate_dir(0, fat_print_directory_entry_dump);
+
+    printf("*** ls / ***\n");
+    iterate_dir(0, callback_ls);
 
     return 0;
 }

@@ -327,7 +327,7 @@ void fat_print_directory_entry_file(DirectoryEntry* entry) {
     fat_print_directory_entry_dump(entry);
 }
 
-void iterate_rootdir() {
+void iterate_rootdir(iterate_dir_callback callback) {
     DirectoryEntry* directoryEntries;
     FatBS* bs = (FatBS*)fat_get_ptr();
 
@@ -339,24 +339,19 @@ void iterate_rootdir() {
         // 0x00 not use, 0xE5 deleted
         if (entry->name[0] == 0x00 || entry->name[0] == 0xE5)
             break;
-        fat_print_directory_entry(&directoryEntries[i]);
-        /* if (entry->attributes & 0x10) { */
-        /*     if (entry->name[0] != '.') { */
-        /*         // Directory */
-        /*     } */
-        /* } else { */
-        /*     // File */
-        /* } */
+        if (callback != NULL) {
+            callback(entry);
+        }
     }
 }
 
-void iterate_dir(uint32_t cluster) {
+void iterate_dir(uint32_t cluster, iterate_dir_callback callback) {
     uint32_t nextCluster;
     DirectoryEntry* directoryEntries;
     FatBS* bs = (FatBS*)fat_get_ptr();
 
     if (cluster == 0)
-        return iterate_rootdir();
+        return iterate_rootdir(callback);
 
     nextCluster = fat_get_fat(cluster);
 
@@ -370,10 +365,33 @@ void iterate_dir(uint32_t cluster) {
             // 0x00 not use, 0xE5 deleted
             if (entry->name[0] == 0x00 || entry->name[0] == 0xE5)
                 break;
-            fat_print_directory_entry(&directoryEntries[i]);
+            if (callback != NULL) {
+                callback(entry);
+            }
         }
         cluster = nextCluster;
     }
+}
+
+char* fat_get_entry_name(DirectoryEntry* entry, char* name, int len) {
+    if (len < 12) {
+        fprintf(stderr, "len must be >=12");
+        return NULL;
+    }
+    strncpy(name, (const char*)(entry->name), 8);
+    int i;
+    for (i = 0; i < 8; i++) {
+        if (name[i] == 0x20)
+            break;
+    }
+    if ((entry->attributes & 0x18) == 0) {
+        // not Directory or Volume
+        name[i++] = '.';
+        strncpy(&name[i], (const char*)&(entry->name[8]), 3);
+        i += 3;
+    }
+    name[i] = '\0';
+    return name;
 }
 
 void* fat_get_ptr() { return _fat_buffer; }

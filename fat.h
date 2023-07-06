@@ -73,7 +73,7 @@ typedef struct {
 } __attribute__((packed)) FatBS;
 
 // ref: https://wiki.osdev.org/FAT#Directories_on_FAT12.2F16.2F32
-typedef struct DirectoryEntry {
+typedef struct {
     unsigned char name[11];
     unsigned char attributes;
     unsigned char reserved[1];
@@ -87,6 +87,9 @@ typedef struct DirectoryEntry {
     unsigned short startingClusterNumber;
     unsigned int fileSize;
 } __attribute__((packed)) DirectoryEntry;
+
+// callback
+typedef void (*iterate_dir_callback)(DirectoryEntry*);
 
 // functions
 bool fat_init(FILE* fp);
@@ -106,8 +109,9 @@ void fat_print_directory_entry_dump(DirectoryEntry* entry);
 void fat_print_directory_entry(DirectoryEntry* entry);
 void fat_print_directory_entry_directory(DirectoryEntry* entry, bool recursive);
 void fat_print_directory_entry_file(DirectoryEntry* entry);
-void iterate_dir(uint32_t cluster);
-void iterate_rootdir();
+void iterate_rootdir(iterate_dir_callback callback);
+void iterate_dir(uint32_t cluster, iterate_dir_callback callback);
+char* fat_get_entry_name(DirectoryEntry* entry, char* name, int len);
 
 void* fat_get_ptr();
 enum FAT_TYPE fat_get_type();

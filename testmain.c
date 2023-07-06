@@ -49,8 +49,8 @@ void test_fat_get_fat() {
     assert(fat == 0xFFF);
     fat = fat_get_fat(8);
     assert(fat == 0xFFF);
-    fat = fat_get_fat(9);
-    assert(fat == 0x029);
+    fat = fat_get_fat(11);
+    assert(fat == 0x02B);
 }
 
 void test_fat_get_root_directory_start_sector_ptr() {
@@ -87,7 +87,7 @@ void test_subdirs1() {
 }
 
 void test_subdirs2() {
-    uint32_t cluster = 9;
+    uint32_t cluster = 11;
     uint32_t nextCluster;
     DirectoryEntry* directoryEntries;
     FatBS* bs = (FatBS*)fat_get_ptr();
@@ -121,6 +121,21 @@ void test_subdirs2() {
     assert(files == 0);
 }
 
+void test_fat_get_cluster_for_entry() {
+    DirectoryEntry entry;
+    memcpy((char*)entry.name, "           ", 11);
+    uint32_t cluster = fat_get_cluster_for_entry(&entry);
+    assert(cluster == 0);
+
+    memcpy((char*)entry.name, "DIR1       ", 11);
+    cluster = fat_get_cluster_for_entry(&entry);
+    assert(cluster == 8);
+
+    memcpy((char*)entry.name, "dir2       ", 11);
+    cluster = fat_get_cluster_for_entry(&entry);
+    assert(cluster == 11);
+}
+
 int main() {
     FILE* fp = fopen("demof12.fat", "rb");
     assert(fp != NULL);
@@ -131,6 +146,7 @@ int main() {
     test_fat_get_root_directory_start_sector_ptr();
     test_subdirs1();
     test_subdirs2();
+    test_fat_get_cluster_for_entry();
     fat_unint();
 
     fclose(fp);

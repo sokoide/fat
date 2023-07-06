@@ -219,7 +219,7 @@ void fat_print_directory_entry_header_legend() {
     clcl();
 }
 
-void fat_print_directory_entry_dump(DirectoryEntry* entry) {
+void fat_print_directory_entry_dump(DirectoryEntry* entry, void* p) {
     // 1st line
     int idx = 0;
     const int l1[] = {11, 1, 1, 1, 2, -1};
@@ -272,7 +272,7 @@ void fat_print_directory_entry_directory(DirectoryEntry* entry,
     printf("Directory: %s, cluster:%d[0x%08X]\n", directoryName,
            entry->startingClusterNumber,
            fat_get_cluster_addr(entry->startingClusterNumber));
-    fat_print_directory_entry_dump(entry);
+    fat_print_directory_entry_dump(entry, NULL);
 
     if (recursive && entry->startingClusterNumber > 0) {
         DirectoryEntry* subEntries =
@@ -324,10 +324,10 @@ void fat_print_directory_entry_file(DirectoryEntry* entry) {
     printf("File: %s, cluster:%d[0x%08X],  size:%d\n", fileName,
            entry->startingClusterNumber,
            fat_get_cluster_addr(entry->startingClusterNumber), entry->fileSize);
-    fat_print_directory_entry_dump(entry);
+    fat_print_directory_entry_dump(entry, NULL);
 }
 
-void iterate_rootdir(iterate_dir_callback callback) {
+void iterate_rootdir(iterate_dir_callback callback, void* p) {
     DirectoryEntry* directoryEntries;
     FatBS* bs = (FatBS*)fat_get_ptr();
 
@@ -340,18 +340,18 @@ void iterate_rootdir(iterate_dir_callback callback) {
         if (entry->name[0] == 0x00 || entry->name[0] == 0xE5)
             break;
         if (callback != NULL) {
-            callback(entry);
+            callback(entry, p);
         }
     }
 }
 
-void iterate_dir(uint32_t cluster, iterate_dir_callback callback) {
+void iterate_dir(uint32_t cluster, iterate_dir_callback callback, void* p) {
     uint32_t nextCluster;
     DirectoryEntry* directoryEntries;
     FatBS* bs = (FatBS*)fat_get_ptr();
 
     if (cluster == 0)
-        return iterate_rootdir(callback);
+        return iterate_rootdir(callback, p);
 
     nextCluster = fat_get_fat(cluster);
 
@@ -366,7 +366,7 @@ void iterate_dir(uint32_t cluster, iterate_dir_callback callback) {
             if (entry->name[0] == 0x00 || entry->name[0] == 0xE5)
                 break;
             if (callback != NULL) {
-                callback(entry);
+                callback(entry, p);
             }
         }
         cluster = nextCluster;
@@ -462,4 +462,41 @@ uint32_t fat_get_cluster_addr(int cluster) {
 
 void* fat_get_cluster_ptr(int cluster) {
     return _fat_buffer + fat_get_cluster_addr(cluster);
+}
+
+typedef struct {
+    unsigned char name[11];
+    bool found;
+    uint32_t cluster;
+} CallbackFindEntryArg;
+
+void _callback_find_entry(DirectoryEntry* entry, void* p) {
+    CallbackFindEntryArg* arg = (CallbackFindEntryArg*)p;
+    if (memcmp(arg->name, entry->name, 11) == 0) {
+        arg->found = true;
+        arg->cluster = entry->startingClusterNumber;
+    }
+}
+
+uint32_t fat_get_cluster_for_entry(DirectoryEntry* entry) {
+    // TODO: support subdirs
+    if (strlen((char*)entry->name) == 0 || entry->name[0] == 0x20)
+        return 0;
+
+    CallbackFindEntryArg arg;
+    memcpy(arg.name, entry->name, 11);
+    // to upper
+    for (int i = 0; i < 11; i++) {
+        if ('a' <= arg.name[i] && arg.name[i] <= 'z') {
+            arg.name[i] = arg.name[i] - 'a' + 'A';
+        }
+    }
+    arg.found = false;
+    arg.cluster = 0;
+
+    iterate_dir(0, _callback_find_entry, &arg);
+    if (arg.found) {
+        return arg.cluster;
+    }
+    return 0;
 }

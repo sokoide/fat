@@ -8,7 +8,7 @@
 
 // function declaration
 void check_null(void* p);
-void callback_ls(DirectoryEntry* entry);
+void callback_ls(DirectoryEntry* entry, void* p);
 
 // functions
 void check_null(void* p) {
@@ -18,7 +18,7 @@ void check_null(void* p) {
     }
 }
 
-void callback_ls(DirectoryEntry* entry) {
+void callback_ls(DirectoryEntry* entry, void* p) {
     char name[12];
     fat_get_entry_name(entry, name, sizeof(name) / sizeof(name[0]));
     if (entry->attributes & 0x10) {
@@ -56,15 +56,23 @@ int main() {
     fat_print_header_legend();
     fat_print_header_dump();
 
-    /* printf("*** FAT table ***\n"); */
-    /* fat_print_fat12(); */
+    printf("*** FAT table ***\n");
+    fat_print_fat12();
 
     printf("*** Files and Directories ***\n");
     fat_print_directory_entry_header_legend();
-    iterate_dir(0, fat_print_directory_entry_dump);
+    printf("* /\n");
+    iterate_dir(0, fat_print_directory_entry_dump, NULL);
+    printf("* /dir1\n");
+    iterate_dir(8, fat_print_directory_entry_dump, NULL);
+    printf("* /dir2\n");
+    iterate_dir(11, fat_print_directory_entry_dump, NULL);
 
     printf("*** ls / ***\n");
-    iterate_dir(0, callback_ls);
+    iterate_dir(0, callback_ls, NULL);
 
+    printf("*** ls /dir1 ***\n");
+    DirectoryEntry entry;
+    uint32_t cluster = fat_get_cluster_for_entry(&entry);
     return 0;
 }

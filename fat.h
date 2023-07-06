@@ -89,7 +89,7 @@ typedef struct {
 } __attribute__((packed)) DirectoryEntry;
 
 // callback
-typedef void (*iterate_dir_callback)(DirectoryEntry*);
+typedef void (*iterate_dir_callback)(DirectoryEntry*, void*);
 
 // functions
 bool fat_init(FILE* fp);
@@ -105,12 +105,12 @@ void fat_print_idx(uint8_t* base, int* idx, int len);
 void fat_print_idxstr(void* base, int* idxStr, int len);
 void fat_print_fat12();
 void fat_print_directory_entry_header_legend();
-void fat_print_directory_entry_dump(DirectoryEntry* entry);
+void fat_print_directory_entry_dump(DirectoryEntry* entry, void* p);
 void fat_print_directory_entry(DirectoryEntry* entry);
 void fat_print_directory_entry_directory(DirectoryEntry* entry, bool recursive);
 void fat_print_directory_entry_file(DirectoryEntry* entry);
-void iterate_rootdir(iterate_dir_callback callback);
-void iterate_dir(uint32_t cluster, iterate_dir_callback callback);
+void iterate_rootdir(iterate_dir_callback callback, void* p);
+void iterate_dir(uint32_t cluster, iterate_dir_callback callback, void* p);
 char* fat_get_entry_name(DirectoryEntry* entry, char* name, int len);
 
 void* fat_get_ptr();
@@ -120,5 +120,6 @@ void* fat_get_root_directory_start_sector_ptr();
 uint32_t fat_get_fat(uint32_t cluster);
 uint32_t fat_get_cluster_addr(int cluster);
 void* fat_get_cluster_ptr(int cluster);
+uint32_t fat_get_cluster_for_entry(DirectoryEntry* entry);
 
 #endif

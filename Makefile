@@ -75,7 +75,7 @@ fat12:
 	mdir -i $(IMG) ::dir2
 	mdir -i $(IMG) ::dir2/subdir1
 
-	rm hello.txt hoge.txt page.txt
+	rm hello*.txt hoge.txt page.txt
 
 
 clean:

@@ -104,7 +104,7 @@ void fat_print_info() {
     printf("* data start_sector %d\n", _data_start_sector);
 }
 
-void fat_print_header() {
+void fat_print_header_legend() {
     clcl();
 
     fat_print_color = CL_RED;
@@ -120,6 +120,12 @@ void fat_print_header() {
     fat_print_legend("sectors per FAT table");
     fat_print_legend("sectors per track");
     fat_print_legend("head count");
+
+    clcl();
+}
+
+void fat_print_header_dump() {
+    clcl();
 
     // 1st line
     int idx = 0;
@@ -193,7 +199,7 @@ void fat_print_fat12() {
     printf("\n");
 }
 
-void fat_print_directory_entry_header() {
+void fat_print_directory_entry_header_legend() {
     clcl();
 
     fat_print_color = CL_RED;
@@ -213,22 +219,7 @@ void fat_print_directory_entry_header() {
     clcl();
 }
 
-void fat_print_directory_entry(DirectoryEntry* entry) {
-    // Check if entry is unused or deleted
-    if (entry->name[0] == 0x00 || entry->name[0] == 0xE5)
-        return;
-
-    clcl();
-
-    // Check if entry is a directory
-    if (entry->attributes & 0x10) {
-        // Directory
-        fat_print_directory_entry_directory(entry, true);
-    } else {
-        // File entry
-        fat_print_directory_entry_file(entry);
-    }
-
+void fat_print_directory_entry_dump(DirectoryEntry* entry) {
     // 1st line
     int idx = 0;
     const int l1[] = {11, 1, 1, 1, 2, -1};
@@ -241,6 +232,36 @@ void fat_print_directory_entry(DirectoryEntry* entry) {
     clcl();
 }
 
+void fat_print_directory_entry(DirectoryEntry* entry) {
+    // Check if entry is unused or deleted
+    if (entry->name[0] == 0x00 || entry->name[0] == 0xE5)
+        return;
+
+    clcl();
+
+    // Check if entry is a directory
+    if (entry->attributes & 0x10) {
+        // Directory
+        if (entry->name[0] != '.') {
+            fat_print_directory_entry_directory(entry, true);
+        }
+    } else {
+        // File entry
+        fat_print_directory_entry_file(entry);
+    }
+
+    /* // 1st line */
+    /* int idx = 0; */
+    /* const int l1[] = {11, 1, 1, 1, 2, -1}; */
+    /* const int l2[] = {2, 2, 2, 2, 2, 2, 4, -1}; */
+    /* fat_print_idx_wide((uint8_t*)entry, &idx, l1); */
+    /* printf("\n"); */
+    /* // 2nd line */
+    /* fat_print_idx_wide((uint8_t*)entry, &idx, l2); */
+    /* printf("\n"); */
+    /* clcl(); */
+}
+
 void fat_print_directory_entry_directory(DirectoryEntry* entry,
                                          bool recursive) {
     // the entry must be a directory
@@ -251,19 +272,45 @@ void fat_print_directory_entry_directory(DirectoryEntry* entry,
     printf("Directory: %s, cluster:%d[0x%08X]\n", directoryName,
            entry->startingClusterNumber,
            fat_get_cluster_addr(entry->startingClusterNumber));
+    fat_print_directory_entry_dump(entry);
+
     if (recursive && entry->startingClusterNumber > 0) {
         DirectoryEntry* subEntries =
             (DirectoryEntry*)fat_get_cluster_ptr(entry->startingClusterNumber);
-        // TODO: must support a directory which has multi clusters
-        for (int i = 0;
-             i < _fat_bs->bytesPerSector * _fat_bs->sectorsPerCluster /
-                     sizeof(DirectoryEntry);
-             i++) {
-            if (subEntries[i].name[0] == 0x00)
-                break;
-            else if (subEntries[i].name[0] == '.')
-                continue;
-            fat_print_directory_entry(&subEntries[i]);
+        if (entry->startingClusterNumber == 0) {
+            // root directory
+            for (int i = 0;
+                 i < _fat_bs->bytesPerSector * _fat_bs->sectorsPerCluster /
+                         sizeof(DirectoryEntry);
+                 i++) {
+                if (subEntries[i].name[0] == 0x00)
+                    break;
+                else if (subEntries[i].name[0] == '.')
+                    continue;
+                fat_print_directory_entry(&subEntries[i]);
+            }
+        } else {
+            // non-root directory
+            uint32_t cluster = entry->startingClusterNumber;
+            uint32_t nextCluster = fat_get_fat(cluster);
+            DirectoryEntry* directoryEntries;
+
+            while (cluster < 0xF00) {
+                nextCluster = fat_get_fat(cluster);
+                directoryEntries =
+                    (DirectoryEntry*)(fat_get_cluster_ptr(cluster));
+                for (int i = 0;
+                     i < _fat_bs->bytesPerSector * _fat_bs->sectorsPerCluster /
+                             sizeof(DirectoryEntry);
+                     i++) {
+                    DirectoryEntry* entry = &directoryEntries[i];
+                    // 0x00 not use, 0xE5 deleted
+                    if (entry->name[0] == 0x00 || entry->name[0] == 0xE5)
+                        break;
+                    fat_print_directory_entry(&directoryEntries[i]);
+                }
+                cluster = nextCluster;
+            }
         }
     }
 }
@@ -277,6 +324,56 @@ void fat_print_directory_entry_file(DirectoryEntry* entry) {
     printf("File: %s, cluster:%d[0x%08X],  size:%d\n", fileName,
            entry->startingClusterNumber,
            fat_get_cluster_addr(entry->startingClusterNumber), entry->fileSize);
+    fat_print_directory_entry_dump(entry);
+}
+
+void iterate_rootdir() {
+    DirectoryEntry* directoryEntries;
+    FatBS* bs = (FatBS*)fat_get_ptr();
+
+    directoryEntries =
+        (DirectoryEntry*)fat_get_root_directory_start_sector_ptr();
+
+    for (int i = 0; i < bs->rootEntryCount; i++) {
+        DirectoryEntry* entry = &directoryEntries[i];
+        // 0x00 not use, 0xE5 deleted
+        if (entry->name[0] == 0x00 || entry->name[0] == 0xE5)
+            break;
+        fat_print_directory_entry(&directoryEntries[i]);
+        /* if (entry->attributes & 0x10) { */
+        /*     if (entry->name[0] != '.') { */
+        /*         // Directory */
+        /*     } */
+        /* } else { */
+        /*     // File */
+        /* } */
+    }
+}
+
+void iterate_dir(uint32_t cluster) {
+    uint32_t nextCluster;
+    DirectoryEntry* directoryEntries;
+    FatBS* bs = (FatBS*)fat_get_ptr();
+
+    if (cluster == 0)
+        return iterate_rootdir();
+
+    nextCluster = fat_get_fat(cluster);
+
+    while (cluster < 0xF00) {
+        nextCluster = fat_get_fat(cluster);
+        directoryEntries = (DirectoryEntry*)(fat_get_cluster_ptr(cluster));
+        for (int i = 0; i < bs->bytesPerSector * bs->sectorsPerCluster /
+                                sizeof(DirectoryEntry);
+             i++) {
+            DirectoryEntry* entry = &directoryEntries[i];
+            // 0x00 not use, 0xE5 deleted
+            if (entry->name[0] == 0x00 || entry->name[0] == 0xE5)
+                break;
+            fat_print_directory_entry(&directoryEntries[i]);
+        }
+        cluster = nextCluster;
+    }
 }
 
 void* fat_get_ptr() { return _fat_buffer; }

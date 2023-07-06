@@ -94,16 +94,20 @@ void fat_unint();
 
 void increment_color();
 void fat_print_info();
-void fat_print_header();
+void fat_print_header_legend();
+void fat_print_header_dump();
 void fat_print_legend(char* legend);
 void fat_print_idx_wide(uint8_t* base, int* idx, const int* lens);
 void fat_print_idx(uint8_t* base, int* idx, int len);
 void fat_print_idxstr(void* base, int* idxStr, int len);
 void fat_print_fat12();
-void fat_print_directory_entry_header();
+void fat_print_directory_entry_header_legend();
+void fat_print_directory_entry_dump(DirectoryEntry* entry);
 void fat_print_directory_entry(DirectoryEntry* entry);
 void fat_print_directory_entry_directory(DirectoryEntry* entry, bool recursive);
 void fat_print_directory_entry_file(DirectoryEntry* entry);
+void iterate_dir(uint32_t cluster);
+void iterate_rootdir();
 
 void* fat_get_ptr();
 enum FAT_TYPE fat_get_type();

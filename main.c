@@ -38,22 +38,15 @@ int main() {
     printf("*** FAT info ***\n");
     fat_print_info();
     printf("*** BIOS parameter block ***\n");
-    fat_print_header();
+    fat_print_header_legend();
+    fat_print_header_dump();
 
-    FatBS* _fat_bs = (FatBS*)fat_get_ptr();
-    void* sector_data;
-
-    printf("*** FAT table ***\n");
-    fat_print_fat12();
+    /* printf("*** FAT table ***\n"); */
+    /* fat_print_fat12(); */
 
     printf("*** Files and Directories ***\n");
-    fat_print_directory_entry_header();
-    DirectoryEntry* directoryEntries =
-        (DirectoryEntry*)fat_get_root_directory_start_sector_ptr();
-    // Traverse the root directory entries
-    for (int i = 0; i < _fat_bs->rootEntryCount; i++) {
-        fat_print_directory_entry(&directoryEntries[i]);
-    }
+    fat_print_directory_entry_header_legend();
+    iterate_dir(0);
 
     return 0;
 }

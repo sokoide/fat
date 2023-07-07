@@ -9,6 +9,7 @@
 // function declaration
 void check_null(void* p);
 void callback_ls(DirectoryEntry* entry, void* p);
+void cat_file(uint32_t cluster, uint32_t file_size);
 
 // functions
 void check_null(void* p) {
@@ -30,6 +31,24 @@ void callback_ls(DirectoryEntry* entry, void* p) {
     } else {
         // File
         printf("F %s %u\n", name, entry->fileSize);
+    }
+}
+
+void cat_file(uint32_t cluster, uint32_t file_size) {
+    char buffer[1025];
+    while (file_size > 0) {
+        uint8_t* p = fat_get_cluster_ptr(cluster);
+        if (file_size >= 1024) {
+            memcpy(buffer, p, 1024);
+            buffer[1024] = '\0';
+            file_size -= 1024;
+            cluster = fat_get_fat(cluster);
+        } else {
+            memcpy(buffer, p, file_size);
+            buffer[file_size] = '\0';
+            file_size = 0;
+        }
+        printf("%s", buffer);
     }
 }
 
@@ -94,12 +113,10 @@ int main() {
     fat_set_entry_name(&entry, "hoge.txt");
     cluster = fat_get_cluster_for_entry(cluster_dir1, &entry);
     printf("cluster: %u, size: %u\n", cluster, entry.fileSize);
-    char* p = fat_get_cluster_ptr(cluster);
 
-    char buffer[1025];
-    memcpy(buffer, p, entry.fileSize);
-    buffer[entry.fileSize] = '\0';
-    printf("```%s```\n", buffer);
+    printf("```");
+    cat_file(cluster, entry.fileSize);
+    printf("```\n");
 
     printf("*** cat /test_5kb.txt *** \n");
     fat_set_entry_name(&entry, "test_5kb.txt");
@@ -107,21 +124,20 @@ int main() {
     printf("cluster: %u, size: %u\n", cluster, entry.fileSize);
     uint32_t fileSize = entry.fileSize;
     printf("```");
-    while (fileSize > 0) {
-        p = fat_get_cluster_ptr(cluster);
-        if (fileSize >= 1024) {
-            memcpy(buffer, p, 1024);
-            buffer[1024] = '\0';
-            fileSize -= 1024;
-            cluster = fat_get_fat(cluster);
-        } else {
-            memcpy(buffer, p, fileSize);
-            buffer[fileSize] = '\0';
-            fileSize = 0;
-        }
-        printf("%s", buffer);
-    }
+    cat_file(cluster, entry.fileSize);
+    printf("```\n");
+
+    printf("*** cat /dir2/subdir1/page.txt *** \n");
+    fat_set_entry_name(&entry, "subdir1");
+    uint32_t cluster_dir2_subdir1 =
+        fat_get_cluster_for_entry(cluster_dir2, &entry);
+    fat_set_entry_name(&entry, "page.txt");
+    cluster = fat_get_cluster_for_entry(cluster_dir2_subdir1, &entry);
+    printf("cluster: %u, size: %u\n", cluster, entry.fileSize);
+
     printf("```");
+    cat_file(cluster, entry.fileSize);
+    printf("```\n");
 
     return 0;
 }

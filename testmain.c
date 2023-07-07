@@ -149,6 +149,17 @@ void test_fat_get_cluster_for_entry() {
     assert(cluster == 11);
 }
 
+void spike_strtok() {
+    char* token;
+    char str[] = "//dir1///dir2/file";
+    const char* delim = "/";
+    token = strtok(str, delim);
+    while (token) {
+        printf("token: %s\n", token);
+        token = strtok(NULL, delim);
+    }
+}
+
 int main() {
     FILE* fp = fopen("demof12.fat", "rb");
     assert(fp != NULL);
@@ -162,15 +173,6 @@ int main() {
     test_fat_set_entry_name();
     test_fat_get_cluster_for_entry();
     fat_unint();
-
-    char* token;
-    char str[] = "dir1/dir2/file";
-    const char* delim = "/";
-    token = strtok(str, delim);
-    while (token) {
-        printf("token: %s\n", token);
-        token = strtok(NULL, delim);
-    }
 
     fclose(fp);
     return 0;

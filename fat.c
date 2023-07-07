@@ -378,7 +378,7 @@ char* fat_get_entry_name(DirectoryEntry* entry, char* name, int len) {
         fprintf(stderr, "len must be >=12");
         return NULL;
     }
-    strncpy(name, (const char*)(entry->name), 8);
+    memcpy(name, (const char*)(entry->name), 8);
     int i;
     for (i = 0; i < 8; i++) {
         if (name[i] == 0x20)
@@ -387,7 +387,7 @@ char* fat_get_entry_name(DirectoryEntry* entry, char* name, int len) {
     if ((entry->attributes & 0x18) == 0) {
         // not Directory or Volume
         name[i++] = '.';
-        strncpy(&name[i], (const char*)&(entry->name[8]), 3);
+        memcpy(&name[i], (const char*)&(entry->name[8]), 3);
         i += 3;
     }
     name[i] = '\0';

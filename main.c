@@ -21,7 +21,7 @@ void check_null(void* p) {
 }
 
 void callback_ls(DirectoryEntry* entry, void* p) {
-    char name[12];
+    char name[13]; // 8 + '.' + 3 + '\0'
     fat_get_entry_name(entry, name, sizeof(name) / sizeof(name[0]));
     if (entry->attributes & 0x10) {
         // Directory

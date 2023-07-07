@@ -163,6 +163,15 @@ int main() {
     test_fat_get_cluster_for_entry();
     fat_unint();
 
+    char* token;
+    char str[] = "dir1/dir2/file";
+    const char* delim = "/";
+    token = strtok(str, delim);
+    while (token) {
+        printf("token: %s\n", token);
+        token = strtok(NULL, delim);
+    }
+
     fclose(fp);
     return 0;
 }

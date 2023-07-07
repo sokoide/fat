@@ -142,7 +142,7 @@ void fat_print_header_dump() {
     clcl();
 }
 
-void fat_print_legend(char* legend) {
+void fat_print_legend(const char* legend) {
     cl(fat_print_color);
     printf("- %s\n", legend);
     increment_color();
@@ -394,7 +394,7 @@ char* fat_get_entry_name(DirectoryEntry* entry, char* name, int len) {
     return name;
 }
 
-void fat_set_entry_name(DirectoryEntry* entry, char* name) {
+void fat_set_entry_name(DirectoryEntry* entry, const char* name) {
     int name_len = strlen(name);
     int dotPos = -1;
     int i = 0;

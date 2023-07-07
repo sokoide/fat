@@ -9,7 +9,8 @@
 // function declaration
 void check_null(void* p);
 void callback_ls(DirectoryEntry* entry, void* p);
-void cat_file(uint32_t cluster, uint32_t file_size);
+void cat_file(uint32_t current_cluster, const char* path);
+void cat_file_for_cluster(uint32_t cluster, uint32_t file_size);
 
 // functions
 void check_null(void* p) {
@@ -34,7 +35,26 @@ void callback_ls(DirectoryEntry* entry, void* p) {
     }
 }
 
-void cat_file(uint32_t cluster, uint32_t file_size) {
+void cat_file(uint32_t current_cluster, const char* path) {
+    DirectoryEntry entry;
+    char* token;
+    const char* delim = "/";
+    char tmp_path[64];
+    strcpy(tmp_path, path);
+
+    token = strtok(tmp_path, delim);
+    uint32_t prev_cluster;
+    uint32_t cluster = current_cluster;
+    while (token) {
+        prev_cluster = cluster;
+        fat_set_entry_name(&entry, token);
+        cluster = fat_get_cluster_for_entry(prev_cluster, &entry);
+        token = strtok(NULL, delim);
+    }
+    cat_file_for_cluster(cluster, entry.fileSize);
+}
+
+void cat_file_for_cluster(uint32_t cluster, uint32_t file_size) {
     char buffer[1025];
     while (file_size > 0) {
         uint8_t* p = fat_get_cluster_ptr(cluster);
@@ -93,51 +113,30 @@ int main() {
     printf("*** ls /dir1 ***\n");
     DirectoryEntry entry;
     fat_set_entry_name(&entry, "dir1");
-    uint32_t cluster_dir1 = fat_get_cluster_for_entry(0, &entry);
-    printf("cluster: %u\n", cluster_dir1);
-    iterate_dir(cluster_dir1, callback_ls, NULL);
+    uint32_t cluster = fat_get_cluster_for_entry(0, &entry);
+    printf("cluster: %u\n", cluster);
+    iterate_dir(cluster, callback_ls, NULL);
 
     printf("*** ls /dir2 ***\n");
     fat_set_entry_name(&entry, "dir2");
-    uint32_t cluster_dir2 = fat_get_cluster_for_entry(0, &entry);
-    printf("cluster: %u\n", cluster_dir2);
-    iterate_dir(cluster_dir2, callback_ls, NULL);
+    cluster = fat_get_cluster_for_entry(0, &entry);
+    printf("cluster: %u\n", cluster);
+    iterate_dir(cluster, callback_ls, NULL);
 
     printf("*** ls /dir2/subbdir1 ***\n");
     fat_set_entry_name(&entry, "subdir1");
-    uint32_t cluster = fat_get_cluster_for_entry(cluster_dir2, &entry);
+    cluster = fat_get_cluster_for_entry(cluster, &entry);
     printf("cluster: %u\n", cluster);
     iterate_dir(cluster, callback_ls, NULL);
 
     printf("*** cat /dir1/hoge.txt *** \n");
-    fat_set_entry_name(&entry, "hoge.txt");
-    cluster = fat_get_cluster_for_entry(cluster_dir1, &entry);
-    printf("cluster: %u, size: %u\n", cluster, entry.fileSize);
-
-    printf("```");
-    cat_file(cluster, entry.fileSize);
-    printf("```\n");
+    cat_file(0, "dir1/hoge.txt");
 
     printf("*** cat /test_5kb.txt *** \n");
-    fat_set_entry_name(&entry, "test_5kb.txt");
-    cluster = fat_get_cluster_for_entry(0, &entry);
-    printf("cluster: %u, size: %u\n", cluster, entry.fileSize);
-    uint32_t fileSize = entry.fileSize;
-    printf("```");
-    cat_file(cluster, entry.fileSize);
-    printf("```\n");
+    cat_file(0, "test_5kb.txt");
 
     printf("*** cat /dir2/subdir1/page.txt *** \n");
-    fat_set_entry_name(&entry, "subdir1");
-    uint32_t cluster_dir2_subdir1 =
-        fat_get_cluster_for_entry(cluster_dir2, &entry);
-    fat_set_entry_name(&entry, "page.txt");
-    cluster = fat_get_cluster_for_entry(cluster_dir2_subdir1, &entry);
-    printf("cluster: %u, size: %u\n", cluster, entry.fileSize);
-
-    printf("```");
-    cat_file(cluster, entry.fileSize);
-    printf("```\n");
+    cat_file(0, "dir2/subdir1/page.txt");
 
     return 0;
 }

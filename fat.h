@@ -85,7 +85,7 @@ typedef struct {
     unsigned short lastWriteTime;
     unsigned short lastWriteDate;
     unsigned short startingClusterNumber;
-    unsigned int fileSize;
+    uint32_t fileSize;
 } __attribute__((packed)) DirectoryEntry;
 
 // callback
@@ -99,7 +99,7 @@ void increment_color();
 void fat_print_info();
 void fat_print_header_legend();
 void fat_print_header_dump();
-void fat_print_legend(char* legend);
+void fat_print_legend(const char* legend);
 void fat_print_idx_wide(uint8_t* base, int* idx, const int* lens);
 void fat_print_idx(uint8_t* base, int* idx, int len);
 void fat_print_idxstr(void* base, int* idxStr, int len);
@@ -113,7 +113,7 @@ void fat_print_directory_entry_file(DirectoryEntry* entry);
 void iterate_rootdir(iterate_dir_callback callback, void* p);
 void iterate_dir(uint32_t cluster, iterate_dir_callback callback, void* p);
 char* fat_get_entry_name(DirectoryEntry* entry, char* name, int len);
-void fat_set_entry_name(DirectoryEntry* entry, char* name);
+void fat_set_entry_name(DirectoryEntry* entry, const char* name);
 
 void* fat_get_ptr();
 enum FAT_TYPE fat_get_type();

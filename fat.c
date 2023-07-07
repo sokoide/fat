@@ -148,7 +148,7 @@ void fat_print_legend(const char* legend) {
     increment_color();
 }
 
-void fat_print_idx_wide(uint8_t* base, int* idx, const int* lens) {
+void fat_print_idx_wide(const uint8_t* base, int* idx, const int* lens) {
     int idxStr = *idx;
     fat_print_color = CL_RED;
     for (int i = 0; lens[i] > 0; i++) {
@@ -161,7 +161,7 @@ void fat_print_idx_wide(uint8_t* base, int* idx, const int* lens) {
     }
 }
 
-void fat_print_idx(uint8_t* base, int* idx, int len) {
+void fat_print_idx(const uint8_t* base, int* idx, const int len) {
     cl(fat_print_color);
     for (int i = 0; i < len; i++) {
         printf("%02x ", (base)[*idx + i]);
@@ -170,7 +170,7 @@ void fat_print_idx(uint8_t* base, int* idx, int len) {
     increment_color();
 }
 
-void fat_print_idxstr(void* base, int* idxStr, int len) {
+void fat_print_idxstr(const void* base, int* idxStr, const int len) {
     cl(fat_print_color);
     for (int i = 0; i < len; i++) {
         uint8_t u = *(uint8_t*)(base + *idxStr + i);

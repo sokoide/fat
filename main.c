@@ -1,175 +1,161 @@
-#include "color.h"
 #include "fat.h"
-#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <string.h>
+#include <stdlib.h>
+
+// fat_dump.c exports (no public header yet; keep in sync with fat_dump.c)
+void fat_print_info(const fat_ctx_t* ctx);
+void fat_print_header_legend(void);
+void fat_print_header_dump(const fat_ctx_t* ctx);
+void fat_print_fat12(const fat_ctx_t* ctx);
+void fat_print_directory_entry_header_legend(void);
+void fat_print_directory_entry_dump(const fat_dirent_t* entry,
+                                    const uint8_t* raw32, void* user_data);
 
 // function declaration
-void callback_ls(DirectoryEntry* entry, void* p);
-uint32_t cluster_for_path(uint32_t current_cluster, const char* path,
-                          DirectoryEntry* entry);
-void cat_file(uint32_t current_cluster, const char* path);
-void cat_file_for_cluster(uint32_t cluster, uint32_t file_size);
+static void callback_ls(const fat_dirent_t* entry, const uint8_t* raw32,
+                        void* user);
+static fat_result_t lookup_dir(fat_ctx_t* ctx, const char* path,
+                               fat_dirent_t* out);
+static void iterate_directory(fat_ctx_t* ctx, uint32_t dir_cluster,
+                              fat_iter_cb cb);
+static void cat_file(fat_ctx_t* ctx, const char* path);
 
 // functions
-void callback_ls(DirectoryEntry* entry, void* p) {
-    (void)p;
-    char name[13]; // 8 + '.' + 3 + '\0'
-    if (fat_get_entry_name(entry, name, sizeof(name) / sizeof(name[0])) ==
-        NULL) {
-        return;
-    }
+static void callback_ls(const fat_dirent_t* entry, const uint8_t* raw32,
+                        void* user) {
+    (void)raw32; // only the dump views need the raw bytes
+    (void)user;
     if (entry->attributes & 0x10) {
         // Directory
-        printf("D %s\n", name);
+        printf("D %s\n", entry->name);
     } else if (entry->attributes & 0x08) {
         // Volume Label
-        printf("V %s\n", name);
+        printf("V %s\n", entry->name);
     } else {
         // File
-        printf("F %s %u\n", name, entry->fileSize);
+        printf("F %s %u\n", entry->name, entry->file_size);
     }
 }
 
-uint32_t cluster_for_path(uint32_t current_cluster, const char* path,
-                          DirectoryEntry* entry) {
-    char* token;
-    char* next;
-    char* saveptr;
-    const char* delim = "/";
-    char tmp_path[64];
-
-    if (snprintf(tmp_path, sizeof(tmp_path), "%s", path) >=
-        (int)sizeof(tmp_path)) {
-        fprintf(stderr, "path too long: '%s'.\n", path);
-        return FAT_CLUSTER_NOT_FOUND;
+// resolve `path` from the root and require a directory; reports errors.
+// Returns FAT_OK and fills *out on success.
+static fat_result_t lookup_dir(fat_ctx_t* ctx, const char* path,
+                               fat_dirent_t* out) {
+    fat_result_t ret = fat_lookup(ctx, FAT_CLUSTER_ROOT, path, out);
+    if (ret != FAT_OK) {
+        fprintf(stderr, "lookup '%s': %s\n", path, fat_strerror(ret));
+        return ret;
     }
-
-    uint32_t cluster = current_cluster;
-    token = strtok_r(tmp_path, delim, &saveptr);
-    while (token) {
-        if (!fat_set_entry_name(entry, token)) {
-            // not representable as an 8.3 name
-            fprintf(stderr, "invalid name: '%s'.\n", token);
-            return FAT_CLUSTER_NOT_FOUND;
-        }
-        cluster = fat_get_cluster_for_entry(cluster, entry);
-        if (cluster == FAT_CLUSTER_NOT_FOUND) {
-            return FAT_CLUSTER_NOT_FOUND;
-        }
-        next = strtok_r(NULL, delim, &saveptr);
-        if (next != NULL && !(entry->attributes & 0x10)) {
-            // intermediate path components must be directories
-            fprintf(stderr, "'%s' is not a directory.\n", token);
-            return FAT_CLUSTER_NOT_FOUND;
-        }
-        token = next;
+    if (!(out->attributes & 0x10)) {
+        // the target of ls / a raw dump must be a directory
+        fprintf(stderr, "'%s' is not a directory.\n", path);
+        return FAT_ERR_PATH_NOT_FOUND;
     }
-    return cluster;
+    return FAT_OK;
 }
 
-void cat_file(uint32_t current_cluster, const char* path) {
-    DirectoryEntry entry;
-    uint32_t cluster = cluster_for_path(current_cluster, path, &entry);
-    if (cluster != FAT_CLUSTER_NOT_FOUND) {
-        cat_file_for_cluster(cluster, entry.fileSize);
-    } else {
-        fprintf(stderr, "path not found.\n");
+// iterate one directory (FAT_CLUSTER_ROOT for the root), reporting errors
+static void iterate_directory(fat_ctx_t* ctx, uint32_t dir_cluster,
+                              fat_iter_cb cb) {
+    fat_result_t ret = fat_iter_dir(ctx, dir_cluster, cb, NULL);
+    if (ret != FAT_OK) {
+        fprintf(stderr, "iterate directory: %s\n", fat_strerror(ret));
     }
 }
 
-void cat_file_for_cluster(uint32_t cluster, uint32_t file_size) {
-    uint32_t cluster_size = fat_get_cluster_size();
-    if (cluster_size == 0) {
-        fprintf(stderr, "invalid cluster size.\n");
+static void cat_file(fat_ctx_t* ctx, const char* path) {
+    fat_dirent_t entry;
+    fat_result_t ret = fat_lookup(ctx, FAT_CLUSTER_ROOT, path, &entry);
+    if (ret != FAT_OK) {
+        fprintf(stderr, "cat '%s': %s\n", path, fat_strerror(ret));
         return;
     }
-    while (file_size > 0) {
-        uint8_t* p = fat_get_cluster_ptr(cluster);
-        if (p == NULL) {
-            fprintf(stderr, "broken cluster chain at cluster %u.\n", cluster);
-            return;
-        }
-        uint32_t bytes_this =
-            (file_size < cluster_size) ? file_size : cluster_size;
-        fwrite(p, 1, bytes_this, stdout);
-        file_size -= bytes_this;
-        if (file_size > 0) {
-            // data remains: the current cluster must have a successor
-            if (fat_is_end_of_cluster(cluster) || fat_is_broken(cluster)) {
-                fprintf(stderr,
-                        "warning: cluster chain ended at %u with %u bytes "
-                        "remaining.\n",
-                        cluster, file_size);
-                return;
-            }
-            cluster = fat_get_fat(cluster);
-        }
+
+    uint8_t* buf = NULL;
+    size_t len = 0;
+    ret = fat_read_file(ctx, &entry, &buf, &len);
+    if (ret != FAT_OK) {
+        fprintf(stderr, "cat '%s': %s\n", path, fat_strerror(ret));
+        return;
     }
+    if (len > 0) {
+        fwrite(buf, 1, len, stdout);
+    }
+    free(buf);
 }
 
-int main() {
-    char* fat_path = "demof12.fat";
-    FILE* fp = fopen(fat_path, "rb");
-    if (fp == NULL) {
-        fprintf(stderr, "failed to open the fat image '%s'.\n", fat_path);
-        return 1;
-    }
+int main(void) {
+    const char* fat_path = "demof12.fat";
+    fat_ctx_t* ctx = NULL;
 
     // ref: https://free.pjc.co.jp/fat/mem/fatm122.html
     // FAT12
-    bool ret = fat_init(fp);
-    if (!ret) {
-        fprintf(stderr, "fat_init failed\n");
+    fat_result_t ret = fat_open(fat_path, &ctx);
+    if (ret != FAT_OK) {
+        fprintf(stderr, "fat_open '%s': %s\n", fat_path, fat_strerror(ret));
+        fat_close(ctx); // no-op on NULL
         return 1;
     }
-    fclose(fp);
+
+    fat_dirent_t entry;
 
     printf("*** FAT info ***\n");
-    fat_print_info();
+    fat_print_info(ctx);
     printf("*** BIOS parameter block ***\n");
     fat_print_header_legend();
-    fat_print_header_dump();
+    fat_print_header_dump(ctx);
 
     printf("*** FAT table ***\n");
-    fat_print_fat12();
+    fat_print_fat12(ctx);
 
     printf("*** Files and Directories ***\n");
     fat_print_directory_entry_header_legend();
     printf("* /\n");
-    iterate_dir(0, fat_print_directory_entry_dump, NULL);
+    iterate_directory(ctx, FAT_CLUSTER_ROOT, fat_print_directory_entry_dump);
     printf("* /dir1\n");
-    iterate_dir(8, fat_print_directory_entry_dump, NULL);
+    if (lookup_dir(ctx, "dir1", &entry) == FAT_OK) {
+        iterate_directory(ctx, entry.first_cluster,
+                          fat_print_directory_entry_dump);
+    }
     printf("* /dir2\n");
-    iterate_dir(11, fat_print_directory_entry_dump, NULL);
+    if (lookup_dir(ctx, "dir2", &entry) == FAT_OK) {
+        iterate_directory(ctx, entry.first_cluster,
+                          fat_print_directory_entry_dump);
+    }
 
     printf("*** ls / ***\n");
-    iterate_dir(0, callback_ls, NULL);
+    iterate_directory(ctx, FAT_CLUSTER_ROOT, callback_ls);
 
     printf("*** ls /dir1 ***\n");
-    DirectoryEntry entry;
-    uint32_t cluster = cluster_for_path(0, "dir1", &entry);
-    printf("cluster: %u\n", cluster);
-    iterate_dir(cluster, callback_ls, NULL);
+    if (lookup_dir(ctx, "dir1", &entry) == FAT_OK) {
+        printf("cluster: %u\n", entry.first_cluster);
+        iterate_directory(ctx, entry.first_cluster, callback_ls);
+    }
 
     printf("*** ls /dir2 ***\n");
-    cluster = cluster_for_path(0, "dir2", &entry);
-    iterate_dir(cluster, callback_ls, NULL);
+    if (lookup_dir(ctx, "dir2", &entry) == FAT_OK) {
+        iterate_directory(ctx, entry.first_cluster, callback_ls);
+    }
 
     printf("*** ls /dir2/subdir1 ***\n");
-    cluster = cluster_for_path(0, "/dir2/subdir1", &entry);
-    iterate_dir(cluster, callback_ls, NULL);
+    if (lookup_dir(ctx, "dir2/subdir1", &entry) == FAT_OK) {
+        iterate_directory(ctx, entry.first_cluster, callback_ls);
+    }
 
     printf("*** cat /dir1/hoge.txt *** \n");
-    cat_file(0, "dir1/hoge.txt");
+    cat_file(ctx, "dir1/hoge.txt");
 
     printf("*** cat /test_5kb.txt *** \n");
-    cat_file(0, "test_5kb.txt");
+    cat_file(ctx, "test_5kb.txt");
 
     printf("*** cat /dir2/subdir1/page.txt *** \n");
-    cat_file(0, "dir2/subdir1/page.txt");
+    cat_file(ctx, "dir2/subdir1/page.txt");
 
-    fat_uninit();
+    // '.' stays in the current directory, '..' walks back to the root
+    printf("*** cat /dir1/../hello.txt *** \n");
+    cat_file(ctx, "dir1/../hello.txt");
+
+    fat_close(ctx);
     return 0;
 }

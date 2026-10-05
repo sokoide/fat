@@ -1,135 +1,143 @@
-#ifndef _FAT_H_
-#define _FAT_H_
+#ifndef FAT_H
+#define FAT_H
 
-#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
 
-// constants
-#define FAT_CLUSTER_ROOT 0u
-#define FAT_CLUSTER_NOT_FOUND 0xFFFFFFFFu
+// cluster sentinels
+#define FAT_CLUSTER_ROOT 0u                // root directory (FAT12/16 fixed region)
+#define FAT_CLUSTER_NOT_FOUND 0xFFFFFFFFu  // no FAT entry / out of range
 
-// enum
+#define FAT_NAME_MAX 256 // 8.3 today, LFN-ready size
+
+// FAT flavor of an opened image
 enum FAT_TYPE {
     FT_UNKNOWN = 0,
     FT_FAT12 = 1,
-    FT_FAT16 = 2,
-    FT_FAT32 = 3,
+    FT_FAT16 = 2, // detected but rejected by fat_open (phase 2)
+    FT_FAT32 = 3, // detected but rejected by fat_open (phase 2)
 };
 
-// globals
+// every public function returns this; FAT_OK == 0 on success
+typedef enum {
+    FAT_OK = 0,
+    FAT_ERR_IO,              // file read failure
+    FAT_ERR_NOMEM,
+    FAT_ERR_INVALID_BPB,     // malformed boot sector / geometry
+    FAT_ERR_UNSUPPORTED,     // e.g. FAT16/FAT32 images
+    FAT_ERR_NAME_TOO_LONG,
+    FAT_ERR_BUFFER_TOO_SMALL,
+    FAT_ERR_INVALID_ARG,
+    FAT_ERR_NOT_FOUND,       // final path component not found
+    FAT_ERR_PATH_NOT_FOUND,  // intermediate directory missing or not a dir
+    FAT_ERR_BAD_CLUSTER,     // broken/looping cluster chain
+} fat_result_t;
 
-// structs
-//
-// // FAT32
-// typedef struct {
-//     // extended fat32 stuff
-//     unsigned int table_size_32;
-//     unsigned short extended_flags;
-//     unsigned short fat_version;
-//     unsigned int root_cluster;
-//     unsigned short fat_info;
-//     unsigned short backup_BS_sector;
-//     unsigned char reserved_0[12];
-//     unsigned char drive_number;
-//     unsigned char reserved_1;
-//     unsigned char boot_signature;
-//     unsigned int volume_id;
-//     unsigned char volume_label[11];
-//     unsigned char fat_type_label[8];
+const char* fat_strerror(fat_result_t r);
 
-// } __attribute__((packed)) FatExtBS32;
-
-// Extended Boot Record
+// parsed directory entry (name rendered from 8.3; LFN-ready size)
 typedef struct {
-    // extended fat12 and fat16 stuff
-    unsigned char biosDriveNum;
-    unsigned char reserved1;
-    unsigned char bootSignature;
-    unsigned int volumeId;
-    unsigned char volumeLabel[11];
-    unsigned char fatTypeLabel[8];
+    char name[FAT_NAME_MAX];
+    uint8_t attributes;
+    uint8_t creation_time_tenth;
+    uint16_t creation_time;
+    uint16_t creation_date;
+    uint16_t last_access_date;
+    uint16_t last_write_time;
+    uint16_t last_write_date;
+    uint32_t first_cluster;
+    uint32_t file_size;
+} fat_dirent_t;
 
-} __attribute__((packed)) FatExtBS16;
+// iteration callback: parsed entry + the 32 raw on-disk bytes (dump views).
+// raw32 is only valid during the callback.
+typedef void (*fat_iter_cb)(const fat_dirent_t* entry, const uint8_t* raw32,
+                            void* user_data);
 
-// BIOS Parameter Block
+// opaque context; internal definition lives in fat_internal.h
+typedef struct fat_ctx fat_ctx_t;
+
+// validated, host-endian geometry of an opened image
 typedef struct {
-    unsigned char bootJmp[3];
-    unsigned char oemName[8];
-    unsigned short bytesPerSector;
-    unsigned char sectorsPerCluster;
-    unsigned short reservedSectorCount;
-    unsigned char tableCount;
-    unsigned short rootEntryCount;
-    unsigned short totalSectors16;
-    unsigned char mediaType;
-    unsigned short tableSize16;
-    unsigned short sectorsPerTrack;
-    unsigned short headSideCount;
-    unsigned int hiddenSectorCount;
-    unsigned int totalSectors32;
+    uint16_t bytes_per_sector;
+    uint8_t sectors_per_cluster;
+    uint16_t reserved_sectors;
+    uint8_t fat_count;
+    uint16_t fat_sectors;   // sectors per FAT table (tableSize16)
+    uint16_t root_entries;
+    uint32_t total_sectors; // totalSectors16 (FAT12/16)
+    uint32_t fat_start_sector;
+    uint32_t root_dir_sector;
+    uint32_t root_dir_sectors;
+    uint32_t data_start_sector;
+    uint32_t cluster_count; // data clusters; valid data clusters are 2..cluster_count+1
+} fat_geometry_t;
 
-    // this will be cast to it's specific type once the driver actually knows
-    // what type of FAT this is.
-    unsigned char extended_section[54];
+// lifecycle -----------------------------------------------------------
 
-} __attribute__((packed)) FatBS;
+// Load the whole image from `path`, validate the BPB, bind `*out`.
+fat_result_t fat_open(const char* path, fat_ctx_t** out);
 
-// ref: https://wiki.osdev.org/FAT#Directories_on_FAT12.2F16.2F32
-typedef struct {
-    unsigned char name[11];
-    unsigned char attributes;
-    unsigned char reserved[1];
-    unsigned char creationTimeTenthOfSecond;
-    unsigned short creationTime;
-    unsigned short creationDate;
-    unsigned short lastAccessDate;
-    unsigned short ignoreInFAT12;
-    unsigned short lastWriteTime;
-    unsigned short lastWriteDate;
-    unsigned short startingClusterNumber;
-    uint32_t fileSize;
-} __attribute__((packed)) DirectoryEntry;
+// Same, from a memory image. The buffer is copied; the caller keeps
+// ownership of `image`. Enables in-process synthetic/mutated images.
+fat_result_t fat_open_mem(const uint8_t* image, size_t size, fat_ctx_t** out);
 
-// callback
-typedef void (*iterate_dir_callback)(DirectoryEntry*, void*);
+// Release everything. Safe on NULL. The context is unusable afterwards.
+void fat_close(fat_ctx_t* ctx);
 
-// functions
-bool fat_init(FILE* fp);
-void fat_uninit(void);
+// introspection -------------------------------------------------------
 
-void increment_color();
-void fat_print_info();
-void fat_print_header_legend();
-void fat_print_header_dump();
-void fat_print_legend(const char* legend);
-void fat_print_idx_wide(const uint8_t* base, int* idx, const int* lens);
-void fat_print_idx(const uint8_t* base, int* idx, const int len);
-void fat_print_idxstr(const void* base, int* idxStr, const int len);
-void fat_print_fat12();
-void fat_print_directory_entry_header_legend();
-void fat_print_directory_entry_dump(DirectoryEntry* entry, void* p);
-void fat_print_directory_entry(DirectoryEntry* entry);
-void fat_print_directory_entry_directory(DirectoryEntry* entry, bool recursive);
-void fat_print_directory_entry_file(DirectoryEntry* entry);
+enum FAT_TYPE fat_get_type(const fat_ctx_t* ctx);          // NULL -> FT_UNKNOWN
+const fat_geometry_t* fat_geometry(const fat_ctx_t* ctx);  // NULL -> ctx NULL
+uint32_t fat_cluster_size(const fat_ctx_t* ctx);           // bytes per data cluster
 
-void iterate_rootdir(iterate_dir_callback callback, void* p);
-void iterate_dir(uint32_t cluster, iterate_dir_callback callback, void* p);
-char* fat_get_entry_name(DirectoryEntry* entry, char* name, int len);
-bool fat_set_entry_name(DirectoryEntry* entry, const char* name);
+// Raw FAT[cluster] value (12-bit, unpacked). Indices 0..cluster_count+1
+// are readable (0/1 hold the media/reserved entries); larger is an error.
+fat_result_t fat_get_fat_entry(const fat_ctx_t* ctx, uint32_t cluster,
+                               uint32_t* out);
 
-void* fat_get_ptr();
-enum FAT_TYPE fat_get_type();
-void* fat_get_sector_ptr(int sector);
-void* fat_get_root_directory_start_sector_ptr();
-uint32_t fat_get_fat(uint32_t cluster);
-bool fat_is_broken(uint32_t cluster);
-bool fat_is_end_of_cluster(uint32_t cluster);
-uint32_t fat_get_cluster_size(void);
-uint32_t fat_get_cluster_addr(uint32_t cluster);
-void* fat_get_cluster_ptr(uint32_t cluster);
-uint32_t fat_get_cluster_for_entry(uint32_t parent_cluster,
-                                   DirectoryEntry* entry);
+// directory iteration --------------------------------------------------
+
+// Iterate `dir_cluster` (FAT_CLUSTER_ROOT for the root directory).
+// Skips deleted (0xE5) and LFN (attr 0x0F) entries; stops at the first
+// never-used (0x00) entry; guards against broken/looping chains.
+fat_result_t fat_iter_dir(fat_ctx_t* ctx, uint32_t dir_cluster,
+                          fat_iter_cb cb, void* user_data);
+
+// path lookup -----------------------------------------------------------
+
+// Resolve `path` relative to `start_cluster` (FAT_CLUSTER_ROOT = absolute).
+// '/'-separated; empty components ignored; "." stays in the current
+// directory, ".." resolves via the directory's own dot entries (".." of a
+// root-level directory yields FAT_CLUSTER_ROOT; ".." at the root itself
+// fails with FAT_ERR_PATH_NOT_FOUND).
+// Intermediate components must have ATTR_DIRECTORY (0x10); the final
+// component may be a file or a directory.
+//   FAT_OK               -> *out filled
+//   FAT_ERR_NOT_FOUND    -> final component missing
+//   FAT_ERR_PATH_NOT_FOUND -> intermediate missing / not a directory
+fat_result_t fat_lookup(fat_ctx_t* ctx, uint32_t start_cluster,
+                        const char* path, fat_dirent_t* out);
+
+// 8.3 name conversion ----------------------------------------------------
+
+// Render an 11-byte on-disk name. Files get "NAME.EXT" with trailing
+// spaces trimmed; directories and volume labels get no extension dot.
+fat_result_t fat_name_from_83(const uint8_t name11[11], uint8_t attributes,
+                              char* out, size_t out_len);
+
+// Inverse: validate, uppercase, space-pad into name11. Rejects NULL/empty
+// names, base > 8, extension > 3, and "." / ".." (fat_lookup handles those
+// itself). Characters after the first '.' count toward the extension.
+fat_result_t fat_name_to_83(const char* name, uint8_t name11[11]);
+
+// file read ---------------------------------------------------------------
+
+// Read the whole file into a malloc'd buffer; caller frees with free().
+// An empty file returns FAT_OK with *out == NULL, *out_size == 0.
+//   FAT_ERR_INVALID_ARG  -> entry is not a regular file (dir/volume/label)
+//   FAT_ERR_BAD_CLUSTER  -> chain ends before file_size or loops
+fat_result_t fat_read_file(fat_ctx_t* ctx, const fat_dirent_t* file,
+                           uint8_t** out, size_t* out_size);
 
 #endif

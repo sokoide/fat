@@ -127,4 +127,16 @@ void* fat_get_cluster_ptr(uint32_t cluster); /* 範囲外は NULL */
 残課題（フェーズ0以降または要ユーザー判断）:
 - `tags`はgit追跡済みのまま（ignoreは追跡ファイルに効かない）。解除には`git rm --cached tags`+コミットが必要
 - `demof12.fat`はウェーブ前にmtools 4.0.48で再生成済み（OEM=MTOO4048）。fixture戦略（凍結+CI diff か untrack+生成依存）は未決定
-- FATタイプ閾値`< 4085`化、再init失敗時の旧バッファ残存、`fat_get_fat`の引数範囲検査、0x05頭バイト、`'.'`/`'..'`解決 → フェーズ1/2へ繰り越し
+- FATタイプ閾値`< 4085`化、再init失敗時の旧バッファ残存、`fat_get_fat`の引数範囲検査、0x05頭バサイズ、`'.'`/`'..'`解決 → フェーズ1/2へ繰り越し
+
+## 10. フェーズ0実施結果（2026-10-05 完了）
+
+アーキテクチャ: `fat.h`（公開契約: `fat_ctx_t`不透明・`fat_result_t`・`fat_dirent_t`(`name[256]`)・`fat_geometry_t`）/ `fat_internal.h`（ディスク上構造体・`struct fat_ctx`・ATTR_*、ライブラリ内専用）/ `fat_core.c`（stdio・color・ファイルスコープ変数ゼロ）/ `fat_dev.c`（`fat_open`のみ、stdioはここだけ）/ `fat_dump.c`（`fat_print_*`、`const fat_ctx_t*`）。`fat.c`は削除。
+
+達成: コンテキスト化（複数イメージ・`fat_close(NULL)`安全・コアのグローバル状態ゼロ）、エラーenum+`fat_strerror`（ライブラリ内印刷廃止）、モデル/ビュー分離、`fat_open_mem`（メモリ変異テスト: 0x55AA破壊・FAT自己ループ・fileSize水増し→`BAD_CLUSTER`等、外部ハーネス不要）、`fat_lookup`（`.`/`..`解決、`NOT_FOUND`/`PATH_NOT_FOUND`区別）、`fat_read_file`（バイナリ安全・所有権明確）、FATタイプ閾値のspec準拠化（`< 4085`）、`totalSectors16==0`→`FAT_ERR_UNSUPPORTED`。
+
+検証: `make check` = 9テスト×2（通常+ASan/UBSan）全ok・警告ゼロ。デモ全セクション正常（新規`cat /dir1/../hello.txt`、`test_5kb.txt`4962バイト完全一致、クラスタ直書き廃止）。
+
+未決の契約判断: ルート直下の`.`のlookupは`FAT_ERR_PATH_NOT_FOUND`（`..`と対称・実装側）。DOS流にrootの合成direntで`FAT_OK`にする選択も可（1行変更）。
+
+フェーズ候補のnotes: 公開APIのconst一貫性（`fat_dump.c`のconst外し1箇所）、`fat_print_directory_entry`が実質デッドexport、`-Wstrict-prototypes`対応、dumpの色サイクルstatic（フェーズ5再入化時）。

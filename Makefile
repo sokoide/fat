@@ -5,10 +5,14 @@ SANOUTDIR ?= build-san
 SCRATCH := scratch
 
 SRCS = main.c \
-	   fat.c \
+	   fat_core.c \
+	   fat_dev.c \
+	   fat_dump.c \
 	   color.c
 TESTSRCS = testmain.c \
-		   fat.c \
+		   fat_core.c \
+		   fat_dev.c \
+		   fat_dump.c \
 		   color.c
 
 OBJS = $(SRCS:.c=.o)

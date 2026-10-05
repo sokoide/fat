@@ -9,10 +9,6 @@
 #define CL_PURPLE 35
 #define CL_CYAN 36
 #define CL_GRAY 37
-#define CL_BG1 10
-#define CL_BG2 70
 
-void cl_test();
 void cl(int code);
-void clbg(int code);
 void clcl();

@@ -1,16 +1,51 @@
 #include "fat.h"
 #include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-void test_fat_init(FILE* fp) {
+#define RUN(t)                                                  \
+    do {                                                        \
+        printf("%-40s", #t);                                    \
+        fflush(stdout);                                         \
+        (t)();                                                  \
+        puts(" ok");                                            \
+    } while (0)
+
+typedef struct {
+    int subdirs;
+    int files;
+} DirCounts;
+
+/* Skip volume labels (0x08), LFN entries (0x0F) and '.' / '..' so the counts
+ * match what mdir -b reports for the same directory. */
+static void count_entries(DirectoryEntry* entry, void* p) {
+    DirCounts* counts = (DirCounts*)p;
+    if ((entry->attributes & 0x08) != 0 || entry->attributes == 0x0F)
+        return;
+    if (entry->name[0] == '.')
+        return;
+    if (entry->attributes & 0x10)
+        counts->subdirs++;
+    else
+        counts->files++;
+}
+
+void test_fat_init() {
+    FILE* fp = fopen("demof12.fat", "rb");
+    if (fp == NULL)
+        perror("demof12.fat");
+    assert(fp != NULL);
+
     bool ret = fat_init(fp);
+    fclose(fp);
     FatBS* bs = (FatBS*)fat_get_ptr();
     assert(ret);
     assert(bs->bootJmp[0] == 0xeb);
     assert(bs->bootJmp[1] == 0x3c);
     assert(bs->bootJmp[2] == 0x90);
-    // The volume name depends on the mtool version you use
-    assert(strncmp((const char*)bs->oemName, "MTOO4032", 8) == 0);
+    // The OEM name and volume label depend on the mtools version; the
+    // geometry assertions below cover what the driver actually relies on.
     assert(bs->bytesPerSector == 512);
     assert(bs->sectorsPerCluster == 2);
     assert(bs->reservedSectorCount == 1);
@@ -59,121 +94,162 @@ void test_fat_get_root_directory_start_sector_ptr() {
     assert(p == buffer + 512 * 7);
 }
 
-void test_subdirs1() {
-    DirectoryEntry* directoryEntries;
+/* Upper bound on chain length: the image cannot hold more data clusters than
+ * totalSectors / sectorsPerCluster. Guards against FAT cycles. */
+static uint32_t max_chain_length() {
     FatBS* bs = (FatBS*)fat_get_ptr();
+    return bs->totalSectors16 / bs->sectorsPerCluster + 1;
+}
 
-    directoryEntries =
-        (DirectoryEntry*)fat_get_root_directory_start_sector_ptr();
-    int subdirs = 0;
-    int files = 0;
-
-    for (int i = 0; i < bs->rootEntryCount; i++) {
-        DirectoryEntry* entry = &directoryEntries[i];
-        // 0x00 not use, 0xE5 deleted
-        if (entry->name[0] == 0x00 || entry->name[0] == 0xE5)
-            break;
-        if (entry->attributes & 0x10) {
-            if (entry->name[0] != '.') {
-                // Directory
-                subdirs++;
-            }
-        } else {
-            files++;
-        }
-    }
-    assert(subdirs == 2);
-    assert(files == 3);
+void test_subdirs1() {
+    DirCounts counts = {0, 0};
+    iterate_rootdir(count_entries, &counts);
+    /* dir1, dir2 / hello.txt, test_5kb.txt (volume label excluded) */
+    assert(counts.subdirs == 2);
+    assert(counts.files == 2);
 }
 
 void test_subdirs2() {
-    uint32_t cluster = 11;
-    uint32_t nextCluster;
-    DirectoryEntry* directoryEntries;
-    FatBS* bs = (FatBS*)fat_get_ptr();
+    DirectoryEntry entry;
+    memset(&entry, 0, sizeof(entry));
+    assert(fat_set_entry_name(&entry, "dir2"));
+    uint32_t cluster = fat_get_cluster_for_entry(FAT_CLUSTER_ROOT, &entry);
+    assert(cluster != FAT_CLUSTER_NOT_FOUND);
 
-    nextCluster = fat_get_fat(cluster);
-
-    int subdirs = 0;
-    int files = 0;
-    while (cluster < 0xF00) {
-        nextCluster = fat_get_fat(cluster);
-        directoryEntries = (DirectoryEntry*)(fat_get_cluster_ptr(cluster));
-        for (int i = 0; i < bs->bytesPerSector * bs->sectorsPerCluster /
-                                sizeof(DirectoryEntry);
-             i++) {
-            DirectoryEntry* entry = &directoryEntries[i];
-            // 0x00 not use, 0xE5 deleted
-            if (entry->name[0] == 0x00 || entry->name[0] == 0xE5)
-                break;
-            if (entry->attributes & 0x10) {
-                if (entry->name[0] != '.') {
-                    // Directory
-                    subdirs++;
-                }
-            } else {
-                files++;
-            }
-        }
-        cluster = nextCluster;
-    }
-    assert(subdirs == 33);
-    assert(files == 0);
+    /* dir2 spans clusters 11 -> 43 -> EOC and holds subdir1..subdir33 */
+    DirCounts counts = {0, 0};
+    iterate_dir(cluster, count_entries, &counts);
+    assert(counts.subdirs == 33);
+    assert(counts.files == 0);
 }
 
 void test_fat_set_entry_name() {
     DirectoryEntry entry;
+    char name[16];
 
-    fat_set_entry_name(&entry, "hoge");
+    /* fat_get_entry_name reads attributes; start from a known state */
+    memset(&entry, 0, sizeof(entry));
+
+    assert(fat_set_entry_name(&entry, "hoge"));
     assert(memcmp(entry.name, "HOGE       ", 11) == 0);
+    assert(fat_get_entry_name(&entry, name, sizeof(name)) != NULL);
+    assert(strcmp(name, "HOGE") == 0);
 
-    fat_set_entry_name(&entry, "page.txt");
+    assert(fat_set_entry_name(&entry, "page.txt"));
     assert(memcmp(entry.name, "PAGE    TXT", 11) == 0);
+    assert(fat_get_entry_name(&entry, name, sizeof(name)) != NULL);
+    assert(strcmp(name, "PAGE.TXT") == 0);
 
-    fat_set_entry_name(&entry, "foo.a");
+    /* extension trailing spaces are trimmed, not padded */
+    assert(fat_set_entry_name(&entry, "foo.a"));
     assert(memcmp(entry.name, "FOO     A  ", 11) == 0);
+    assert(fat_get_entry_name(&entry, name, sizeof(name)) != NULL);
+    assert(strcmp(name, "FOO.A") == 0);
+
+    /* extension-less names get no dot */
+    assert(fat_set_entry_name(&entry, "readme"));
+    assert(memcmp(entry.name, "README      ", 11) == 0);
+    assert(fat_get_entry_name(&entry, name, sizeof(name)) != NULL);
+    assert(strcmp(name, "README") == 0);
+
+    /* directories (attr 0x10) are formatted the same way, no dot */
+    memset(&entry, 0, sizeof(entry));
+    entry.attributes = 0x10;
+    assert(fat_set_entry_name(&entry, "subdir1"));
+    assert(fat_get_entry_name(&entry, name, sizeof(name)) != NULL);
+    assert(strcmp(name, "SUBDIR1") == 0);
+
+    /* names not representable in 8.3 are rejected */
+    assert(!fat_set_entry_name(&entry, "toolongname.txt"));
+    assert(!fat_set_entry_name(&entry, "file.text"));
 }
 
 void test_fat_get_cluster_for_entry() {
     DirectoryEntry entry;
-    fat_set_entry_name(&entry, "           ");
-    uint32_t cluster = fat_get_cluster_for_entry(0, &entry);
-    assert(cluster == 0);
+
+    /* blank name matches nothing */
+    memset(&entry, 0, sizeof(entry));
+    fat_set_entry_name(&entry, "");
+    uint32_t cluster = fat_get_cluster_for_entry(FAT_CLUSTER_ROOT, &entry);
+    assert(cluster == FAT_CLUSTER_NOT_FOUND);
 
     fat_set_entry_name(&entry, "DIR1");
-    cluster = fat_get_cluster_for_entry(0, &entry);
+    cluster = fat_get_cluster_for_entry(FAT_CLUSTER_ROOT, &entry);
     assert(cluster == 8);
 
     fat_set_entry_name(&entry, "dir2");
-    cluster = fat_get_cluster_for_entry(0, &entry);
+    cluster = fat_get_cluster_for_entry(FAT_CLUSTER_ROOT, &entry);
     assert(cluster == 11);
 }
 
-void spike_strtok() {
-    char* token;
-    char str[] = "//dir1///dir2/file";
-    const char* delim = "/";
-    token = strtok(str, delim);
-    while (token) {
-        printf("token: %s\n", token);
-        token = strtok(NULL, delim);
+/* Chain-read the multi-cluster root file TEST_5KBTXT (4962 bytes over 5
+ * clusters) and compare it byte-for-byte with the repo copy of the file. */
+void test_read_multicluster_file() {
+    DirectoryEntry entry;
+    memset(&entry, 0, sizeof(entry));
+    assert(fat_set_entry_name(&entry, "test_5kb.txt"));
+    uint32_t cluster = fat_get_cluster_for_entry(FAT_CLUSTER_ROOT, &entry);
+    assert(cluster != FAT_CLUSTER_NOT_FOUND);
+    assert(cluster >= 2);
+
+    uint32_t clusterSize = fat_get_cluster_size();
+    uint32_t size = entry.fileSize;
+    assert(size == 4962);
+    assert((size + clusterSize - 1) / clusterSize == 5);
+
+    /* the chain ends cleanly at EOC after exactly 5 clusters */
+    uint32_t expectedClusters = (size + clusterSize - 1) / clusterSize;
+    uint32_t seen = 0;
+    uint32_t c = cluster;
+    while (c >= 2 && seen < max_chain_length()) {
+        seen++;
+        if (fat_is_end_of_cluster(c) || fat_is_broken(c))
+            break;
+        c = fat_get_fat(c);
     }
+    assert(seen == expectedClusters);
+    assert(fat_is_end_of_cluster(c));
+
+    FILE* fp = fopen("test_5kb.txt", "rb");
+    if (fp == NULL)
+        perror("test_5kb.txt");
+    assert(fp != NULL);
+    uint8_t* expected = malloc(size);
+    uint8_t* actual = malloc(size);
+    assert(expected != NULL && actual != NULL);
+    assert(fread(expected, 1, size, fp) == size);
+    fclose(fp);
+
+    uint32_t off = 0;
+    c = cluster;
+    while (off < size && c >= 2) {
+        void* data = fat_get_cluster_ptr(c);
+        assert(data != NULL);
+        uint32_t n = size - off < clusterSize ? size - off : clusterSize;
+        memcpy(actual + off, data, n);
+        off += n;
+        if (fat_is_end_of_cluster(c) || fat_is_broken(c))
+            break;
+        c = fat_get_fat(c);
+    }
+    assert(off == size);
+    assert(memcmp(actual, expected, size) == 0);
+
+    free(expected);
+    free(actual);
 }
 
-int main() {
-    FILE* fp = fopen("demof12.fat", "rb");
-    assert(fp != NULL);
+int main(void) {
+    RUN(test_fat_init);
+    RUN(test_fat_get_sector_ptr);
+    RUN(test_fat_get_fat);
+    RUN(test_fat_get_root_directory_start_sector_ptr);
+    RUN(test_subdirs1);
+    RUN(test_subdirs2);
+    RUN(test_fat_set_entry_name);
+    RUN(test_fat_get_cluster_for_entry);
+    RUN(test_read_multicluster_file);
+    fat_uninit();
 
-    test_fat_init(fp);
-    test_fat_get_sector_ptr();
-    test_fat_get_fat();
-    test_fat_get_root_directory_start_sector_ptr();
-    test_subdirs1();
-    test_subdirs2();
-    test_fat_set_entry_name();
-    test_fat_get_cluster_for_entry();
-    fat_unint();
-
-    fclose(fp);
     return 0;
 }

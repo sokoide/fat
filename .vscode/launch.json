@@ -8,7 +8,7 @@
             "type": "lldb",
             "request": "launch",
             "name": "Debug fatdemo",
-            "program": "~/tmp/hoge/fatdemo",
+            "program": "${workspaceFolder}/build/fatdemo",
             "args": [],
             "cwd": "${workspaceFolder}",
             "preLaunchTask": "make"
@@ -17,7 +17,7 @@
             "type": "lldb",
             "request": "launch",
             "name": "Debug fattest",
-            "program": "~/tmp/hoge/fattest",
+            "program": "${workspaceFolder}/build/fattest",
             "args": [],
             "cwd": "${workspaceFolder}",
             "preLaunchTask": "make-testbuild"

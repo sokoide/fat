@@ -1,13 +1,11 @@
 #include "color.h"
 #include "fat.h"
-#include <memory.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
+#include <string.h>
 
 // function declaration
-void check_null(void* p);
 void callback_ls(DirectoryEntry* entry, void* p);
 uint32_t cluster_for_path(uint32_t current_cluster, const char* path,
                           DirectoryEntry* entry);
@@ -15,16 +13,13 @@ void cat_file(uint32_t current_cluster, const char* path);
 void cat_file_for_cluster(uint32_t cluster, uint32_t file_size);
 
 // functions
-void check_null(void* p) {
-    if (p == NULL) {
-        fprintf(stderr, "p is NULL.\n");
-        exit(1);
-    }
-}
-
 void callback_ls(DirectoryEntry* entry, void* p) {
+    (void)p;
     char name[13]; // 8 + '.' + 3 + '\0'
-    fat_get_entry_name(entry, name, sizeof(name) / sizeof(name[0]));
+    if (fat_get_entry_name(entry, name, sizeof(name) / sizeof(name[0])) ==
+        NULL) {
+        return;
+    }
     if (entry->attributes & 0x10) {
         // Directory
         printf("D %s\n", name);
@@ -40,18 +35,36 @@ void callback_ls(DirectoryEntry* entry, void* p) {
 uint32_t cluster_for_path(uint32_t current_cluster, const char* path,
                           DirectoryEntry* entry) {
     char* token;
+    char* next;
+    char* saveptr;
     const char* delim = "/";
     char tmp_path[64];
-    strcpy(tmp_path, path);
 
-    token = strtok(tmp_path, delim);
-    uint32_t prev_cluster;
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s", path) >=
+        (int)sizeof(tmp_path)) {
+        fprintf(stderr, "path too long: '%s'.\n", path);
+        return FAT_CLUSTER_NOT_FOUND;
+    }
+
     uint32_t cluster = current_cluster;
+    token = strtok_r(tmp_path, delim, &saveptr);
     while (token) {
-        prev_cluster = cluster;
-        fat_set_entry_name(entry, token);
-        cluster = fat_get_cluster_for_entry(prev_cluster, entry);
-        token = strtok(NULL, delim);
+        if (!fat_set_entry_name(entry, token)) {
+            // not representable as an 8.3 name
+            fprintf(stderr, "invalid name: '%s'.\n", token);
+            return FAT_CLUSTER_NOT_FOUND;
+        }
+        cluster = fat_get_cluster_for_entry(cluster, entry);
+        if (cluster == FAT_CLUSTER_NOT_FOUND) {
+            return FAT_CLUSTER_NOT_FOUND;
+        }
+        next = strtok_r(NULL, delim, &saveptr);
+        if (next != NULL && !(entry->attributes & 0x10)) {
+            // intermediate path components must be directories
+            fprintf(stderr, "'%s' is not a directory.\n", token);
+            return FAT_CLUSTER_NOT_FOUND;
+        }
+        token = next;
     }
     return cluster;
 }
@@ -59,7 +72,7 @@ uint32_t cluster_for_path(uint32_t current_cluster, const char* path,
 void cat_file(uint32_t current_cluster, const char* path) {
     DirectoryEntry entry;
     uint32_t cluster = cluster_for_path(current_cluster, path, &entry);
-    if (cluster > 0) {
+    if (cluster != FAT_CLUSTER_NOT_FOUND) {
         cat_file_for_cluster(cluster, entry.fileSize);
     } else {
         fprintf(stderr, "path not found.\n");
@@ -67,20 +80,32 @@ void cat_file(uint32_t current_cluster, const char* path) {
 }
 
 void cat_file_for_cluster(uint32_t cluster, uint32_t file_size) {
-    char buffer[1025];
+    uint32_t cluster_size = fat_get_cluster_size();
+    if (cluster_size == 0) {
+        fprintf(stderr, "invalid cluster size.\n");
+        return;
+    }
     while (file_size > 0) {
         uint8_t* p = fat_get_cluster_ptr(cluster);
-        if (file_size >= 1024) {
-            memcpy(buffer, p, 1024);
-            buffer[1024] = '\0';
-            file_size -= 1024;
-            cluster = fat_get_fat(cluster);
-        } else {
-            memcpy(buffer, p, file_size);
-            buffer[file_size] = '\0';
-            file_size = 0;
+        if (p == NULL) {
+            fprintf(stderr, "broken cluster chain at cluster %u.\n", cluster);
+            return;
         }
-        printf("%s", buffer);
+        uint32_t bytes_this =
+            (file_size < cluster_size) ? file_size : cluster_size;
+        fwrite(p, 1, bytes_this, stdout);
+        file_size -= bytes_this;
+        if (file_size > 0) {
+            // data remains: the current cluster must have a successor
+            if (fat_is_end_of_cluster(cluster) || fat_is_broken(cluster)) {
+                fprintf(stderr,
+                        "warning: cluster chain ended at %u with %u bytes "
+                        "remaining.\n",
+                        cluster, file_size);
+                return;
+            }
+            cluster = fat_get_fat(cluster);
+        }
     }
 }
 
@@ -132,9 +157,9 @@ int main() {
     cluster = cluster_for_path(0, "dir2", &entry);
     iterate_dir(cluster, callback_ls, NULL);
 
-    printf("*** ls /dir2/subbdir1 ***\n");
-    iterate_dir(cluster, callback_ls, NULL);
+    printf("*** ls /dir2/subdir1 ***\n");
     cluster = cluster_for_path(0, "/dir2/subdir1", &entry);
+    iterate_dir(cluster, callback_ls, NULL);
 
     printf("*** cat /dir1/hoge.txt *** \n");
     cat_file(0, "dir1/hoge.txt");
@@ -145,5 +170,6 @@ int main() {
     printf("*** cat /dir2/subdir1/page.txt *** \n");
     cat_file(0, "dir2/subdir1/page.txt");
 
+    fat_uninit();
     return 0;
 }

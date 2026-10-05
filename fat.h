@@ -6,6 +6,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+// constants
+#define FAT_CLUSTER_ROOT 0u
+#define FAT_CLUSTER_NOT_FOUND 0xFFFFFFFFu
+
 // enum
 enum FAT_TYPE {
     FT_UNKNOWN = 0,
@@ -93,7 +97,7 @@ typedef void (*iterate_dir_callback)(DirectoryEntry*, void*);
 
 // functions
 bool fat_init(FILE* fp);
-void fat_unint();
+void fat_uninit(void);
 
 void increment_color();
 void fat_print_info();
@@ -113,15 +117,18 @@ void fat_print_directory_entry_file(DirectoryEntry* entry);
 void iterate_rootdir(iterate_dir_callback callback, void* p);
 void iterate_dir(uint32_t cluster, iterate_dir_callback callback, void* p);
 char* fat_get_entry_name(DirectoryEntry* entry, char* name, int len);
-void fat_set_entry_name(DirectoryEntry* entry, const char* name);
+bool fat_set_entry_name(DirectoryEntry* entry, const char* name);
 
 void* fat_get_ptr();
 enum FAT_TYPE fat_get_type();
 void* fat_get_sector_ptr(int sector);
 void* fat_get_root_directory_start_sector_ptr();
 uint32_t fat_get_fat(uint32_t cluster);
-uint32_t fat_get_cluster_addr(int cluster);
-void* fat_get_cluster_ptr(int cluster);
+bool fat_is_broken(uint32_t cluster);
+bool fat_is_end_of_cluster(uint32_t cluster);
+uint32_t fat_get_cluster_size(void);
+uint32_t fat_get_cluster_addr(uint32_t cluster);
+void* fat_get_cluster_ptr(uint32_t cluster);
 uint32_t fat_get_cluster_for_entry(uint32_t parent_cluster,
                                    DirectoryEntry* entry);
 

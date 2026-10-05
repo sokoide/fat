@@ -77,7 +77,7 @@ FAT12のコアデコード（`fat_get_fat`の12bit展開・`DirectoryEntry`構�
 - **フェーズ1 堅牢性:** BPB検証（`bytesPerSector∈{512,1024,2048,4096}`、`sectorsPerCluster`2の冪、`totalSectors16==0`なら`totalSectors32`、積≤実ファイルサイズ、0x55AA）、範囲検査、`fat_is_end_of_cluster`統一+反復上限=クラスタ数。
 - **フェーズ2 FAT16/32:** `fat_get_fat`タイプ別ディスパッチ（FAT32は`& 0x0FFFFFFF`マスク必須）、FAT32ルートはBPB[44]`rootCluster`のチェーン走査、`FatExtBS32`実体化、FSInfo読み取り、アクティブFAT選択。
 - **フェーズ3 LFN:** 0x0F連続エントリ結合、UTF-16→UTF-8、短名チェックサム検証、LFN優先・8.3フォールバック。
-- **フェーズ4 書き込み:** FAT書き込み（12bitはread-modify-write、両FATコピー）、クラスタ確保/解放、ディレクトリスロット探索、FSInfo更新、DOSタイムスタンプ。
+- **フェーズ4 書き込み:** FAT書き込み（12bitはread-modify-write、両FATコピー）、クラスタ確保/解放、ディレクトリスロット探索、FSInfo更新、DOSタイムスタンプ。詳細設計は§12。
 - **フェーズ5 I/O抽象化:** `fat_io_t{read/write/size}`差し替え+セクタキャッシュ。丸ごとRAMは`fat_io_mem`実装の一つに。FILE*・ブロックデバイス・FUSEバックエンドが並列実装可能。
 
 ## 7. 修正優先順位
@@ -163,3 +163,75 @@ void* fat_get_cluster_ptr(uint32_t cluster); /* 範囲外は NULL */
 統合時にリードが修正したバグ1件: `fat_read_file`のチェーンループ検出は「サイズ不足で飢えるループ」しか捕捉せず、自己ループ（FAT[5]=5）はfile_size分をゴミで埋めて`FAT_OK`になる契約違反 → **Brentのサイクル検出**（O(1)空間、1ステップ1比較）をreadウォークに追加し「loops→BAD_CLUSTER」契約を遵守。
 
 残課題: FAT16/32のOEM・fatsz整合の追加mutation、ルート直下の`.`のlookup挙動（§10未決のまま）、フェーズ3 LFN（0x0F連続エントリ）は現在スキップのみ。
+
+## 12. フェーズ4（書き込み）詳細設計（2026-10-05 追記）
+
+前提: フェーズ0〜2完了（コンテキスト化・エラーenum・FAT12/16/32デコード）。イメージは`fat_open`/`fat_open_mem`で丸ごとRAM載せのため、フェーズ4の書き込みはメモリ上のイメージコピーへの更新とし、永続化は`fat_write()`（全バッファをオリジナルパスへ書き戻し）で行う。I/O抽象化（フェーズ5）でこの境界を`fat_io_t`に差し替える。
+
+### 12.1 FATエントリ書き込み `fat_set_fat_entry`
+
+- 12bitはバイト非アライメント。オフセット`cluster*3/2`の2バイトを既にFAT12では1バイト読みの`fat_get_fat_entry`で処理済みだが、書き込みは必ず**read-modify-write**（隣接エントリとニブルを共有するため、隣を壊さない）:
+  - 偶数: `b[0] = value & 0xFF`、`b[1] = (b[1] & 0xF0) | (value >> 8)`
+  - 奇数: `b[0] = (b[0] & 0x0F) | (value << 4)`、`b[1] = value >> 8`
+- **両FATコピーへ書き込む**: `fat_count`分のテーブル先頭オフセットをループ。ミラー間不一致は書き込み後に一致検証するか、少なくとも既存チェーン読み取りと同じactive FAT選択規則に従う。
+- 値はタイプ別に妥当化: EOCマークはタイプ別定数（0xFFF / 0xFFFF / 0x0FFFFFFF）、FREEは0。`cluster`は2..cluster_count+1のみ（0/1はINVALID_ARG）。
+- FAT32は既存どおり`& 0x0FFFFFFF`マスク（上位4bitは予約のため保存）。
+
+### 12.2 クラスタ確保 `fat_alloc_cluster`
+
+- FAT[2..]を先頭から走査しFREE（0）を探す。FAT32はFSInfoの`next_free_cluster`ヒントから試み、その値が本当にFREEのときのみ採用（stale=0xFFFFFFFFや誤値は無視して全走査）。
+- 見つけたらEOCマークを書き込み、FSInfoのfree数を減算。空きなしは新enum `FAT_ERR_DISK_FULL`。
+- 確保後はチェーン接続は呼び出し側の責務（`fat_set_fat_entry(prev, new)`）。
+
+### 12.3 クラスタ解放 `fat_free_chain`
+
+- 先頭からEOCまで辿って各エントリをFREEに。サイクル検出は`fat_read_file`に追加済みのBrent法と同じ上限（cluster_count反復）で防御。
+- FSInfoのfree数を加算し、`next_free_cluster`ヒントを先頭クラスタに更新（or unknown化）。
+
+### 12.4 ディレクトリスロット探索 `fat_add_dirent`
+
+- 0x00=未使用（以降も0x00が続くため、ここから連続枠を取れる）、0xE5=削除済み（単独で再利用可）。
+- フェーズ4は8.3のみでスロット1個。フェーズ3 LFN結合後は「短名+LFN N個」の連続N+1枠が必要（0x40フラグ・チェックサムはフェーズ3で設計）。
+- FAT12/16のルートは固定領域（`root_entries`上限、拡張不可）→ 満杯は新enum `FAT_ERR_DIR_FULL`。
+- サブディレクトリとFAT32ルートはチェーン走査し、空き枠がなければ`fat_alloc_cluster`でチェーンを延長し、新クラスタを0x00でゼロ埋め（0x00=終端マーカーを保証）。
+
+### 12.5 FSInfo更新（FAT32のみ）
+
+- 確保/解放に応じて`free_cluster_count`±1、`next_free_cluster`書き換え。署名不正・不在（0xFFFFFFFF）のときは壊さずunknownのまま維持（§2の`fat_fsinfo()`契約と対称）。
+
+### 12.6 DOSタイムスタンプ
+
+- FatDate = `((year-1980)<<9) | (month<<5) | day`、FatTime = `(hour<<11) | (min<<5) | (sec/2)`（2秒粒度、`creation_time_tenth`が追加精度）。
+- 作成時: `creation_date/time` + `last_write_date/time` + `last_access_date`（FAT32慣例）。更新時: `last_write_*`のみ。
+- タイムゾーンは実装方針を明記（DOS流ローカルタイム or UTC、どちらでもよいが統一）。
+
+### 12.7 書き込み順序（失敗時一貫性）
+
+クラッシュ耐性はRAM載せ+全体flushのため題外だが、**操作途中の失敗で不整合を残さない**順序にする:
+
+1. データ書き込み先クラスタを確保（チェーン構築）→ 2. データ全量を書き込み → 3. 最後にdirentのfirst cluster / file_sizeを更新。
+
+どのステップで失敗しても、確保済みチェーンを`fat_free_chain`で解放して`FAT_ERR_*`を返す。direntが最後に変わるため、失敗時に「direntだけ有効でデータ無し」の孤立参照を作らない。
+
+### 12.8 公開API契約案（`fat.h`追記）
+
+```c
+fat_result_t fat_set_fat_entry(fat_ctx_t* ctx, uint32_t cluster, uint32_t value);
+fat_result_t fat_alloc_cluster(fat_ctx_t* ctx, uint32_t* out);
+fat_result_t fat_free_chain(fat_ctx_t* ctx, uint32_t head);
+fat_result_t fat_add_dirent(fat_ctx_t* ctx, uint32_t dir_cluster,
+                            const char* name, const fat_dirent_t* tmpl);
+fat_result_t fat_write_file(fat_ctx_t* ctx, uint32_t dir_cluster,
+                            const char* name, const uint8_t* data, size_t size);
+                            /* 12.7の順序で alloc→write→dirent更新 */
+fat_result_t fat_write(fat_ctx_t* ctx, const char* path); /* 全イメージflush。NULL=open元パス */
+```
+
+enum追記: `FAT_ERR_DISK_FULL`（FAT空きなし）、`FAT_ERR_DIR_FULL`（ディレクトリ枠なし）。
+
+### 12.9 テスト計画
+
+- mtoolsオラクル差分: 書き込み後に`mdir -b`/`mtype`で目録・内容一致assert（§5方針の継続）。
+- 12bitニブル隣接保護: クラスタ3書き込み後、2/4の値が不変であること（偶数/奇数両方）。
+- 両FATコピーの一致、FAT12/16ルート満杯、0xE5再利用、FAT32ルートチェーン延長、DISK_FULL。
+- 書き込み→`fat_open`再読み込みでround-trip一致。全ターゲットを`test-san`（ASan/UBSan）に追加。

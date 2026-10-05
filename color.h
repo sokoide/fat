@@ -11,4 +11,4 @@
 #define CL_GRAY 37
 
 void cl(int code);
-void clcl();
+void clcl(void);

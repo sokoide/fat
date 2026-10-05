@@ -8,33 +8,11 @@
 // view state (cycled legend colors), shared by the printers below
 static int fat_print_color;
 
-static void increment_color() {
+static void increment_color(void) {
     fat_print_color += 1;
     if (fat_print_color >= CL_GRAY + 1)
         fat_print_color = CL_RED;
 }
-
-// byte offset of data cluster `cluster` in the image, 0 when out of range
-static uint64_t cluster_addr(const fat_ctx_t* ctx, uint32_t cluster) {
-    if (ctx == NULL)
-        return 0;
-    const fat_geometry_t* geo = fat_geometry(ctx);
-    if (cluster < 2 || cluster >= 2 + geo->cluster_count)
-        return 0;
-    // 64-bit intermediates: FAT32 cluster offsets can exceed 32 bits
-    return ((uint64_t)geo->data_start_sector +
-            (uint64_t)(cluster - 2) * geo->sectors_per_cluster) *
-           geo->bytes_per_sector;
-}
-
-// pretty-lister internals (defined after the public entry points)
-static void fat_print_directory_entry_directory(const fat_ctx_t* ctx,
-                                                const fat_dirent_t* entry,
-                                                const uint8_t* raw32,
-                                                bool recursive);
-static void fat_print_directory_entry_file(const fat_ctx_t* ctx,
-                                           const fat_dirent_t* entry,
-                                           const uint8_t* raw32);
 
 static const char* fat_type_name(const fat_ctx_t* ctx) {
     switch (fat_get_type(ctx)) {
@@ -131,7 +109,7 @@ static void fat_print_idx_wide(const uint8_t* base, int* idx,
     }
 }
 
-void fat_print_header_legend() {
+void fat_print_header_legend(void) {
     clcl();
 
     fat_print_color = CL_RED;
@@ -228,7 +206,7 @@ void fat_print_fat(const fat_ctx_t* ctx) {
         printf("... (%u more entries truncated)\n", entryCount - shown);
 }
 
-void fat_print_directory_entry_header_legend() {
+void fat_print_directory_entry_header_legend(void) {
     clcl();
 
     fat_print_color = CL_RED;
@@ -265,72 +243,3 @@ void fat_print_directory_entry_dump(const fat_dirent_t* entry,
     clcl();
 }
 
-// adapter: feed iter_dir's (entry, raw32) pairs back into the pretty-lister
-static void iter_print_cb(const fat_dirent_t* entry, const uint8_t* raw32,
-                          void* user_data);
-
-static void print_entry_full(const fat_ctx_t* ctx, const fat_dirent_t* entry,
-                             const uint8_t* raw32);
-
-// pretty-lister entry point for already-parsed entries (no raw bytes at
-// hand: the byte dump is skipped)
-void fat_print_directory_entry(const fat_ctx_t* ctx,
-                               const fat_dirent_t* entry) {
-    print_entry_full(ctx, entry, NULL);
-}
-
-static void print_entry_full(const fat_ctx_t* ctx, const fat_dirent_t* entry,
-                             const uint8_t* raw32) {
-    // Check if entry is unused or deleted (defensive: iter_dir filters
-    // these already)
-    if (entry->name[0] == '\0')
-        return;
-
-    clcl();
-
-    // Check if entry is a directory
-    if (entry->attributes & ATTR_DIRECTORY) {
-        // Directory ("." / ".." stay silent)
-        if (entry->name[0] != '.')
-            fat_print_directory_entry_directory(ctx, entry, raw32, true);
-    } else {
-        // File entry
-        fat_print_directory_entry_file(ctx, entry, raw32);
-    }
-}
-
-static void iter_print_cb(const fat_dirent_t* entry, const uint8_t* raw32,
-                          void* user_data) {
-    print_entry_full((const fat_ctx_t*)user_data, entry, raw32);
-}
-
-static void fat_print_directory_entry_directory(const fat_ctx_t* ctx,
-                                                const fat_dirent_t* entry,
-                                                const uint8_t* raw32,
-                                                bool recursive) {
-    // the entry must be a directory
-    printf("Directory: %s, cluster:%u[0x%08llX]\n", entry->name,
-           entry->first_cluster,
-           (unsigned long long)cluster_addr(ctx, entry->first_cluster));
-    if (raw32 != NULL)
-        fat_print_directory_entry_dump(entry, raw32, NULL);
-
-    if (recursive) {
-        // walk the sub directory's cluster chain; iter_dir caps the walk
-        // and skips deleted/LFN entries
-        (void)fat_iter_dir((fat_ctx_t*)ctx, entry->first_cluster,
-                           iter_print_cb, (void*)ctx);
-    }
-}
-
-static void fat_print_directory_entry_file(const fat_ctx_t* ctx,
-                                           const fat_dirent_t* entry,
-                                           const uint8_t* raw32) {
-    // the entry must be a file
-    printf("File: %s, cluster:%u[0x%08llX],  size:%u\n", entry->name,
-           entry->first_cluster,
-           (unsigned long long)cluster_addr(ctx, entry->first_cluster),
-           entry->file_size);
-    if (raw32 != NULL)
-        fat_print_directory_entry_dump(entry, raw32, NULL);
-}

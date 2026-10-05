@@ -235,3 +235,63 @@ enum追記: `FAT_ERR_DISK_FULL`（FAT空きなし）、`FAT_ERR_DIR_FULL`（デ�
 - 12bitニブル隣接保護: クラスタ3書き込み後、2/4の値が不変であること（偶数/奇数両方）。
 - 両FATコピーの一致、FAT12/16ルート満杯、0xE5再利用、FAT32ルートチェーン延長、DISK_FULL。
 - 書き込み→`fat_open`再読み込みでround-trip一致。全ターゲットを`test-san`（ASan/UBSan）に追加。
+
+## 13. ウェーブA&B: 正確性の詰め + ライブラリAPI（2026-10-05 計画、TDD実施）
+
+LFN（フェーズ3）は見送り。読み取り専用ライブラリとしての完成度を上げる。**TDD**: リードが`fat.h`契約を先に拡張（完了）→ テストエージェントが全テストを先行記述しredを確認（この間ライブラリはコミット済みの安定状態）→ 実装エージェントがgreen化 → リードが最終検証。
+
+### 13.1 契約変更（fat.h拡張済み）
+
+- **A2 ルート直下の`.`/`..`**: DOS流に**合成direntで`FAT_OK`**（name="."/".."、ATTR_DIRECTORY、first_cluster=FAT_CLUSTER_ROOT、size=0）。§10の未決を決着。
+- **A3 ボリュームラベル非マッチ**: `fat_lookup`はATTR_VOLUME_IDエントリにマッチしない（DOS open()準拠）。
+- **A1 0x05頭バイト**: `fat_name_from_83`はname11[0]==0x05を0xE5として描画（日本語名エスケープ）。
+- **B6 ストリーミング読み**: `fat_file_t`（opaque）+`fat_file_open/seek/read/tell/size/close`。全丸ごとmallocの`fat_read_file`はFAT16の2GBで破綻するため。seekはO(チェーン長)、readはEOF以外ショートなし、loopは`fat_read_file`と同じBrent防御で`BAD_CLUSTER`。
+- **B7 ディレクトリカーソル**: `fat_dir_t`（opaque）+`fat_dir_open/next/close`。終端は新enum **`FAT_ERR_END_OF_DIR`**（継続呼び出しも同値）。`fat_iter_dir`は内部でcursor実装に統合（走査ロジックの二重化を防ぐ）。
+- **B8 タイムスタンプ**: `fat_dos_date_to_tm(dos_date, dos_time, dos_tenth, struct tm*)`。範囲外フィールドは`INVALID_ARG`。タイムゾーンは中立（tm_isdst=0）。
+- `fat_strerror`にEND_OF_DIR分を追加（リードが基盤として先行投入）。
+
+### 13.2 テスト追加（p-ab-test、testmain.c/Makefile所有）
+
+- A1: 0x05レンダリング単体 + 8.3ラウンドトリップ
+- A2: `.`/`..` at root → FAT_OK + 合成dirent検証、`dir1/../..` の追跡
+- A3: `"demof12"`/`"demof16"`/`"demof32"` lookup → NOT_FOUND
+- B6: 全ファイル読み（`fat_read_file`とのバイト一致）、seek+tell、境界（0/size/size+1）、空ファイル、ショートしないread、FAT32の多クラスタ、突然のBAD_CLUSTER（mutation）
+- B7: `fat_iter_dir`との列挙一致（3フィクスチャ）、終端後の継続呼び出し、root/FAT32ルートチェーン
+- B8: DOS日時デコード（境界値1980/2107、月0/13、日0、時24、tenth）
+- **A4 ブートセクタファズ**: FAT12は512B全bit反転（4096变异、open→iterate→lookup→readの生存）、FAT16/32はBPBフィールド値ベースmutation（{0x00,0xFF,0x55}×主要オフセット。イメージコピー34MB×4096は実行時間非現実的のため）。ASanビルドで実行。
+- **A5 mtools差分**: `mdir -b`出力と当方の列挙（名前/サイズ/種別）を3フィクスチャ横断で比較、`mtype`と`fat_read_file`のバイト一致。mtools不在時はスキップ表示。
+- Makefile: `-Wstrict-prototypes`追加、ファズ・差分を`check`に含めつつ実行時間を概算1分以内に。
+
+### 13.3 実装（p-ab-lib、fat_internal.h/fat_core.c/fat_dump.c所有）
+
+- A1/A2/A3: `fat_name_from_83`/`fat_lookup`（合成dirent生成、label除外）
+- B6: `struct fat_file`（ctx借用+direntコピー+位置/クラスター状態+Brent状態）
+- B7: `struct fat_dir`（走査状態）で`fat_iter_dir`を再実装（同一ロジック共用）
+- B8: ビット分解デコーダ
+- **A9 掃除**: `fat_dump.c`のconst外し解消、`fat_print_directory_entry`デッドexport削除、`-Wstrict-prototypes`対応
+- 制約: コアはstdioゼロ・グローバル状態ゼロ・警告ゼロを維持。テストファイルは触らない（テストの誤りはリードにエスカレーション）
+
+### 13.4 検証
+
+redリスト記録 → green化 → リードが`make check`（+ASan）とデモを直接実行、§14に結果記録。コミットは指示待ち。
+
+## 14. ウェーブA&B実施結果（2026-10-05 完了）
+
+TDD実施: **p-ab-test**がred フェーズで全テスト先行記述（A1/A2/A3はアサーションred、B6/B7/B8はリンクred=未定義シンボル10個、A4ファズ/A5 mtools差分は現行libで緑の回帰ロック。red理由はプローブ実測で「契約未実装」であることを全件確認）→ **p-ab-lib**がgreen化（凍結テスト・契約fat.h変更なし、指摘ゼロで一発green）→ リード検証。
+
+達成:
+- **A1**: `fat_name_from_83`はname11[0]==0x05を0xE5描画
+- **A2**: ルート直下の`.`/`..`は合成dirent（name/ATTR_DIRECTORY/`FAT_CLUSTER_ROOT`/size 0）で`FAT_OK`。§10の未決解消。非ルートの`.`は実ディスク"."エントリ解決（相対開始クラスタ対応）
+- **A3**: `fat_lookup`はATTR_VOLUME_ID非マッチ（DOS open()準拠）
+- **B6**: `fat_file_t`ストリーミングAPI（open/seek/read/tell/size/close）。seekはO(チェーン)再ウォーク、readは`fat_read_file`と同一ガード（bad/free/reserved/EOC短絡/bounds/Brent）を呼び出し内継続、エラー時カーソル不変
+- **B7**: `fat_dir_t`カーソルAPI。`fat_iter_dir`は`fat_dir_open`+nextループのthin実装に統合（走査単一化）。END_OF_DIRはsticky。**非ルートディレクトリクラスタは先頭"."エントリ必須の検証**を共有パスに追加（ファイルデータ誤指定をINVALID_ARGで拒否、FAT32のroot_cluster直指定も免除対象）
+- **B8**: `fat_dos_date_to_tm`（範囲検証: 月1-12/日≥1/時≤23/分≤59/秒フィールド≤29/tenth≤199）
+- **A4**: FAT12ブートセクタ全bit反転4096変異（ASan込み3.8秒）+ FAT16/32値変異（9/13オフセット×3値）— クラッシュ/ASan報告ゼロ
+- **A5**: mtools差分（`mdir -b`列挙集合比較×6 Listing、`mtype`バイト一致×3）— 現行libで一致、回帰ロック化
+- **A9**: `-Wstrict-prototypes`対応5箇所（color×2、fat_dump×3）、`fat_print_directory_entry`デッドexportと到達不能静的群（約90行）削除、const外し解消
+
+検証（リード直接実施）: クリーンビルド `make check` = **37テスト×2全ok、警告ゼロ**（`-Wall -Wextra -Wshadow -Wstrict-prototypes`、通常+ASan/UBSan）。デモexit=0・全セクション正常。実行時間はASan込み全体で約4秒（ファズフルスイープ含む）。
+
+テスト構成: FAT12基盤9 + ファズ/mtools回帰 + FAT16 5 + FAT32 8 + 新API群（file 6/dir 5/dos日時/0x05/ラベル/ルートdots）= 37。
+
+次のステップ（§12設計済み）: フェーズ4書き込み対応（`fat_set_fat_entry`/`fat_alloc_cluster`/`fat_free_chain`/`fat_add_dirent`/`fat_write_file`/`fat_write`、FAT12 RMW・両FATコピー・FSInfo更新・DOSタイムスタンプ・失敗時一貫性順序）。

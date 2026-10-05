@@ -23,7 +23,7 @@ TESTOUTOBJS = $(addprefix $(OUTDIR)/,$(TESTOBJS))
 SANOUTOBJS = $(addprefix $(SANOUTDIR)/,$(TESTOBJS))
 
 CC = clang
-CFLAGS = -std=c99 -Wall -Wextra -Wshadow -g -I. -MMD -MP
+CFLAGS = -std=c99 -Wall -Wextra -Wshadow -Wstrict-prototypes -g -I. -MMD -MP
 SANFLAGS = $(CFLAGS) -fsanitize=address,undefined
 
 VOL := DEMOF12

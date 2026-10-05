@@ -361,6 +361,31 @@ static void test_names(void)
     assert(strcmp(out, "HELLO.TXT") == 0);
 }
 
+/* A1: on-disk first byte 0x05 is the escape for a true first byte 0xE5
+ * (a name whose real lead byte is 0xE5 would be mistaken for a deleted
+ * entry, so FAT stores it as 0x05).  Both stored forms must render the
+ * same name, with a literal 0xE5 first byte.  High (non-ASCII) bytes are
+ * copied through verbatim; blank extension on a file means no dot. */
+static void test_name_05_escape(void)
+{
+    static const uint8_t stored05[11] = {
+        0x05, 0x81, 0x90, ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' '
+    };
+    static const uint8_t storedE5[11] = {
+        0xE5, 0x81, 0x90, ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' '
+    };
+    static const uint8_t want[4] = {0xE5, 0x81, 0x90, 0x00};
+    char out05[FAT_NAME_MAX];
+    char outE5[FAT_NAME_MAX];
+
+    assert(fat_name_from_83(stored05, 0x20, out05, sizeof(out05)) == FAT_OK);
+    assert(fat_name_from_83(storedE5, 0x20, outE5, sizeof(outE5)) == FAT_OK);
+    /* byte-exact render (0xE5 lead), and both forms agree */
+    assert(memcmp(out05, want, sizeof(want)) == 0);
+    assert(memcmp(outE5, want, sizeof(want)) == 0);
+    assert(memcmp(out05, outE5, sizeof(want)) == 0);
+}
+
 static void test_lookup(void)
 {
     fat_ctx_t* ctx = open_fixture();
@@ -405,14 +430,19 @@ static void test_lookup(void)
     assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "hello.txt/x", &de) ==
            FAT_ERR_PATH_NOT_FOUND);
 
-    /* "." / ".." at the root: the fixed root region has no dot entries, so
-     * neither can resolve to a dirent. fat_lookup handles both itself
-     * (fat_name_to_83 rejects them); like "..", "." at the root fails with
-     * PATH_NOT_FOUND -- there is no current-directory entry to stay in. */
-    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, ".", &de) ==
-           FAT_ERR_PATH_NOT_FOUND);
-    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "..", &de) ==
-           FAT_ERR_PATH_NOT_FOUND);
+    /* A2: "." / ".." at the root now succeed with a synthetic root dirent
+     * (DOS semantics: the root is its own parent).  The fixed root region
+     * has no dot entries; fat_lookup must synthesize one. */
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, ".", &de) == FAT_OK);
+    assert(strcmp(de.name, ".") == 0);
+    assert(de.attributes & 0x10);
+    assert(de.first_cluster == FAT_CLUSTER_ROOT);
+    assert(de.file_size == 0);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "..", &de) == FAT_OK);
+    assert(strcmp(de.name, "..") == 0);
+    assert(de.attributes & 0x10);
+    assert(de.first_cluster == FAT_CLUSTER_ROOT);
+    assert(de.file_size == 0);
 
     /* "." resolves to the directory's own dot entry */
     assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir1/.", &de) == FAT_OK);
@@ -425,6 +455,54 @@ static void test_lookup(void)
     assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir1/../hello.txt", &de) ==
            FAT_OK);
     assert(de.file_size == 12);
+
+    fat_close(ctx);
+}
+
+/* A2: the root is its own parent, transitively -- any number of ".." from
+ * the root stays at the root, and paths through them keep resolving. */
+static void test_lookup_root_dots(void)
+{
+    fat_ctx_t* ctx = open_fixture();
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+
+    /* leading/trailing and repeated root dots */
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "/.", &de) == FAT_OK);
+    assert(de.first_cluster == FAT_CLUSTER_ROOT);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "./..", &de) == FAT_OK);
+    assert(de.first_cluster == FAT_CLUSTER_ROOT);
+
+    /* down and back up past the root: dir1/.. lands on the root, and the
+     * next ".." must stay there instead of failing */
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir1/../..", &de) == FAT_OK);
+    assert(strcmp(de.name, "..") == 0);
+    assert(de.attributes & 0x10);
+    assert(de.first_cluster == FAT_CLUSTER_ROOT);
+    assert(de.file_size == 0);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir1/../../hello.txt", &de) ==
+           FAT_OK);
+    assert(de.file_size == 12);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "../../dir1/hoge.txt", &de) ==
+           FAT_OK);
+    assert(de.file_size == 11);
+
+    fat_close(ctx);
+}
+
+/* A3: volume-label entries (attr 0x08) are metadata, not openable objects;
+ * fat_lookup must never match them (DOS open() semantics).  Iteration
+ * still shows them (test_root_iterate). */
+static void test_lookup_volume_label(void)
+{
+    fat_ctx_t* ctx = open_fixture();
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "demof12", &de) ==
+           FAT_ERR_NOT_FOUND);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "DEMOF12", &de) ==
+           FAT_ERR_NOT_FOUND);
 
     fat_close(ctx);
 }
@@ -710,6 +788,772 @@ static void test_open_mem_errors(void)
     free(orig);
 }
 
+/* ---- B6/B7/B8 (link-red until implemented) ---- */
+
+/* B8: DOS date/time decode helpers.
+ * date = ((year-1980)<<9) | (month<<5) | day, time = (h<<11)|(min<<5)|s/2 */
+static uint16_t dos_date_bits(int year, int month, int day)
+{
+    return (uint16_t)(((year - 1980) << 9) | (month << 5) | day);
+}
+
+static uint16_t dos_time_bits(int hour, int minute, int second)
+{
+    return (uint16_t)((hour << 11) | (minute << 5) | (second / 2));
+}
+
+static void assert_tm_fields(const struct tm* tm, int year, int mon, int mday,
+                             int hour, int min, int sec)
+{
+    assert(tm->tm_year == year);
+    assert(tm->tm_mon == mon);
+    assert(tm->tm_mday == mday);
+    assert(tm->tm_hour == hour);
+    assert(tm->tm_min == min);
+    assert(tm->tm_sec == sec);
+    assert(tm->tm_isdst == 0);
+}
+
+static void test_dos_date_to_tm(void)
+{
+    struct tm tm;
+
+    /* DOS epoch: 1980-01-01 00:00:00 */
+    memset(&tm, 0xAA, sizeof(tm));
+    assert(fat_dos_date_to_tm(dos_date_bits(1980, 1, 1),
+                              dos_time_bits(0, 0, 0), 0, &tm) == FAT_OK);
+    assert_tm_fields(&tm, 80, 0, 1, 0, 0, 0);
+
+    /* max encodable timestamp: 2107-12-31 23:59:58 */
+    memset(&tm, 0xAA, sizeof(tm));
+    assert(fat_dos_date_to_tm(dos_date_bits(2107, 12, 31),
+                              dos_time_bits(23, 59, 58), 0, &tm) == FAT_OK);
+    assert_tm_fields(&tm, 207, 11, 31, 23, 59, 58);
+
+    /* ordinary stamp with a 0.01s field: struct tm has no sub-second slot,
+     * so the tenth must not disturb any decoded field.  fat.h only
+     * promises the date/time decode ("pass 0 to ignore"), so this asserts
+     * exactly that much: tenth=78 decodes identically to tenth=0. */
+    memset(&tm, 0xAA, sizeof(tm));
+    assert(fat_dos_date_to_tm(dos_date_bits(2026, 10, 5),
+                              dos_time_bits(12, 34, 56), 78, &tm) == FAT_OK);
+    assert_tm_fields(&tm, 126, 9, 5, 12, 34, 56);
+    memset(&tm, 0xAA, sizeof(tm));
+    assert(fat_dos_date_to_tm(dos_date_bits(2026, 10, 5),
+                              dos_time_bits(12, 34, 56), 0, &tm) == FAT_OK);
+    assert_tm_fields(&tm, 126, 9, 5, 12, 34, 56);
+
+    /* out-of-range encoded fields (fat.h: month 0/13+, day 0, hour 24+) */
+    assert(fat_dos_date_to_tm(dos_date_bits(2026, 0, 5),
+                              dos_time_bits(12, 34, 56), 0, &tm) ==
+           FAT_ERR_INVALID_ARG);
+    assert(fat_dos_date_to_tm(dos_date_bits(2026, 13, 5),
+                              dos_time_bits(12, 34, 56), 0, &tm) ==
+           FAT_ERR_INVALID_ARG);
+    assert(fat_dos_date_to_tm(dos_date_bits(2026, 10, 0),
+                              dos_time_bits(12, 34, 56), 0, &tm) ==
+           FAT_ERR_INVALID_ARG);
+    assert(fat_dos_date_to_tm(dos_date_bits(2026, 10, 5),
+                              dos_time_bits(24, 0, 0), 0, &tm) ==
+           FAT_ERR_INVALID_ARG);
+
+    /* NULL out */
+    assert(fat_dos_date_to_tm(dos_date_bits(2026, 10, 5),
+                              dos_time_bits(12, 34, 56), 0, NULL) ==
+           FAT_ERR_INVALID_ARG);
+}
+
+/* ------------------------------------------------------------------ */
+/* B6: fat_file_t streaming reads vs fat_read_file ground truth        */
+/* ------------------------------------------------------------------ */
+
+/* Exercise one file through the whole fat_file_t surface and compare
+ * every byte with fat_read_file's whole-file buffer. */
+static void exercise_file_stream(fat_ctx_t* ctx, const char* path)
+{
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, path, &de) == FAT_OK);
+
+    uint8_t* whole = NULL;
+    size_t whole_size = 0;
+    assert(fat_read_file(ctx, &de, &whole, &whole_size) == FAT_OK);
+    assert(whole_size == de.file_size);
+
+    fat_file_t* f = NULL;
+    assert(fat_file_open(ctx, &de, &f) == FAT_OK);
+    assert(f != NULL);
+    assert(fat_file_size(f) == whole_size);
+    assert(fat_file_tell(f) == 0);
+
+    /* whole file in a single read: full length delivered (a short read
+     * only happens at EOF), bytes identical, cursor at the end */
+    if (whole_size > 0) {
+        uint8_t* buf = malloc(whole_size);
+        assert(buf != NULL);
+        size_t got = 0x5A5A;
+        assert(fat_file_read(f, buf, whole_size, &got) == FAT_OK);
+        assert(got == whole_size);
+        assert(memcmp(buf, whole, whole_size) == 0);
+        assert(fat_file_tell(f) == whole_size);
+        /* at EOF further reads deliver 0 bytes with FAT_OK */
+        got = 0x5A5A;
+        assert(fat_file_read(f, buf, 16, &got) == FAT_OK);
+        assert(got == 0);
+        free(buf);
+    }
+
+    /* 1-byte chunked walk over the first 2000 bytes (FAT12: crosses the
+     * first cluster boundary at 1024); tell tracks every single step */
+    {
+        size_t steps = whole_size < 2000 ? whole_size : 2000;
+        for (size_t i = 0; i < steps; i++) {
+            uint8_t b = 0;
+            size_t got = 0;
+            assert(fat_file_seek(f, i) == FAT_OK);
+            assert(fat_file_tell(f) == i);
+            assert(fat_file_read(f, &b, 1, &got) == FAT_OK);
+            assert(got == 1);
+            assert(b == whole[i]);
+            assert(fat_file_tell(f) == i + 1);
+        }
+    }
+
+    /* seek edges: 0, EOF (legal), and one past the end */
+    assert(fat_file_seek(f, 0) == FAT_OK);
+    assert(fat_file_tell(f) == 0);
+    assert(fat_file_seek(f, whole_size) == FAT_OK);
+    assert(fat_file_tell(f) == whole_size);
+    {
+        uint8_t b = 0;
+        size_t got = 0x5A5A;
+        assert(fat_file_read(f, &b, 1, &got) == FAT_OK);
+        assert(got == 0);
+    }
+    assert(fat_file_seek(f, whole_size + 1) == FAT_ERR_INVALID_ARG);
+    if (whole_size > 0) {
+        /* short read ONLY at EOF: 2 bytes requested at size-1 deliver 1 */
+        uint8_t b[2] = {0, 0};
+        size_t got = 0x5A5A;
+        assert(fat_file_seek(f, whole_size - 1) == FAT_OK);
+        assert(fat_file_read(f, b, 2, &got) == FAT_OK);
+        assert(got == 1);
+        assert(b[0] == whole[whole_size - 1]);
+    }
+    /* read spanning a cluster boundary: last byte of cluster 0 and first
+     * byte of cluster 1 in one call */
+    {
+        uint32_t cs = fat_cluster_size(ctx);
+        if (whole_size > cs) {
+            uint8_t b[2] = {0, 0};
+            size_t got = 0;
+            assert(fat_file_seek(f, cs - 1) == FAT_OK);
+            assert(fat_file_read(f, b, 2, &got) == FAT_OK);
+            assert(got == 2);
+            assert(b[0] == whole[cs - 1] && b[1] == whole[cs]);
+        }
+    }
+
+    fat_file_close(f);
+    free(whole);
+}
+
+static void test_file_stream(void)
+{
+    fat_ctx_t* ctx = open_fixture();
+
+    /* multi-cluster (5 clusters of 1024B) and single-cluster files */
+    exercise_file_stream(ctx, "test_5kb.txt");
+    exercise_file_stream(ctx, "hello.txt");
+
+    /* empty file: fabricated dirent (the fixture has no empty file) */
+    {
+        fat_dirent_t de;
+        memset(&de, 0, sizeof(de));
+        de.attributes = 0x20;
+        de.first_cluster = 0;
+        de.file_size = 0;
+        fat_file_t* f = NULL;
+        assert(fat_file_open(ctx, &de, &f) == FAT_OK);
+        assert(fat_file_size(f) == 0);
+        assert(fat_file_tell(f) == 0);
+        uint8_t b = 0;
+        size_t got = 0x5A5A;
+        assert(fat_file_read(f, &b, 8, &got) == FAT_OK);
+        assert(got == 0);
+        assert(fat_file_seek(f, 0) == FAT_OK);
+        assert(fat_file_seek(f, 1) == FAT_ERR_INVALID_ARG); /* past size 0 */
+        fat_file_close(f);
+    }
+
+    /* non-file dirents are rejected, same rules as fat_read_file */
+    {
+        fat_dirent_t de;
+        fat_file_t* f = NULL;
+        memset(&de, 0, sizeof(de));
+        de.attributes = 0x10; /* directory */
+        de.first_cluster = 8;
+        assert(fat_file_open(ctx, &de, &f) == FAT_ERR_INVALID_ARG);
+        de.attributes = 0x08; /* volume label */
+        assert(fat_file_open(ctx, &de, &f) == FAT_ERR_INVALID_ARG);
+    }
+
+    /* documented NULL handling */
+    fat_file_close(NULL);
+    assert(fat_file_tell(NULL) == 0);
+    assert(fat_file_size(NULL) == 0);
+
+    fat_close(ctx);
+}
+
+static void test_fat16_file_stream(void)
+{
+    fat_ctx_t* ctx = open_image(IMG16_NAME);
+
+    /* 4962 bytes over 512B clusters (chain 3->4->..->12) + single cluster */
+    exercise_file_stream(ctx, "test_5kb.txt");
+    exercise_file_stream(ctx, "hello.txt");
+
+    fat_close(ctx);
+}
+
+static void test_fat32_file_stream(void)
+{
+    fat_ctx_t* ctx = open_image(IMG32_NAME);
+
+    /* 4962 bytes over 512B clusters (chain 4->5->..->13) + single cluster */
+    exercise_file_stream(ctx, "test_5kb.txt");
+    exercise_file_stream(ctx, "hello.txt");
+
+    fat_close(ctx);
+
+    /* broken chain: FAT[5]=5 self-loop inside the test_5kb chain.
+     * open must succeed (only the BPB is validated); the read must trip
+     * the same chain guard as fat_read_file (Brent) -> BAD_CLUSTER */
+    size_t size = 0;
+    uint8_t* orig = read_image(IMG32_NAME, &size);
+    uint8_t* img = copy_image(orig, size);
+    set_fat32_entry(img, 5, 5);
+    fat_ctx_t* mctx = NULL;
+    assert(fat_open_mem(img, size, &mctx) == FAT_OK);
+    free(img);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(fat_lookup(mctx, FAT_CLUSTER_ROOT, "test_5kb.txt", &de) == FAT_OK);
+    fat_file_t* f = NULL;
+    assert(fat_file_open(mctx, &de, &f) == FAT_OK);
+    uint8_t* buf = malloc(de.file_size);
+    assert(buf != NULL);
+    size_t got = 0x5A5A;
+    assert(fat_file_read(f, buf, de.file_size, &got) == FAT_ERR_BAD_CLUSTER);
+    free(buf);
+    fat_file_close(f);
+    fat_close(mctx);
+    free(orig);
+}
+
+/* ------------------------------------------------------------------ */
+/* B7: fat_dir_t cursors vs fat_iter_dir                               */
+/* ------------------------------------------------------------------ */
+
+#define COLLECT_MAX 64 /* biggest listing: the 44-entry FAT32 root */
+
+typedef struct {
+    fat_dirent_t e[COLLECT_MAX];
+    uint8_t raw[COLLECT_MAX][32];
+    int n;
+    int overflow;
+} EntryList;
+
+static void collect_entries(const fat_dirent_t* entry, const uint8_t* raw32,
+                            void* user_data)
+{
+    EntryList* list = user_data;
+
+    if (list->n >= COLLECT_MAX) {
+        list->overflow = 1;
+        return;
+    }
+    list->e[list->n] = *entry;
+    memcpy(list->raw[list->n], raw32, 32);
+    list->n++;
+}
+
+/* The cursor must enumerate exactly what fat_iter_dir enumerates on the
+ * same cluster -- same entries in the same order -- then report
+ * FAT_ERR_END_OF_DIR, stickily. */
+static void assert_dir_cursor_matches_iter(fat_ctx_t* ctx, uint32_t cluster)
+{
+    EntryList list;
+    memset(&list, 0, sizeof(list));
+    assert(fat_iter_dir(ctx, cluster, collect_entries, &list) == FAT_OK);
+    assert(list.overflow == 0);
+
+    fat_dir_t* d = NULL;
+    assert(fat_dir_open(ctx, cluster, &d) == FAT_OK);
+    assert(d != NULL);
+    for (int i = 0; i < list.n; i++) {
+        const fat_dirent_t* e = NULL;
+        const uint8_t* r = NULL;
+        assert(fat_dir_next(d, &e, &r) == FAT_OK);
+        assert(e != NULL && r != NULL);
+        assert(strcmp(e->name, list.e[i].name) == 0);
+        assert(e->attributes == list.e[i].attributes);
+        assert(e->first_cluster == list.e[i].first_cluster);
+        assert(e->file_size == list.e[i].file_size);
+        /* raw32: the same 32 on-disk bytes, and their first 11 must be
+         * the 8.3 encoding of the rendered name (dot entries are not 8.3
+         * names, so those skip the round trip) */
+        assert(memcmp(r, list.raw[i], 32) == 0);
+        if (e->name[0] != '.') {
+            uint8_t name11[11];
+            assert(fat_name_to_83(e->name, name11) == FAT_OK);
+            assert(memcmp(r, name11, 11) == 0);
+        }
+    }
+    const fat_dirent_t* e = NULL;
+    const uint8_t* r = NULL;
+    assert(fat_dir_next(d, &e, &r) == FAT_ERR_END_OF_DIR);
+    assert(fat_dir_next(d, &e, &r) == FAT_ERR_END_OF_DIR); /* sticky */
+    fat_dir_close(d);
+}
+
+static void test_dir_cursor(void)
+{
+    fat_ctx_t* ctx = open_fixture();
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+
+    assert_dir_cursor_matches_iter(ctx, FAT_CLUSTER_ROOT);
+
+    /* dir2: multi-cluster chain 11->43, 35 entries (2 dots + 33 subdirs) */
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir2", &de) == FAT_OK);
+    assert_dir_cursor_matches_iter(ctx, de.first_cluster);
+
+    /* a file's cluster is not a directory: hello.txt lives in cluster 2
+     * (its data "hello world" does not start with a "." entry like every
+     * real subdirectory does); cluster 1 is a reserved FAT entry */
+    fat_dir_t* d = NULL;
+    assert(fat_dir_open(ctx, 2, &d) == FAT_ERR_INVALID_ARG);
+    assert(fat_dir_open(ctx, 1, &d) == FAT_ERR_INVALID_ARG);
+
+    fat_dir_close(NULL); /* documented NULL safety */
+
+    fat_close(ctx);
+}
+
+static void test_fat16_dir_cursor(void)
+{
+    fat_ctx_t* ctx = open_image(IMG16_NAME);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+
+    assert_dir_cursor_matches_iter(ctx, FAT_CLUSTER_ROOT);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir1", &de) == FAT_OK);
+    assert_dir_cursor_matches_iter(ctx, de.first_cluster);
+
+    fat_close(ctx);
+}
+
+static void test_fat32_dir_cursor(void)
+{
+    fat_ctx_t* ctx = open_image(IMG32_NAME);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+
+    /* root: the 3-cluster chain 2->54->55 with 44 entries */
+    assert_dir_cursor_matches_iter(ctx, FAT_CLUSTER_ROOT);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir1", &de) == FAT_OK);
+    assert_dir_cursor_matches_iter(ctx, de.first_cluster);
+
+    fat_close(ctx);
+}
+
+/* ------------------------------------------------------------------ */
+/* A4: boot-sector fuzz (regression: pass = no crash/hang/ASan report) */
+/* ------------------------------------------------------------------ */
+
+static void fuzz_noop_cb(const fat_dirent_t* entry, const uint8_t* raw32,
+                         void* user_data)
+{
+    (void)entry;
+    (void)raw32;
+    (void)user_data;
+}
+
+/* full pipeline on one mutated image: open -> root iterate -> lookup ->
+ * whole-file read of test_5kb.txt (fat_read_file has no length bound;
+ * the 4962-byte fixture bounds it).  Any fat_result_t is acceptable at
+ * every step; surviving is the contract.  *lookup_read counts full
+ * pipeline runs that reached a successful read. */
+static fat_result_t fuzz_pipeline(const uint8_t* img, size_t size,
+                                  int* lookup_read)
+{
+    fat_ctx_t* ctx = NULL;
+    fat_dirent_t de;
+
+    *lookup_read = 0;
+    fat_result_t r = fat_open_mem(img, size, &ctx);
+    if (r != FAT_OK) {
+        if (ctx != NULL)
+            fat_close(ctx); /* a context bound on failure is released */
+        return r;
+    }
+    (void)fat_iter_dir(ctx, FAT_CLUSTER_ROOT, fuzz_noop_cb, NULL);
+    if (fat_lookup(ctx, FAT_CLUSTER_ROOT, "test_5kb.txt", &de) == FAT_OK) {
+        uint8_t* data = NULL;
+        size_t n = 0;
+        if (fat_read_file(ctx, &de, &data, &n) == FAT_OK)
+            *lookup_read = 1;
+        free(data);
+    }
+    fat_close(ctx);
+    return r;
+}
+
+static void test_boot_fuzz_fat12(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    int opened = 0, rejected = 0, read_ok = 0;
+
+    /* exhaustive: every bit of all 512 boot-sector bytes = 4096 mutants.
+     * Measured ~0.1ms per mutant native (~0.4s total, a few seconds under
+     * ASan) -- no reduction needed on this device. */
+    for (size_t byte = 0; byte < 512; byte++) {
+        for (int bit = 0; bit < 8; bit++) {
+            int lr = 0;
+            memcpy(img, orig, size);
+            img[byte] ^= (uint8_t)(1u << bit);
+            if (fuzz_pipeline(img, size, &lr) == FAT_OK)
+                opened++;
+            else
+                rejected++;
+            read_ok += lr;
+        }
+    }
+    /* determinism guard: both outcomes and the full pipeline must have
+     * actually run (BPB flips reject; OEM-name flips open fine) */
+    assert(opened > 0);
+    assert(rejected > 0);
+    assert(read_ok > 0);
+
+    free(img);
+    free(orig);
+}
+
+struct bpb_field {
+    size_t off;
+    size_t len;
+};
+
+/* critical BPB offsets (fatgen103 layout) and their byte widths */
+static const struct bpb_field BPB_FIELDS_16[] = {
+    {11, 2}, /* bytesPerSector */
+    {13, 1}, /* sectorsPerCluster */
+    {14, 2}, /* reservedSectorCount */
+    {16, 1}, /* tableCount */
+    {17, 2}, /* rootEntryCount */
+    {19, 2}, /* totalSectors16 */
+    {21, 1}, /* mediaType */
+    {22, 2}, /* tableSize16 */
+    {32, 4}, /* totalSectors32 */
+};
+static const struct bpb_field BPB_FIELDS_32[] = {
+    {11, 2}, {13, 1}, {14, 2}, {16, 1}, {17, 2},
+    {19, 2}, {21, 1}, {22, 2}, {32, 4},
+    {36, 4}, /* FAT32 tableSize32 */
+    {40, 2}, /* FAT32 extFlags */
+    {44, 4}, /* FAT32 rootCluster */
+    {48, 2}, /* FAT32 fsInfo sector */
+};
+
+static void fuzz_bpb_values(const char* img_name,
+                            const struct bpb_field* fields, size_t nfields)
+{
+    size_t size = 0;
+    uint8_t* orig = read_image(img_name, &size);
+    uint8_t* img = copy_image(orig, size);
+    int opened = 0, rejected = 0, read_ok = 0;
+    static const uint8_t patterns[3] = {0x00, 0xFF, 0x55};
+
+    /* each critical field x {0x00, 0xFF, 0x55} byte-fill (0x5555... for
+     * multi-byte fields).  Copying 16/33MiB per mutant bounds this to the
+     * value grid -- a full bit sweep is not affordable at these sizes. */
+    for (size_t i = 0; i < nfields; i++) {
+        for (int p = 0; p < 3; p++) {
+            int lr = 0;
+            memcpy(img, orig, size);
+            memset(img + fields[i].off, patterns[p], fields[i].len);
+            if (fuzz_pipeline(img, size, &lr) == FAT_OK)
+                opened++;
+            else
+                rejected++;
+            read_ok += lr;
+        }
+    }
+    assert(opened > 0);
+    assert(rejected > 0);
+    assert(read_ok > 0);
+
+    free(img);
+    free(orig);
+}
+
+static void test_boot_fuzz_values_fat16(void)
+{
+    fuzz_bpb_values(IMG16_NAME, BPB_FIELDS_16,
+                    sizeof(BPB_FIELDS_16) / sizeof(BPB_FIELDS_16[0]));
+}
+
+static void test_boot_fuzz_values_fat32(void)
+{
+    fuzz_bpb_values(IMG32_NAME, BPB_FIELDS_32,
+                    sizeof(BPB_FIELDS_32) / sizeof(BPB_FIELDS_32[0]));
+}
+
+/* ------------------------------------------------------------------ */
+/* A5: mtools differential (mdir -b / mtype as the oracle)             */
+/* ------------------------------------------------------------------ */
+
+/* mtools 4.0.48 `mdir -b` format, verified empirically on this device:
+ * one entry per line as "::/dir/name" -- the requested directory is
+ * repeated in each line, directories carry a trailing '/', names are
+ * printed in lowercase (we render uppercase), and neither the volume
+ * label nor "."/".." entries are listed.  No sizes are printed; content
+ * equality is covered by mtype instead. */
+
+static int mtools_probe_state = -1;
+
+static int mtools_present(void)
+{
+    if (mtools_probe_state < 0) {
+        FILE* p = popen("mdir --version 2>/dev/null", "r");
+        char buf[64];
+        int ok = p != NULL && fgets(buf, sizeof(buf), p) != NULL;
+        if (p != NULL)
+            pclose(p);
+        mtools_probe_state = ok ? 1 : 0;
+    }
+    return mtools_probe_state;
+}
+
+#define MDIR_MAX 64
+
+typedef struct {
+    char name[16]; /* 8.3 = 12 chars max */
+    int is_dir;
+} MDirEntry;
+
+static int upper_eq(const char* a, const char* b)
+{
+    while (*a != '\0' && *b != '\0') {
+        char ca = *a >= 'a' && *a <= 'z' ? (char)(*a - 'a' + 'A') : *a;
+        char cb = *b >= 'a' && *b <= 'z' ? (char)(*b - 'a' + 'A') : *b;
+        if (ca != cb)
+            return 0;
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+/* run `mdir -b -i img ::dir`, parse lines into entries; -1 on mdir
+ * failure (mtools was probed present, so that is a hard error) */
+static int run_mdir_b(const char* img_name, const char* dir,
+                      MDirEntry* out, int max)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "mdir -b -i %s ::%s 2>/dev/null", img_name,
+             dir);
+    FILE* p = popen(cmd, "r");
+    if (p == NULL)
+        return -1;
+    char line[512];
+    int n = 0;
+    while (fgets(line, sizeof(line), p) != NULL) {
+        char* s = strstr(line, "::/");
+        if (s == NULL)
+            continue;
+        s += 3; /* past "::/" */
+        char* nl = strchr(s, '\n');
+        if (nl != NULL)
+            *nl = '\0';
+        /* the trailing '/' is the directory marker, not a separator:
+         * drop it before splitting, then keep only the final path
+         * component (lines repeat the requested dir prefix) */
+        size_t len = strlen(s);
+        int is_dir = len > 0 && s[len - 1] == '/';
+        if (is_dir)
+            s[len - 1] = '\0';
+        const char* slash = strrchr(s, '/');
+        const char* base = slash != NULL ? slash + 1 : s;
+        size_t namelen = strlen(base);
+        if (namelen == 0 || namelen >= sizeof(out[0].name))
+            continue;
+        if (n < max) {
+            memcpy(out[n].name, base, namelen);
+            out[n].name[namelen] = '\0';
+            out[n].is_dir = is_dir;
+            n++;
+        }
+    }
+    int status = pclose(p);
+    return status == 0 ? n : -1;
+}
+
+typedef struct {
+    MDirEntry e[MDIR_MAX];
+    int n;
+} OurListing;
+
+static void list_ours_cb(const fat_dirent_t* entry, const uint8_t* raw32,
+                         void* user_data)
+{
+    OurListing* ours = user_data;
+
+    (void)raw32;
+    if (entry->attributes & 0x08) /* volume label: mdir -b omits it */
+        return;
+    if (entry->name[0] == '.')    /* dot entries: mdir -b omits them */
+        return;
+    if (ours->n < MDIR_MAX) {
+        snprintf(ours->e[ours->n].name, sizeof(ours->e[0].name), "%s",
+                 entry->name);
+        ours->e[ours->n].is_dir = (entry->attributes & 0x10) != 0;
+        ours->n++;
+    }
+}
+
+static void assert_listing_matches_mdir(fat_ctx_t* ctx, const char* img_name,
+                                        const char* dir, uint32_t cluster)
+{
+    MDirEntry theirs[MDIR_MAX];
+    int tn = run_mdir_b(img_name, dir, theirs, MDIR_MAX);
+    if (tn < 0)
+        fprintf(stderr, "mdir failed: %s ::%s\n", img_name, dir);
+    assert(tn >= 0);
+
+    OurListing ours;
+    memset(&ours, 0, sizeof(ours));
+    assert(fat_iter_dir(ctx, cluster, list_ours_cb, &ours) == FAT_OK);
+
+    if (ours.n != tn)
+        fprintf(stderr, "listing size mismatch for ::%s: ours %d mdir %d\n",
+                dir, ours.n, tn);
+    assert(ours.n == tn);
+    /* set comparison: every mdir entry matched by exactly one of ours
+     * (with equal counts that is a bijection) */
+    for (int i = 0; i < tn; i++) {
+        int found = 0;
+        for (int j = 0; j < ours.n; j++) {
+            if (upper_eq(theirs[i].name, ours.e[j].name)) {
+                if (!found && (theirs[i].is_dir != ours.e[j].is_dir))
+                    fprintf(stderr, "dir-ness mismatch: %s%s vs %s\n",
+                            theirs[i].name, theirs[i].is_dir ? "/" : "",
+                            ours.e[j].name);
+                assert(!found); /* names are unique: at most one match */
+                assert(theirs[i].is_dir == ours.e[j].is_dir);
+                found = 1;
+            }
+        }
+        if (!found)
+            fprintf(stderr, "mdir entry not in our listing: %s%s\n",
+                    theirs[i].name, theirs[i].is_dir ? "/" : "");
+        assert(found);
+    }
+}
+
+/* byte-compare `mtype -i img ::path` with fat_read_file */
+static void assert_mtype_matches_read(fat_ctx_t* ctx, const char* img_name,
+                                      const char* path)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "mtype -i %s ::%s 2>/dev/null", img_name,
+             path);
+    FILE* p = popen(cmd, "r");
+    if (p == NULL)
+        perror("mtype");
+    assert(p != NULL);
+
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, path, &de) == FAT_OK);
+    uint8_t* want = NULL;
+    size_t want_size = 0;
+    assert(fat_read_file(ctx, &de, &want, &want_size) == FAT_OK);
+
+    size_t got_total = 0;
+    int mismatch = 0;
+    int ch;
+    while ((ch = fgetc(p)) != EOF) {
+        if (got_total >= want_size || (uint8_t)ch != want[got_total]) {
+            mismatch = 1;
+            break;
+        }
+        got_total++;
+    }
+    int status = pclose(p);
+    if (status != 0 || mismatch || got_total != want_size)
+        fprintf(stderr, "mtype mismatch on %s: status %d, %zu of %zu bytes\n",
+                path, status, got_total, want_size);
+    assert(status == 0);
+    assert(!mismatch);
+    assert(got_total == want_size);
+    free(want);
+}
+
+static void test_mtools_diff(void)
+{
+    fat_ctx_t* ctx = open_fixture();
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+
+    assert_listing_matches_mdir(ctx, IMG_NAME, "", FAT_CLUSTER_ROOT);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir1", &de) == FAT_OK);
+    assert_listing_matches_mdir(ctx, IMG_NAME, "dir1", de.first_cluster);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir2", &de) == FAT_OK);
+    assert_listing_matches_mdir(ctx, IMG_NAME, "dir2", de.first_cluster);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir2/subdir1", &de) == FAT_OK);
+    assert_listing_matches_mdir(ctx, IMG_NAME, "dir2/subdir1",
+                                de.first_cluster);
+
+    assert_mtype_matches_read(ctx, IMG_NAME, "test_5kb.txt");
+
+    fat_close(ctx);
+}
+
+static void test_fat16_mtools_diff(void)
+{
+    fat_ctx_t* ctx = open_image(IMG16_NAME);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+
+    assert_listing_matches_mdir(ctx, IMG16_NAME, "", FAT_CLUSTER_ROOT);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir1", &de) == FAT_OK);
+    assert_listing_matches_mdir(ctx, IMG16_NAME, "dir1", de.first_cluster);
+
+    assert_mtype_matches_read(ctx, IMG16_NAME, "test_5kb.txt");
+
+    fat_close(ctx);
+}
+
+static void test_fat32_mtools_diff(void)
+{
+    fat_ctx_t* ctx = open_image(IMG32_NAME);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+
+    assert_listing_matches_mdir(ctx, IMG32_NAME, "", FAT_CLUSTER_ROOT);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir1", &de) == FAT_OK);
+    assert_listing_matches_mdir(ctx, IMG32_NAME, "dir1", de.first_cluster);
+
+    assert_mtype_matches_read(ctx, IMG32_NAME, "test_5kb.txt");
+
+    fat_close(ctx);
+}
+
 /* ------------------------------------------------------------------ */
 /* shared read helpers for the FAT16/FAT32 suites                      */
 /* ------------------------------------------------------------------ */
@@ -903,6 +1747,24 @@ static void test_fat16_lookup_read(void)
     assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "noexist/foo", &de) ==
            FAT_ERR_PATH_NOT_FOUND);
 
+    /* A2: synthetic root dirent on FAT16 too */
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "..", &de) == FAT_OK);
+    assert(de.first_cluster == FAT_CLUSTER_ROOT);
+    assert(de.attributes & 0x10);
+
+    fat_close(ctx);
+}
+
+/* A3: the FAT16 volume label never matches a lookup */
+static void test_fat16_label_lookup(void)
+{
+    fat_ctx_t* ctx = open_image(IMG16_NAME);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "demof16", &de) ==
+           FAT_ERR_NOT_FOUND);
+
     fat_close(ctx);
 }
 
@@ -1072,6 +1934,25 @@ static void test_fat32_lookup_read(void)
     assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "noexist/foo", &de) ==
            FAT_ERR_PATH_NOT_FOUND);
 
+    /* A2: synthetic root dirent; the FAT32 root is a real cluster chain
+     * (2->54->55), but "."/".." there are still synthesized, not read */
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, ".", &de) == FAT_OK);
+    assert(de.first_cluster == FAT_CLUSTER_ROOT);
+    assert(de.attributes & 0x10);
+
+    fat_close(ctx);
+}
+
+/* A3: the FAT32 volume label never matches a lookup */
+static void test_fat32_label_lookup(void)
+{
+    fat_ctx_t* ctx = open_image(IMG32_NAME);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "demof32", &de) ==
+           FAT_ERR_NOT_FOUND);
+
     fat_close(ctx);
 }
 
@@ -1160,16 +2041,39 @@ int main(void)
     RUN(test_root_iterate);
     RUN(test_dir2_iterate);
     RUN(test_names);
+    RUN(test_name_05_escape);
     RUN(test_lookup);
+    RUN(test_lookup_root_dots);
+    RUN(test_lookup_volume_label);
     RUN(test_read_file);
     RUN(test_ctx_lifecycle);
     RUN(test_open_mem_errors);
+
+    RUN(test_dos_date_to_tm);
+    RUN(test_file_stream);
+    RUN(test_dir_cursor);
+    RUN(test_boot_fuzz_fat12);
+    if (mtools_present()) {
+        RUN(test_mtools_diff);
+    } else {
+        printf("%-40s skipped (mtools not installed)\n", "test_mtools_diff");
+    }
 
     if (fixture_present(IMG16_NAME)) {
         RUN(test_fat16_open);
         RUN(test_fat16_fat_entries);
         RUN(test_fat16_root_iterate);
         RUN(test_fat16_lookup_read);
+        RUN(test_fat16_label_lookup);
+        RUN(test_fat16_file_stream);
+        RUN(test_fat16_dir_cursor);
+        RUN(test_boot_fuzz_values_fat16);
+        if (mtools_present()) {
+            RUN(test_fat16_mtools_diff);
+        } else {
+            printf("%-40s skipped (mtools not installed)\n",
+                   "test_fat16_mtools_diff");
+        }
     } else {
         printf("%-40s skipped (%s missing; run: make fat16)\n",
                "FAT16 suite", IMG16_NAME);
@@ -1180,8 +2084,18 @@ int main(void)
         RUN(test_fat32_fat_entries);
         RUN(test_fat32_root_iterate);
         RUN(test_fat32_lookup_read);
+        RUN(test_fat32_label_lookup);
         RUN(test_fat32_fsinfo);
         RUN(test_open_mem_errors_fat32);
+        RUN(test_fat32_file_stream);
+        RUN(test_fat32_dir_cursor);
+        RUN(test_boot_fuzz_values_fat32);
+        if (mtools_present()) {
+            RUN(test_fat32_mtools_diff);
+        } else {
+            printf("%-40s skipped (mtools not installed)\n",
+                   "test_fat32_mtools_diff");
+        }
     } else {
         printf("%-40s skipped (%s missing; run: make fat32)\n",
                "FAT32 suite", IMG32_NAME);

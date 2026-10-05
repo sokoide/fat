@@ -140,3 +140,26 @@ void* fat_get_cluster_ptr(uint32_t cluster); /* 範囲外は NULL */
 未決の契約判断: ルート直下の`.`のlookupは`FAT_ERR_PATH_NOT_FOUND`（`..`と対称・実装側）。DOS流にrootの合成direntで`FAT_OK`にする選択も可（1行変更）。
 
 フェーズ候補のnotes: 公開APIのconst一貫性（`fat_dump.c`のconst外し1箇所）、`fat_print_directory_entry`が実質デッドexport、`-Wstrict-prototypes`対応、dumpの色サイクルstatic（フェーズ5再入化時）。
+
+## 11. フェーズ2実施結果（2026-10-05 完了）
+
+チーム編成: リードが`fat.h`契約を先に拡張（`fat_geometry_t.root_cluster`、`fat_fsinfo_t`+`fat_fsinfo()`、FAT16/32サポート明記）→ p2-lib（`fat_internal.h`/`fat_core.c`/`fat_dump.c`）、p2-test（`testmain.c`/`Makefile`/`.gitignore`）、p2-app（`main.c`改名追従）の並列分担。p2-lib/p2-testはAPI使用制限（429）でレポート送信直前に中断したが、ファイル書き込みは完了していたため、リードが統合検証を直接実施した。
+
+達成:
+- **タイプ別FATデコード**: FAT12従来/ FAT16 u16 / FAT32 u32 `& 0x0FFFFFFF`（マスク必須）。エントリ読取り前にタイプ別バイト長でFAT領域内を検証。EOC/bad/reserved閾値もタイプ別（0xFF8系/0xFFF8系/0x0FFFFFF8系）。
+- **totalSectors32対応**: totalSectors16==0なら32bit値（従来の`UNSUPPORTED`撤廃）。fatSizeもtableSize16==0ならfatsz32。領域導出は全て64bit中間計算。
+- **FAT32ルート=チェーン走査**: `FatExtBS32`実体化（extended_section[0]、common tailは[28]）。`rootClus`検証（2..cluster_count+1）、`geo.root_cluster`に反映、`root_dir_sector/sectors`は0。`fat_iter_dir(FAT_CLUSTER_ROOT)`はタイプで自動ディスパッチ。
+- **active FAT選択**: extFlags bit7でミラー無効時、下位4bitのFAT番号を`fat_start_sector`に反映（範囲外は`INVALID_BPB`）。
+- **FSInfo**: `fat_fsinfo()`。署名3種（RRaA/rrAa/0xAA550000）検証、不正・不在は0xFFFFFFFF（unknown）で`FAT_OK`、FAT12/16は`UNSUPPORTED`。
+- **firstClusterHigh/Low合成**: FAT32は32bit合成、FAT12/16はlowのみ。
+- **dump**: `fat_print_fat12`→`fat_print_fat`改名（%03X/%04X/%08X、FAT32は先頭1024エントリ+打ち切り表示）、`fat_print_info`のタイプ対応、FAT32 EBPBダンプ。
+
+フィクスチャ（mtools実物、gitignore、`make fat16`/`make fat32`で生成、`check-all`=生成+check）:
+- `demof16.fat` 16MiB: cluster 32481、チェーン3→..→12、FAT[0]=0xFFF8
+- `demof32.fat` 33MiB: cluster 66512、**ルートが3クラスタ chain 2→54→55（44エントリ）**、FSInfo free=66454（mdir 34024448B freeと一致検証済み）
+
+検証: `make check` = **19テスト×2**（FAT12 9 + FAT16 4 + FAT32 6、通常+ASan/UBSan）全ok・警告ゼロ。fixture不在時はスキップ表示で`check`は高速維持。デモはdemof12で従来どおり全セクション正常。
+
+統合時にリードが修正したバグ1件: `fat_read_file`のチェーンループ検出は「サイズ不足で飢えるループ」しか捕捉せず、自己ループ（FAT[5]=5）はfile_size分をゴミで埋めて`FAT_OK`になる契約違反 → **Brentのサイクル検出**（O(1)空間、1ステップ1比較）をreadウォークに追加し「loops→BAD_CLUSTER」契約を遵守。
+
+残課題: FAT16/32のOEM・fatsz整合の追加mutation、ルート直下の`.`のlookup挙動（§10未決のまま）、フェーズ3 LFN（0x0F連続エントリ）は現在スキップのみ。

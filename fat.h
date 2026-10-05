@@ -14,8 +14,8 @@
 enum FAT_TYPE {
     FT_UNKNOWN = 0,
     FT_FAT12 = 1,
-    FT_FAT16 = 2, // detected but rejected by fat_open (phase 2)
-    FT_FAT32 = 3, // detected but rejected by fat_open (phase 2)
+    FT_FAT16 = 2, // supported
+    FT_FAT32 = 3, // supported (root directory is a cluster chain)
 };
 
 // every public function returns this; FAT_OK == 0 on success
@@ -65,10 +65,11 @@ typedef struct {
     uint8_t fat_count;
     uint16_t fat_sectors;   // sectors per FAT table (tableSize16)
     uint16_t root_entries;
-    uint32_t total_sectors; // totalSectors16 (FAT12/16)
+    uint32_t total_sectors; // totalSectors16, or totalSectors32 when that is 0
     uint32_t fat_start_sector;
-    uint32_t root_dir_sector;
-    uint32_t root_dir_sectors;
+    uint32_t root_dir_sector;   // FAT12/16 fixed root region (0 for FAT32)
+    uint32_t root_dir_sectors;  // FAT12/16 only (0 for FAT32)
+    uint32_t root_cluster;      // FAT32: first cluster of the root chain; 0 for FAT12/16
     uint32_t data_start_sector;
     uint32_t cluster_count; // data clusters; valid data clusters are 2..cluster_count+1
 } fat_geometry_t;
@@ -76,6 +77,7 @@ typedef struct {
 // lifecycle -----------------------------------------------------------
 
 // Load the whole image from `path`, validate the BPB, bind `*out`.
+// FAT12, FAT16 and FAT32 images are supported.
 fat_result_t fat_open(const char* path, fat_ctx_t** out);
 
 // Same, from a memory image. The buffer is copied; the caller keeps
@@ -91,8 +93,10 @@ enum FAT_TYPE fat_get_type(const fat_ctx_t* ctx);          // NULL -> FT_UNKNOWN
 const fat_geometry_t* fat_geometry(const fat_ctx_t* ctx);  // NULL -> ctx NULL
 uint32_t fat_cluster_size(const fat_ctx_t* ctx);           // bytes per data cluster
 
-// Raw FAT[cluster] value (12-bit, unpacked). Indices 0..cluster_count+1
-// are readable (0/1 hold the media/reserved entries); larger is an error.
+// Raw FAT[cluster] value, unpacked (12/16/32-bit wide depending on the
+// image type; FAT32 values are masked with 0x0FFFFFFF). Indices
+// 0..cluster_count+1 are readable (0/1 hold the media/reserved entries);
+// larger is an error.
 fat_result_t fat_get_fat_entry(const fat_ctx_t* ctx, uint32_t cluster,
                                uint32_t* out);
 
@@ -130,6 +134,17 @@ fat_result_t fat_name_from_83(const uint8_t name11[11], uint8_t attributes,
 // names, base > 8, extension > 3, and "." / ".." (fat_lookup handles those
 // itself). Characters after the first '.' count toward the extension.
 fat_result_t fat_name_to_83(const char* name, uint8_t name11[11]);
+
+// FSInfo (FAT32 only) ------------------------------------------------------
+
+typedef struct {
+    uint32_t free_cluster_count; // 0xFFFFFFFF = unknown/stale
+    uint32_t next_free_cluster;  // 0xFFFFFFFF = unknown
+} fat_fsinfo_t;
+
+// Parse the FSInfo sector. FAT_ERR_UNSUPPORTED for FAT12/16. Values are
+// 0xFFFFFFFF when the sector is absent or its signatures are invalid.
+fat_result_t fat_fsinfo(const fat_ctx_t* ctx, fat_fsinfo_t* out);
 
 // file read ---------------------------------------------------------------
 

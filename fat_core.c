@@ -1,11 +1,22 @@
-// fat_core.c -- context lifecycle, BPB validation, FAT12 decode, directory
-// iteration and path lookup. No stdio, no color: errors are fat_result_t.
+// fat_core.c -- context lifecycle, BPB validation, FAT12/16/32 decode,
+// directory iteration and path lookup. No stdio, no color: errors are
+// fat_result_t.
 
 #include "fat_internal.h"
 #include <stdlib.h>
 #include <string.h>
 
 // internal helpers --------------------------------------------------------
+
+// host-endian little-endian readers
+static uint16_t rd16(const uint8_t* p) {
+    return (uint16_t)(p[0] | (p[1] << 8));
+}
+
+static uint32_t rd32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
 
 const uint8_t* fat_region_ptr(const fat_ctx_t* ctx, size_t offset) {
     if (ctx == NULL || offset > ctx->image_size)
@@ -26,43 +37,104 @@ const uint8_t* fat_fat_ptr(const fat_ctx_t* ctx) {
     return ctx->image + fat_offset;
 }
 
-uint32_t fat_raw_fat12(const fat_ctx_t* ctx, uint32_t cluster) {
+uint32_t fat_raw_fat_entry(const fat_ctx_t* ctx, uint32_t cluster) {
     const uint8_t* fatp = fat_fat_ptr(ctx);
     if (fatp == NULL)
         return FAT_CLUSTER_NOT_FOUND;
 
-    // FAT12 packs two 12-bit entries into every 3 bytes
-    size_t need = (size_t)(cluster / 2) * 3 + 3;
+    // byte span of entry `cluster` per packing (FAT12 packs two 12-bit
+    // entries into every 3 bytes)
     size_t fat_bytes = (size_t)ctx->geo.fat_sectors *
                        ctx->geo.bytes_per_sector;
+    size_t need;
+    switch (ctx->type) {
+    case FT_FAT16:
+        need = (size_t)cluster * 2 + 2;
+        break;
+    case FT_FAT32:
+        need = (size_t)cluster * 4 + 4;
+        break;
+    case FT_FAT12:
+        need = (size_t)(cluster / 2) * 3 + 3;
+        break;
+    default:
+        return FAT_CLUSTER_NOT_FOUND;
+    }
     if (need > fat_bytes)
         return FAT_CLUSTER_NOT_FOUND;
 
-    uint32_t value;
-    const uint8_t* e = &fatp[(size_t)(cluster / 2) * 3];
-    if (cluster % 2 == 0) {
-        value = e[0];
-        value |= (e[1] & 0x0F) << 8;
-    } else {
-        value = e[2];
-        value <<= 4;
-        value |= (e[1] & 0xF0) >> 4;
+    switch (ctx->type) {
+    case FT_FAT16:
+        return rd16(fatp + (size_t)cluster * 2);
+    case FT_FAT32:
+        // the upper 4 bits are reserved flags; masking is mandatory for
+        // EOC detection
+        return rd32(fatp + (size_t)cluster * 4) & 0x0FFFFFFF;
+    case FT_FAT12: {
+        uint32_t value;
+        const uint8_t* e = &fatp[(size_t)(cluster / 2) * 3];
+        if (cluster % 2 == 0) {
+            value = e[0];
+            value |= (e[1] & 0x0F) << 8;
+        } else {
+            value = e[2];
+            value <<= 4;
+            value |= (e[1] & 0xF0) >> 4;
+        }
+        return value;
     }
-    return value;
+    default:
+        return FAT_CLUSTER_NOT_FOUND;
+    }
 }
 
-// EOC / bad-cluster classification of a raw FAT12 value (phase 2 will
-// dispatch on ctx->type)
-static bool fat12_is_end_of_chain(uint32_t entry) { return entry > 0xFF7; }
-static bool fat12_is_bad(uint32_t entry) { return entry == 0xFF7; }
+// EOC / bad / reserved classification of a raw FAT value, per image type
+// (thresholds: FAT12 0xFF0/0xFF7/0xFF8, FAT16 0xFFF0/0xFFF7/0xFFF8,
+// FAT32 0x0FFFFFF0/0x0FFFFFF7/0x0FFFFFF8 after masking)
+static bool fat_is_bad(const fat_ctx_t* ctx, uint32_t entry) {
+    switch (ctx->type) {
+    case FT_FAT16:
+        return entry == 0xFFF7;
+    case FT_FAT32:
+        return entry == 0x0FFFFFF7;
+    case FT_FAT12:
+        return entry == 0xFF7;
+    default:
+        return true;
+    }
+}
 
-// host-endian little-endian readers
-static uint16_t rd16(const uint8_t* p) {
-    return (uint16_t)(p[0] | (p[1] << 8));
+static bool fat_is_eoc(const fat_ctx_t* ctx, uint32_t entry) {
+    switch (ctx->type) {
+    case FT_FAT16:
+        return entry >= 0xFFF8;
+    case FT_FAT32:
+        return entry >= 0x0FFFFFF8;
+    case FT_FAT12:
+        return entry >= 0xFF8;
+    default:
+        return false;
+    }
+}
+
+// reserved values (e.g. FAT12 0xFF0..0xFF6) must never be followed as
+// cluster numbers
+static bool fat_is_reserved(const fat_ctx_t* ctx, uint32_t entry) {
+    switch (ctx->type) {
+    case FT_FAT16:
+        return entry >= 0xFFF0 && entry < 0xFFF7;
+    case FT_FAT32:
+        return entry >= 0x0FFFFFF0 && entry < 0x0FFFFFF7;
+    case FT_FAT12:
+        return entry >= 0xFF0 && entry < 0xFF7;
+    default:
+        return true;
+    }
 }
 
 // fill a public fat_dirent_t from 32 raw on-disk bytes
-static void dirent_from_raw(const uint8_t* raw32, fat_dirent_t* out) {
+static void dirent_from_raw(const fat_ctx_t* ctx, const uint8_t* raw32,
+                            fat_dirent_t* out) {
     const DirectoryEntry* e = (const DirectoryEntry*)raw32;
     fat_name_from_83(e->name, e->attributes, out->name, FAT_NAME_MAX);
     out->attributes = e->attributes;
@@ -72,7 +144,13 @@ static void dirent_from_raw(const uint8_t* raw32, fat_dirent_t* out) {
     out->last_access_date = e->lastAccessDate;
     out->last_write_time = e->lastWriteTime;
     out->last_write_date = e->lastWriteDate;
-    out->first_cluster = e->firstClusterLow;
+    // FAT32 spreads the first cluster over two 16-bit halves; FAT12/16 use
+    // the low half only
+    if (ctx->type == FT_FAT32)
+        out->first_cluster = ((uint32_t)e->firstClusterHigh << 16) |
+                             e->firstClusterLow;
+    else
+        out->first_cluster = e->firstClusterLow;
     out->file_size = e->fileSize;
 }
 
@@ -80,10 +158,14 @@ static void dirent_from_raw(const uint8_t* raw32, fat_dirent_t* out) {
 static const uint8_t* cluster_ptr(const fat_ctx_t* ctx, uint32_t cluster) {
     if (cluster < 2 || cluster >= 2 + ctx->geo.cluster_count)
         return NULL;
-    size_t offset = ((size_t)ctx->geo.data_start_sector +
-                     (size_t)(cluster - 2) * ctx->geo.sectors_per_cluster) *
-                    ctx->geo.bytes_per_sector;
-    return fat_region_ptr(ctx, offset);
+    // 64-bit intermediates: cluster * sectors_per_cluster * bytes_per_sector
+    // can exceed 32 bits in hostile BPBs
+    uint64_t offset = ((uint64_t)ctx->geo.data_start_sector +
+                       (uint64_t)(cluster - 2) * ctx->geo.sectors_per_cluster) *
+                      ctx->geo.bytes_per_sector;
+    if (offset + fat_cluster_size(ctx) > (uint64_t)ctx->image_size)
+        return NULL;
+    return ctx->image + (size_t)offset;
 }
 
 // shared BPB validation + image copy; fat_open (fat_dev.c) and fat_open_mem
@@ -109,6 +191,7 @@ fat_result_t fat_ctx_init_mem(fat_ctx_t** out, const uint8_t* image,
     uint16_t rootEntryCount = rd16((const uint8_t*)&bs->rootEntryCount);
     uint16_t totalSectors16 = rd16((const uint8_t*)&bs->totalSectors16);
     uint16_t tableSize16 = rd16((const uint8_t*)&bs->tableSize16);
+    uint32_t totalSectors32 = rd32((const uint8_t*)&bs->totalSectors32);
 
     if (bytesPerSector != 512 && bytesPerSector != 1024 &&
         bytesPerSector != 2048 && bytesPerSector != 4096)
@@ -116,30 +199,35 @@ fat_result_t fat_ctx_init_mem(fat_ctx_t** out, const uint8_t* image,
     if (sectorsPerCluster == 0 ||
         (sectorsPerCluster & (sectorsPerCluster - 1)) != 0)
         return FAT_ERR_INVALID_BPB;
-    if (tableSize16 == 0)
-        return FAT_ERR_INVALID_BPB;
-    if (totalSectors16 == 0)
-        return FAT_ERR_UNSUPPORTED; // FAT32-style totalSectors32 layout
 
-    // region layout derived from the BPB (in sectors)
-    uint32_t fatStart = reservedSectorCount;
-    uint32_t fatSectors = (uint32_t)tableSize16 * tableCount;
-    uint32_t rootDirStart = fatStart + fatSectors;
-    uint32_t rootDirSectors =
-        ((uint32_t)sizeof(DirectoryEntry) * rootEntryCount +
+    // totalSectors16 wins when nonzero, else the 32-bit count (FAT32 style)
+    uint64_t totSec = totalSectors16 != 0 ? totalSectors16 : totalSectors32;
+    if (totSec == 0)
+        return FAT_ERR_INVALID_BPB;
+
+    // sectors per FAT table: tableSize16 wins when nonzero, else fatsz32
+    // (only FAT32 volumes carry fatsz32; offset 36 is always within the
+    // 512-byte boot sector checked above)
+    const FatExtBS32* ext32 = (const FatExtBS32*)bs->extended_section;
+    uint32_t fatsz32 = rd32((const uint8_t*)&ext32->fatsz32);
+    uint64_t fatSize = tableSize16;
+    if (fatSize == 0)
+        fatSize = fatsz32;
+    if (fatSize == 0)
+        return FAT_ERR_INVALID_BPB;
+
+    // region layout derived from the BPB (in sectors; 64-bit intermediates
+    // because fatsz * tableCount can exceed 32 bits in hostile BPBs)
+    uint64_t fatAreaSectors = fatSize * tableCount;
+    uint64_t rootDirSectors =
+        ((uint64_t)sizeof(DirectoryEntry) * rootEntryCount +
          bytesPerSector - 1) /
         bytesPerSector;
-    uint32_t dataStart = rootDirStart + rootDirSectors;
+    uint64_t dataStart = reservedSectorCount + fatAreaSectors + rootDirSectors;
     // all derived regions must fit and leave at least one data cluster
-    uint32_t clusters = dataStart < totalSectors16
-                            ? (totalSectors16 - dataStart) / sectorsPerCluster
-                            : 0;
+    uint64_t clusters =
+        dataStart < totSec ? (totSec - dataStart) / sectorsPerCluster : 0;
     if (clusters < 1)
-        return FAT_ERR_INVALID_BPB;
-
-    // the whole image must actually fit in the buffer
-    size_t imageSize = (size_t)totalSectors16 * bytesPerSector;
-    if (size < imageSize)
         return FAT_ERR_INVALID_BPB;
 
     // classify by the data cluster count (spec thresholds)
@@ -150,32 +238,68 @@ fat_result_t fat_ctx_init_mem(fat_ctx_t** out, const uint8_t* image,
         type = FT_FAT16;
     else
         type = FT_FAT32;
-    if (type != FT_FAT12)
-        return FAT_ERR_UNSUPPORTED; // phase 2
+
+    // per-type BPB requirements
+    if (type != FT_FAT32 && tableSize16 == 0)
+        return FAT_ERR_INVALID_BPB; // FAT12/16 must carry tableSize16
+    if (type == FT_FAT16 && rootEntryCount == 0)
+        return FAT_ERR_INVALID_BPB;
+    if (type == FT_FAT32 && fatsz32 == 0)
+        return FAT_ERR_INVALID_BPB;
+    if (fatSize > 0xFFFF)
+        return FAT_ERR_INVALID_BPB; // does not fit geo.fat_sectors
+
+    uint32_t rootCluster = 0; // FAT12/16: fixed root region, no chain
+    uint16_t fsInfoSector = 0;
+    uint32_t activeFat = 0;
+    if (type == FT_FAT32) {
+        uint16_t extFlags = rd16((const uint8_t*)&ext32->extFlags);
+        rootCluster = rd32((const uint8_t*)&ext32->rootClus);
+        fsInfoSector = rd16((const uint8_t*)&ext32->fsInfo);
+        // spec: rootClus must name a valid data cluster
+        if (rootCluster < 2 || rootCluster >= 2 + clusters)
+            return FAT_ERR_INVALID_BPB;
+        // extFlags bit7 set: no mirroring, low 4 bits pick the active FAT
+        if (extFlags & 0x0080)
+            activeFat = extFlags & 0x000F;
+        if (activeFat >= tableCount)
+            return FAT_ERR_INVALID_BPB;
+    }
+
+    // the whole volume must actually fit in the buffer
+    uint64_t imageSize = totSec * bytesPerSector;
+    if (imageSize > (uint64_t)size)
+        return FAT_ERR_INVALID_BPB;
 
     fat_ctx_t* ctx = malloc(sizeof(*ctx));
     if (ctx == NULL)
         return FAT_ERR_NOMEM;
-    ctx->image = malloc(imageSize);
+    ctx->image = malloc((size_t)imageSize);
     if (ctx->image == NULL) {
         free(ctx);
         return FAT_ERR_NOMEM;
     }
-    memcpy(ctx->image, image, imageSize);
-    ctx->image_size = imageSize;
+    memcpy(ctx->image, image, (size_t)imageSize);
+    ctx->image_size = (size_t)imageSize;
     ctx->type = type;
     ctx->geo.bytes_per_sector = bytesPerSector;
     ctx->geo.sectors_per_cluster = sectorsPerCluster;
     ctx->geo.reserved_sectors = reservedSectorCount;
     ctx->geo.fat_count = tableCount;
-    ctx->geo.fat_sectors = tableSize16;
+    ctx->geo.fat_sectors = (uint16_t)fatSize;
     ctx->geo.root_entries = rootEntryCount;
-    ctx->geo.total_sectors = totalSectors16;
-    ctx->geo.fat_start_sector = fatStart;
-    ctx->geo.root_dir_sector = rootDirStart;
-    ctx->geo.root_dir_sectors = rootDirSectors;
-    ctx->geo.data_start_sector = dataStart;
-    ctx->geo.cluster_count = clusters;
+    ctx->geo.total_sectors = (uint32_t)totSec;
+    // FAT #0 for FAT12/16; the active table for FAT32
+    ctx->geo.fat_start_sector =
+        (uint32_t)(reservedSectorCount + (uint64_t)activeFat * fatSize);
+    // FAT32 has no fixed root region: the root is the rootClus chain
+    ctx->geo.root_dir_sector =
+        type == FT_FAT32 ? 0 : (uint32_t)(reservedSectorCount + fatAreaSectors);
+    ctx->geo.root_dir_sectors = type == FT_FAT32 ? 0 : (uint32_t)rootDirSectors;
+    ctx->geo.root_cluster = rootCluster;
+    ctx->geo.data_start_sector = (uint32_t)dataStart;
+    ctx->geo.cluster_count = (uint32_t)clusters;
+    ctx->fsinfo_sector = fsInfoSector;
 
     *out = ctx;
     return FAT_OK;
@@ -223,7 +347,7 @@ fat_result_t fat_get_fat_entry(const fat_ctx_t* ctx, uint32_t cluster,
     // entries
     if (cluster > ctx->geo.cluster_count + 1)
         return FAT_ERR_INVALID_ARG;
-    uint32_t value = fat_raw_fat12(ctx, cluster);
+    uint32_t value = fat_raw_fat_entry(ctx, cluster);
     if (value == FAT_CLUSTER_NOT_FOUND)
         return FAT_ERR_INVALID_BPB; // FAT region does not cover the index
     *out = value;
@@ -238,26 +362,30 @@ fat_result_t fat_iter_dir(fat_ctx_t* ctx, uint32_t dir_cluster,
         return FAT_ERR_INVALID_ARG;
 
     if (dir_cluster == FAT_CLUSTER_ROOT) {
-        // the FAT12/16 root directory is a fixed region, not a chain
-        size_t root_offset = (size_t)ctx->geo.root_dir_sector *
-                             ctx->geo.bytes_per_sector;
-        const uint8_t* p = fat_region_ptr(ctx, root_offset);
-        if (p == NULL)
-            return FAT_ERR_INVALID_BPB;
-        for (uint32_t i = 0; i < ctx->geo.root_entries; i++) {
-            const uint8_t* raw32 = p + (size_t)i * sizeof(DirectoryEntry);
-            // 0x00: no more entries, 0xE5: deleted
-            if (raw32[0] == 0x00)
-                break;
-            if (raw32[0] == 0xE5)
-                continue;
-            if (raw32[11] == ATTR_LONG_NAME)
-                continue; // long file name entry
-            fat_dirent_t entry;
-            dirent_from_raw(raw32, &entry);
-            cb(&entry, raw32, user_data);
+        if (ctx->type != FT_FAT32) {
+            // the FAT12/16 root directory is a fixed region, not a chain
+            size_t root_offset = (size_t)ctx->geo.root_dir_sector *
+                                 ctx->geo.bytes_per_sector;
+            const uint8_t* p = fat_region_ptr(ctx, root_offset);
+            if (p == NULL)
+                return FAT_ERR_INVALID_BPB;
+            for (uint32_t i = 0; i < ctx->geo.root_entries; i++) {
+                const uint8_t* raw32 = p + (size_t)i * sizeof(DirectoryEntry);
+                // 0x00: no more entries, 0xE5: deleted
+                if (raw32[0] == 0x00)
+                    break;
+                if (raw32[0] == 0xE5)
+                    continue;
+                if (raw32[11] == ATTR_LONG_NAME)
+                    continue; // long file name entry
+                fat_dirent_t entry;
+                dirent_from_raw(ctx, raw32, &entry);
+                cb(&entry, raw32, user_data);
+            }
+            return FAT_OK;
         }
-        return FAT_OK;
+        // the FAT32 root directory is a cluster chain like any directory
+        dir_cluster = ctx->geo.root_cluster;
     }
 
     if (dir_cluster < 2 || dir_cluster >= 2 + ctx->geo.cluster_count)
@@ -273,8 +401,8 @@ fat_result_t fat_iter_dir(fat_ctx_t* ctx, uint32_t dir_cluster,
         const uint8_t* p = cluster_ptr(ctx, cluster);
         if (p == NULL)
             return FAT_ERR_BAD_CLUSTER;
-        uint32_t fat = fat_raw_fat12(ctx, cluster);
-        if (fat == FAT_CLUSTER_NOT_FOUND || fat12_is_bad(fat))
+        uint32_t fat = fat_raw_fat_entry(ctx, cluster);
+        if (fat == FAT_CLUSTER_NOT_FOUND || fat_is_bad(ctx, fat))
             return FAT_ERR_BAD_CLUSTER;
 
         for (uint32_t i = 0; i < entriesPerCluster; i++) {
@@ -287,12 +415,14 @@ fat_result_t fat_iter_dir(fat_ctx_t* ctx, uint32_t dir_cluster,
             if (raw32[11] == ATTR_LONG_NAME)
                 continue; // long file name entry
             fat_dirent_t entry;
-            dirent_from_raw(raw32, &entry);
+            dirent_from_raw(ctx, raw32, &entry);
             cb(&entry, raw32, user_data);
         }
 
-        if (fat12_is_end_of_chain(fat))
+        if (fat_is_eoc(ctx, fat))
             return FAT_OK;
+        if (fat == 0 || fat_is_reserved(ctx, fat))
+            return FAT_ERR_BAD_CLUSTER; // free/reserved while chain continues
         cluster = fat;
         if (cluster < 2 || cluster >= 2 + ctx->geo.cluster_count)
             return FAT_ERR_BAD_CLUSTER;
@@ -371,6 +501,32 @@ fat_result_t fat_name_to_83(const char* name, uint8_t name11[11]) {
         if ('a' <= name11[i] && name11[i] <= 'z')
             name11[i] = (uint8_t)(name11[i] - 'a' + 'A');
     }
+    return FAT_OK;
+}
+
+// FSInfo (FAT32 only) ------------------------------------------------------
+
+fat_result_t fat_fsinfo(const fat_ctx_t* ctx, fat_fsinfo_t* out) {
+    if (ctx == NULL || out == NULL)
+        return FAT_ERR_INVALID_ARG;
+    out->free_cluster_count = 0xFFFFFFFF; // unknown/stale
+    out->next_free_cluster = 0xFFFFFFFF;
+    if (ctx->type != FT_FAT32)
+        return FAT_ERR_UNSUPPORTED;
+
+    // 0 = no FSInfo sector; otherwise the signatures decide validity
+    if (ctx->fsinfo_sector == 0)
+        return FAT_OK;
+    uint64_t offset = (uint64_t)ctx->fsinfo_sector * ctx->geo.bytes_per_sector;
+    const uint8_t* p = fat_region_ptr(ctx, (size_t)offset);
+    if (p == NULL || ctx->image_size - (size_t)offset < 512)
+        return FAT_OK; // sector absent from the image
+    if (rd32(p) != 0x41615252 ||       // "RRaA"
+        rd32(p + 484) != 0x61417272 || // "rrAa"
+        rd32(p + 508) != 0xAA550000)
+        return FAT_OK; // invalid signature: report unknown
+    out->free_cluster_count = rd32(p + 488);
+    out->next_free_cluster = rd32(p + 492);
     return FAT_OK;
 }
 
@@ -460,8 +616,11 @@ fat_result_t fat_lookup(fat_ctx_t* ctx, uint32_t start_cluster,
             if (!lookup_in_dir(ctx, cur, dotdot11, &dotdot))
                 return FAT_ERR_PATH_NOT_FOUND;
             uint32_t parent = dotdot.first_cluster;
-            if (parent == 0)
-                parent = FAT_CLUSTER_ROOT; // some tools record root as 0
+            // some tools record the root as 0; FAT32 tools may also record
+            // the root's real cluster number -- both normalize to the root
+            // sentinel
+            if (parent == 0 || parent == ctx->geo.root_cluster)
+                parent = FAT_CLUSTER_ROOT;
             if (last) {
                 *out = dotdot_dirent(parent);
                 return FAT_OK;
@@ -529,15 +688,20 @@ fat_result_t fat_read_file(fat_ctx_t* ctx, const fat_dirent_t* file,
     if (buf == NULL)
         return FAT_ERR_NOMEM;
 
+    // Brent's algorithm anchors; `tortoise` lags behind the advancing head
+    uint32_t tortoise = cluster;
+    uint32_t power = 1;
+    uint32_t lam = 1;
+
     // chain-read exactly file_size bytes, capped at the total data cluster
     // count (+1) against cycles in a corrupt FAT
     uint32_t remaining = file->file_size;
     uint32_t copied = 0;
     for (uint32_t visited = 0;; visited++) {
         const uint8_t* p = cluster_ptr(ctx, cluster);
-        uint32_t fat = p != NULL ? fat_raw_fat12(ctx, cluster)
+        uint32_t fat = p != NULL ? fat_raw_fat_entry(ctx, cluster)
                                  : FAT_CLUSTER_NOT_FOUND;
-        if (p == NULL || fat == FAT_CLUSTER_NOT_FOUND || fat12_is_bad(fat))
+        if (p == NULL || fat == FAT_CLUSTER_NOT_FOUND || fat_is_bad(ctx, fat))
             break; // broken
 
         uint32_t n = remaining < cluster_size ? remaining : cluster_size;
@@ -550,12 +714,28 @@ fat_result_t fat_read_file(fat_ctx_t* ctx, const fat_dirent_t* file,
             return FAT_OK;
         }
 
-        if (fat12_is_end_of_chain(fat))
+        if (fat_is_eoc(ctx, fat))
             break; // chain ends before file_size
+        if (fat == 0 || fat_is_reserved(ctx, fat))
+            break; // free/reserved while the file continues
         cluster = fat;
         if (cluster < 2 || cluster >= 2 + ctx->geo.cluster_count ||
             visited >= ctx->geo.cluster_count)
             break; // chain longer than the image can hold
+
+        // A healthy chain never revisits a cluster. The iteration cap above
+        // only catches loops that starve the read; a self-pointing entry
+        // satisfies file_size with garbage, so detect revisits explicitly
+        // (Brent's cycle detection: O(1) space, one extra compare per step).
+        if (cluster == tortoise)
+            break; // cycle
+        if (power == lam) {
+            tortoise = cluster;
+            power <<= 1;
+            lam = 0;
+        } else {
+            lam++;
+        }
     }
 
     // no partial buffer on error

@@ -15,14 +15,15 @@ static void increment_color() {
 }
 
 // byte offset of data cluster `cluster` in the image, 0 when out of range
-static uint32_t cluster_addr(const fat_ctx_t* ctx, uint32_t cluster) {
+static uint64_t cluster_addr(const fat_ctx_t* ctx, uint32_t cluster) {
     if (ctx == NULL)
         return 0;
     const fat_geometry_t* geo = fat_geometry(ctx);
     if (cluster < 2 || cluster >= 2 + geo->cluster_count)
         return 0;
-    return (geo->data_start_sector +
-            (cluster - 2) * geo->sectors_per_cluster) *
+    // 64-bit intermediates: FAT32 cluster offsets can exceed 32 bits
+    return ((uint64_t)geo->data_start_sector +
+            (uint64_t)(cluster - 2) * geo->sectors_per_cluster) *
            geo->bytes_per_sector;
 }
 
@@ -35,10 +36,24 @@ static void fat_print_directory_entry_file(const fat_ctx_t* ctx,
                                            const fat_dirent_t* entry,
                                            const uint8_t* raw32);
 
+static const char* fat_type_name(const fat_ctx_t* ctx) {
+    switch (fat_get_type(ctx)) {
+    case FT_FAT12:
+        return "FAT12";
+    case FT_FAT16:
+        return "FAT16";
+    case FT_FAT32:
+        return "FAT32";
+    default:
+        return "unknown";
+    }
+}
+
 void fat_print_info(const fat_ctx_t* ctx) {
     const fat_geometry_t* geo = fat_geometry(ctx);
     if (geo == NULL)
         return;
+    printf("fat type: %s\n", fat_type_name(ctx));
     printf("bytesPerSector: %u\n", geo->bytes_per_sector);
     printf("sectorsPerCluster: %u\n", geo->sectors_per_cluster);
     // 1st FAT table's sector
@@ -48,6 +63,9 @@ void fat_print_info(const fat_ctx_t* ctx) {
     printf("rootEntryCount: %u\n", geo->root_entries);
     printf("root dir sector count: %u\n", geo->root_dir_sectors);
     printf("total_sectors: %u\n", geo->total_sectors);
+    printf("total bytes: %llu\n",
+           (unsigned long long)(uint64_t)geo->total_sectors *
+               geo->bytes_per_sector);
     // count of FAT table sectors
     printf("tableSize16: %u\n", geo->fat_sectors);
 
@@ -56,6 +74,16 @@ void fat_print_info(const fat_ctx_t* ctx) {
            (uint32_t)geo->fat_sectors * geo->fat_count);
     printf("* root_dir start_sector %u\n", geo->root_dir_sector);
     printf("* root_dir sectors %u\n", geo->root_dir_sectors);
+    if (fat_get_type(ctx) == FT_FAT32) {
+        // the FAT32 root is a cluster chain, not a fixed region
+        printf("* root cluster %u\n", geo->root_cluster);
+        fat_fsinfo_t info;
+        if (fat_fsinfo(ctx, &info) == FAT_OK &&
+            info.free_cluster_count != 0xFFFFFFFF)
+            printf("* free cluster count: %u\n", info.free_cluster_count);
+        else
+            printf("* free cluster count: unknown\n");
+    }
     printf("* data start_sector %u\n", geo->data_start_sector);
     printf("* data cluster count %u\n", geo->cluster_count);
 }
@@ -142,25 +170,62 @@ void fat_print_header_dump(const fat_ctx_t* ctx) {
     fat_print_idx_wide((const uint8_t*)bs, &idx, l2);
     printf("\n");
 
+    // 3rd line, FAT32 only: totalSectors32 (offset 32) then the FatExtBS32
+    // fields (fatsz32, extFlags, fsVer, rootClus, fsInfo, bkBootSec)
+    if (fat_get_type(ctx) == FT_FAT32) {
+        idx = 32;
+        const int l3[] = {4, 4, 2, 2, 4, 2, 2, -1};
+        fat_print_idx_wide((const uint8_t*)bs, &idx, l3);
+        printf("\n");
+    }
+
     clcl();
 }
 
-void fat_print_fat12(const fat_ctx_t* ctx) {
+void fat_print_fat(const fat_ctx_t* ctx) {
     if (ctx == NULL)
         return;
-    // olny print the 1st FAT table
-    // FAT12 packs two 12-bit entries into every 3 bytes
-    uint32_t entryCount =
-        (uint32_t)ctx->geo.fat_sectors * ctx->geo.bytes_per_sector * 2 / 3;
+    // only print the FAT table the context reads (FAT #0, or the active
+    // FAT32 table)
+    size_t fat_bytes = (size_t)ctx->geo.fat_sectors * ctx->geo.bytes_per_sector;
+    const char* fmt;
+    uint32_t entryCount;
+    uint32_t maxShow; // cap for FAT32: a full table is unusable output
+    switch (ctx->type) {
+    case FT_FAT16:
+        fmt = "%04X ";
+        entryCount = (uint32_t)(fat_bytes / 2);
+        maxShow = 0xFFFFFFFFu;
+        break;
+    case FT_FAT32:
+        fmt = "%08X ";
+        entryCount = (uint32_t)(fat_bytes / 4);
+        maxShow = 1024;
+        break;
+    default: // FAT12 packs two 12-bit entries into every 3 bytes
+        fmt = "%03X ";
+        entryCount = (uint32_t)(fat_bytes * 2 / 3);
+        maxShow = 0xFFFFFFFFu;
+        break;
+    }
+    uint32_t shown = 0;
+    bool truncated = false;
     for (uint32_t i = 0; i < entryCount; i++) {
-        uint32_t value = fat_raw_fat12(ctx, i);
+        uint32_t value = fat_raw_fat_entry(ctx, i);
         if (value == FAT_CLUSTER_NOT_FOUND)
             break; // FAT region ended
-        printf("%03X ", value);
+        printf(fmt, value);
         if (i % 10 == 9)
             printf("\n");
+        shown++;
+        if (shown == maxShow) {
+            truncated = i + 1 < entryCount;
+            break;
+        }
     }
     printf("\n");
+    if (truncated)
+        printf("... (%u more entries truncated)\n", entryCount - shown);
 }
 
 void fat_print_directory_entry_header_legend() {
@@ -244,8 +309,9 @@ static void fat_print_directory_entry_directory(const fat_ctx_t* ctx,
                                                 const uint8_t* raw32,
                                                 bool recursive) {
     // the entry must be a directory
-    printf("Directory: %s, cluster:%u[0x%08X]\n", entry->name,
-           entry->first_cluster, cluster_addr(ctx, entry->first_cluster));
+    printf("Directory: %s, cluster:%u[0x%08llX]\n", entry->name,
+           entry->first_cluster,
+           (unsigned long long)cluster_addr(ctx, entry->first_cluster));
     if (raw32 != NULL)
         fat_print_directory_entry_dump(entry, raw32, NULL);
 
@@ -261,8 +327,9 @@ static void fat_print_directory_entry_file(const fat_ctx_t* ctx,
                                            const fat_dirent_t* entry,
                                            const uint8_t* raw32) {
     // the entry must be a file
-    printf("File: %s, cluster:%u[0x%08X],  size:%u\n", entry->name,
-           entry->first_cluster, cluster_addr(ctx, entry->first_cluster),
+    printf("File: %s, cluster:%u[0x%08llX],  size:%u\n", entry->name,
+           entry->first_cluster,
+           (unsigned long long)cluster_addr(ctx, entry->first_cluster),
            entry->file_size);
     if (raw32 != NULL)
         fat_print_directory_entry_dump(entry, raw32, NULL);

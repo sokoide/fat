@@ -1,7 +1,8 @@
-/* Phase 0 test suite: exercises the public fat.h API against the frozen
- * demof12.fat fixture (720KB FAT12, mtools-generated).  All fixture facts
- * asserted here were verified independently with mtools and raw image dumps:
+/* Phase 2 test suite: exercises the public fat.h API against three frozen
+ * mtools-generated fixtures.  All fixture facts asserted here were verified
+ * independently with mtools (mdir/minfo) and raw image dumps (od):
  *
+ * demof12.fat (720KB FAT12, mformat -f 720) -- committed to the repo:
  *   root: DEMOF12 label (attr 0x08), HELLO.TXT (cluster 2, 12 bytes),
  *         TEST_5KB.TXT (cluster 3, 4962 bytes, chain 3->4->5->6->7),
  *         DIR1 (cluster 8), DIR2 (cluster 11, chain 11->43)
@@ -11,6 +12,41 @@
  *         48->49->50->51->52, byte-identical to the repo test_5kb.txt)
  *   FAT: [0]=0xFF9 [1]=0xFFF [2]=0xFFF [3]=4 [4]=5 [5]=6 [6]=7 [7]=0xFFF
  *        [8]=0xFFF [11]=0x02B [43]=0xFFF
+ *
+ * demof16.fat (16MiB FAT16, `make fat16`; gitignored) --
+ *   geometry: bps 512, sectors/cluster 1, reserved 1, fats 2, fatSectors
+ *         127, rootEntries 512, totalSectors16 32768 -> fatStart 1,
+ *         rootDirSector 255, rootDirSectors 32, dataStart 287,
+ *         clusterCount (32768-287)/1 = 32481 (FAT16 range [4085,65524])
+ *   root: DEMOF16 label (attr 0x08), HELLO.TXT (cluster 2, 12 bytes),
+ *         TEST_5KB.TXT (cluster 3, 4962 bytes, chain 3->4->..->12),
+ *         DIR1 (cluster 13)
+ *   dir1: ".", ".."(->0), SUB1 (cluster 14), HOGE.TXT (cluster 16, 11 bytes)
+ *   sub1: ".", ".."(->13), PAGE.TXT (cluster 15, 14 bytes)
+ *   FAT: [0]=0xFFF8 [1]=0xFFFF [2]=0xFFFF [3]=4 ... [11]=12 [12]=0xFFFF
+ *        [13]=0xFFFF [14]=0xFFFF [15]=0xFFFF [16]=0xFFFF
+ *
+ * demof32.fat (33MiB FAT32, `make fat32`; gitignored) --
+ *   geometry: bps 512, sectors/cluster 1, reserved 32, fats 2, fatSectors
+ *         (tableSize32) 520, rootEntries 0, totalSectors32 67584 ->
+ *         fatStart 32, rootDirSector/rootDirSectors 0, rootCluster 2,
+ *         dataStart 1072, clusterCount (67584-1072)/1 = 66512 (>= 65525)
+ *   root chain: 2 -> 54 -> 55 (44 entries over 3 clusters):
+ *         cluster 2: DEMOF32 label (attr 0x08), HELLO.TXT (cluster 3,
+ *         12 bytes), TEST_5KB.TXT (cluster 4, 4962 bytes, chain
+ *         4->5->..->13), F00.TXT..F12.TXT (clusters 14..26)
+ *         cluster 54: F13.TXT..F28.TXT (clusters 27..42)
+ *         cluster 55: F29.TXT..F39.TXT (clusters 43..53), DIR1 (cluster 56)
+ *   F-files: "filler file N" content, 14 bytes for N<10 else 15 bytes
+ *   dir1 (cluster 56): ".", ".."(->0), SUB1 (cluster 57), HOGE.TXT
+ *         (cluster 59, 11 bytes)
+ *   sub1 (cluster 57): ".", ".."(->56), PAGE.TXT (cluster 58, 14 bytes)
+ *   FAT (masked 32-bit values): [0]=0x0FFFFFF8 [1]=0x0FFFFFFF [2]=54
+ *        [3]=0x0FFFFFFF [4]=5 ... [12]=13 [13]=0x0FFFFFFF [14..26]=EOC
+ *        [27..53]=EOC [54]=55 [55]=0x0FFFFFFF [56..59]=EOC
+ *   FSInfo (sector 1, per BPB@48): lead "RRaA", freeClusterCount 66454,
+ *         nextFreeCluster 59; mdir cross-check: 34024448 bytes free
+ *         = 66454 * 512 exactly
  */
 
 #include "fat.h"
@@ -30,28 +66,50 @@
     } while (0)
 
 #define IMG_NAME "demof12.fat"
+#define IMG16_NAME "demof16.fat"
+#define IMG32_NAME "demof32.fat"
 
 /* BPB field offsets (fatgen103 layout, confirmed on the fixture bytes). */
 #define BPB_BYTES_PER_SECTOR 11
 #define BPB_RESERVED_SECTORS 14
 #define BPB_TOTAL_SECTORS16  19
 #define BPB_TOTAL_SECTORS32  32
+#define BPB_ROOT_CLUSTER     44
+#define BPB_FSINFO_SECTOR    48
 #define BPB_SIGNATURE        510
 
-/* Fixture geometry derived from the verified BPB (see test_open). */
+/* Fixture geometry derived from the verified BPBs (see the tests). */
 #define FIXTURE_FAT_SECTOR   1u    /* reservedSectorCount */
 #define FIXTURE_ROOT_SECTOR  7u    /* 1 + fatCount * fatSectors */
 #define FIXTURE_ROOT_ENTRIES 112u  /* rootEntryCount 0x70 */
+#define F16_FAT_SECTOR       1u    /* demof16.fat: reservedSectorCount */
+#define F32_FAT_SECTOR       32u   /* demof32.fat: reservedSectorCount */
 
-static fat_ctx_t* open_fixture(void)
+static fat_ctx_t* open_image(const char* name)
 {
     fat_ctx_t* ctx = NULL;
-    fat_result_t r = fat_open(IMG_NAME, &ctx);
+    fat_result_t r = fat_open(name, &ctx);
     if (r != FAT_OK)
-        fprintf(stderr, "%s: %s\n", IMG_NAME, fat_strerror(r));
+        fprintf(stderr, "%s: %s\n", name, fat_strerror(r));
     assert(r == FAT_OK);
     assert(ctx != NULL);
     return ctx;
+}
+
+static fat_ctx_t* open_fixture(void)
+{
+    return open_image(IMG_NAME);
+}
+
+/* 1 when the fixture image exists: missing FAT16/FAT32 suites are skipped
+ * with a notice instead of failing (plain `make check` stays fast) */
+static int fixture_present(const char* name)
+{
+    FILE* fp = fopen(name, "rb");
+    if (fp == NULL)
+        return 0;
+    fclose(fp);
+    return 1;
 }
 
 /* fat_get_fat_entry that insists on success and returns the value */
@@ -166,6 +224,7 @@ static void test_open(void)
     assert(g->fat_start_sector == 1);
     assert(g->root_dir_sector == 7);
     assert(g->root_dir_sectors == 7);
+    assert(g->root_cluster == 0); /* FAT12/16: fixed root region, no chain */
     assert(g->data_start_sector == 14);
     assert(g->cluster_count == (0x5A0u - 14u) / 2u);
     assert(g->cluster_count == 713);
@@ -471,11 +530,11 @@ static void test_ctx_lifecycle(void)
 /* in-process mutated images (fat_open_mem)                            */
 /* ------------------------------------------------------------------ */
 
-static uint8_t* read_fixture(size_t* out_size)
+static uint8_t* read_image(const char* name, size_t* out_size)
 {
-    FILE* fp = fopen(IMG_NAME, "rb");
+    FILE* fp = fopen(name, "rb");
     if (fp == NULL)
-        perror(IMG_NAME);
+        perror(name);
     assert(fp != NULL);
     assert(fseek(fp, 0, SEEK_END) == 0);
     long n = ftell(fp);
@@ -487,6 +546,11 @@ static uint8_t* read_fixture(size_t* out_size)
     fclose(fp);
     *out_size = (size_t)n;
     return buf;
+}
+
+static uint8_t* read_fixture(size_t* out_size)
+{
+    return read_image(IMG_NAME, out_size);
 }
 
 static uint64_t checksum(const uint8_t* p, size_t n)
@@ -529,6 +593,17 @@ static void set_fat12_entry(uint8_t* img, uint32_t cluster, uint16_t value)
     }
 }
 
+/* Write a 32-bit FAT entry (little-endian) into the first FAT table of the
+ * raw FAT32 image. */
+static void set_fat32_entry(uint8_t* img, uint32_t cluster, uint32_t value)
+{
+    size_t off = F32_FAT_SECTOR * 512u + (size_t)cluster * 4u;
+    img[off] = (uint8_t)(value & 0xFFu);
+    img[off + 1] = (uint8_t)((value >> 8) & 0xFFu);
+    img[off + 2] = (uint8_t)((value >> 16) & 0xFFu);
+    img[off + 3] = (uint8_t)((value >> 24) & 0xFFu);
+}
+
 /* open_mem must fail; a context accidentally bound on failure is released */
 static void assert_open_mem_fails(const uint8_t* img, size_t size,
                                   fat_result_t want)
@@ -559,14 +634,21 @@ static void test_open_mem_errors(void)
     free(img);
 
     /* (c) totalSectors16 = 0 with totalSectors32 = 32768: a well-formed BPB
-     * claiming (32768 - 14) / 2 = 16377 clusters, i.e. FAT16.  fat.h says
-     * FT_FAT16 is "detected but rejected by fat_open", so the contract
-     * points to FAT_ERR_UNSUPPORTED here. */
+     * claiming (32768 - 14) / 2 = 16377 clusters, i.e. FAT16 (FATSz16 and
+     * rootEntryCount are nonzero, so this stays in the FAT12/16 family).
+     * Phase 2 fat_open accepts FAT16, so the type alone no longer rejects
+     * this; what still must is the region fit: the claimed volume spans
+     * 32768 * 512 = 16MiB while the buffer holds only 720KB.  A FAT table
+     * too small for the claimed cluster count is NOT an error by itself
+     * (nothing validates FAT coverage), only the image-size fit is.
+     * Confirmed against the phase-2 fat_core.c: the phase-1 short-circuit
+     * "ts16==0 -> UNSUPPORTED" is gone (FAT32 images are all ts16==0) and
+     * the whole-volume-must-fit check fires first. */
     static const uint8_t ts16_zero[2] = {0x00, 0x00};
     static const uint8_t ts32_16m[4] = {0x00, 0x80, 0x00, 0x00};
     img = mutated_copy(orig, size, BPB_TOTAL_SECTORS16, ts16_zero, 2);
     memcpy(img + BPB_TOTAL_SECTORS32, ts32_16m, 4);
-    assert_open_mem_fails(img, size, FAT_ERR_UNSUPPORTED);
+    assert_open_mem_fails(img, size, FAT_ERR_INVALID_BPB);
     free(img);
 
     /* (d) bytesPerSector = 768: not a legal power-of-two sector size */
@@ -628,6 +710,449 @@ static void test_open_mem_errors(void)
     free(orig);
 }
 
+/* ------------------------------------------------------------------ */
+/* shared read helpers for the FAT16/FAT32 suites                      */
+/* ------------------------------------------------------------------ */
+
+static void assert_read_string(fat_ctx_t* ctx, const char* path,
+                               const char* want)
+{
+    static uint8_t sentinel; /* non-NULL start catches "OK but out unwritten" */
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    size_t want_size = strlen(want);
+
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, path, &de) == FAT_OK);
+    assert(de.file_size == want_size);
+    uint8_t* data = &sentinel;
+    size_t size = 1;
+    assert(fat_read_file(ctx, &de, &data, &size) == FAT_OK);
+    assert(data != &sentinel);
+    assert(size == want_size);
+    assert(memcmp(data, want, want_size) == 0);
+    free(data);
+}
+
+static void assert_read_matches_host(fat_ctx_t* ctx, const char* path,
+                                     const char* host_file, size_t want_size)
+{
+    static uint8_t sentinel;
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, path, &de) == FAT_OK);
+    assert(de.file_size == want_size);
+    uint8_t* data = &sentinel;
+    size_t size = 1;
+    assert(fat_read_file(ctx, &de, &data, &size) == FAT_OK);
+    assert(data != &sentinel);
+    assert(size == want_size);
+    {
+        FILE* fp = fopen(host_file, "rb");
+        if (fp == NULL)
+            perror(host_file);
+        assert(fp != NULL);
+        uint8_t* expected = malloc(size);
+        assert(expected != NULL);
+        assert(fread(expected, 1, size, fp) == size);
+        fclose(fp);
+        assert(memcmp(data, expected, size) == 0);
+        free(expected);
+    }
+    free(data);
+}
+
+/* ------------------------------------------------------------------ */
+/* FAT16 fixture (demof16.fat, `make fat16`)                           */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    int labels, files, dirs;
+    int saw_label, saw_hello, saw_5kb, saw_dir1;
+} Root16Counts;
+
+static void count_root16(const fat_dirent_t* entry, const uint8_t* raw32,
+                         void* user_data)
+{
+    Root16Counts* counts = user_data;
+
+    (void)raw32;
+    if (entry->attributes & 0x08) { /* volume label */
+        counts->labels++;
+        if (strcmp(entry->name, "DEMOF16") == 0)
+            counts->saw_label = 1;
+        return;
+    }
+    if (strcmp(entry->name, "HELLO.TXT") == 0) {
+        counts->saw_hello = 1;
+        assert(entry->first_cluster == 2);
+        assert(entry->file_size == 12);
+    } else if (strcmp(entry->name, "TEST_5KB.TXT") == 0) {
+        counts->saw_5kb = 1;
+        assert(entry->first_cluster == 3);
+        assert(entry->file_size == 4962);
+    } else if (strcmp(entry->name, "DIR1") == 0) {
+        counts->saw_dir1 = 1;
+        assert(entry->first_cluster == 13);
+        assert(entry->attributes & 0x10);
+    }
+    if (entry->attributes & 0x10)
+        counts->dirs++;
+    else
+        counts->files++;
+}
+
+static void test_fat16_open(void)
+{
+    fat_ctx_t* ctx = open_image(IMG16_NAME);
+
+    assert(fat_get_type(ctx) == FT_FAT16);
+
+    /* fatStart=1, rootDir=1+2*127=255, rootDirSectors=512*32/512=32,
+     * dataStart=255+32=287, clusterCount=(32768-287)/1=32481 */
+    const fat_geometry_t* g = fat_geometry(ctx);
+    assert(g != NULL);
+    assert(g->bytes_per_sector == 512);
+    assert(g->sectors_per_cluster == 1);
+    assert(g->reserved_sectors == 1);
+    assert(g->fat_count == 2);
+    assert(g->fat_sectors == 127);
+    assert(g->root_entries == 512);
+    assert(g->total_sectors == 32768);
+    assert(g->fat_start_sector == 1);
+    assert(g->root_dir_sector == 255);
+    assert(g->root_dir_sectors == 32);
+    assert(g->root_cluster == 0); /* FAT12/16: fixed root region */
+    assert(g->data_start_sector == 287);
+    assert(g->cluster_count == 32481);
+    assert(g->cluster_count >= 4085 && g->cluster_count < 65525);
+    assert(g->fat_sectors > 0);
+
+    assert(fat_cluster_size(ctx) == 512u);
+
+    /* FSInfo is FAT32-only */
+    fat_fsinfo_t fi;
+    assert(fat_fsinfo(ctx, &fi) == FAT_ERR_UNSUPPORTED);
+
+    fat_close(ctx);
+}
+
+static void test_fat16_fat_entries(void)
+{
+    fat_ctx_t* ctx = open_image(IMG16_NAME);
+
+    /* media/reserved entries and the verified chains */
+    assert(fat_at(ctx, 0) == 0xFFF8); /* media 0xF8 dirty pattern */
+    assert(fat_at(ctx, 1) == 0xFFFF);
+    assert(fat_at(ctx, 2) == 0xFFFF); /* hello.txt: single cluster, EOC */
+    assert(fat_at(ctx, 3) == 4);     /* test_5kb.txt chain 3->4->..->12 */
+    assert(fat_at(ctx, 11) == 12);
+    assert(fat_at(ctx, 12) == 0xFFFF); /* EOC at chain end, 0xFFFF >= 0xFFF8 */
+    assert(fat_at(ctx, 13) == 0xFFFF); /* dir1 */
+    assert(fat_at(ctx, 14) == 0xFFFF); /* sub1 */
+    assert(fat_at(ctx, 15) == 0xFFFF); /* page.txt */
+    assert(fat_at(ctx, 16) == 0xFFFF); /* hoge.txt */
+
+    /* indices 0..cluster_count+1 are readable, beyond that is an error */
+    const fat_geometry_t* g = fat_geometry(ctx);
+    uint32_t v = 0;
+    assert(fat_get_fat_entry(ctx, g->cluster_count + 1, &v) == FAT_OK);
+    assert(fat_get_fat_entry(ctx, g->cluster_count + 2, &v) ==
+           FAT_ERR_INVALID_ARG);
+
+    fat_close(ctx);
+}
+
+static void test_fat16_root_iterate(void)
+{
+    fat_ctx_t* ctx = open_image(IMG16_NAME);
+    Root16Counts counts = {0, 0, 0, 0, 0, 0, 0};
+
+    assert(fat_iter_dir(ctx, FAT_CLUSTER_ROOT, count_root16, &counts) ==
+           FAT_OK);
+    /* DEMOF16 + hello.txt + test_5kb.txt + dir1 */
+    assert(counts.labels == 1);
+    assert(counts.files == 2);
+    assert(counts.dirs == 1);
+    assert(counts.saw_label && counts.saw_hello && counts.saw_5kb);
+    assert(counts.saw_dir1);
+
+    fat_close(ctx);
+}
+
+static void test_fat16_lookup_read(void)
+{
+    fat_ctx_t* ctx = open_image(IMG16_NAME);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir1", &de) == FAT_OK);
+    assert(de.first_cluster == 13);
+    assert(de.attributes & 0x10);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir1/sub1", &de) == FAT_OK);
+    assert(de.first_cluster == 14);
+
+    /* multi-cluster chain: 4962 bytes over clusters 3->4->..->12 */
+    assert_read_matches_host(ctx, "test_5kb.txt", "test_5kb.txt", 4962);
+    assert_read_string(ctx, "hello.txt", "hello world\n");
+    assert_read_string(ctx, "dir1/hoge.txt", "I am hoge.\n");
+    assert_read_string(ctx, "dir1/sub1/page.txt", "You are page.\n");
+
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir1/noexist", &de) ==
+           FAT_ERR_NOT_FOUND);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "noexist/foo", &de) ==
+           FAT_ERR_PATH_NOT_FOUND);
+
+    fat_close(ctx);
+}
+
+/* ------------------------------------------------------------------ */
+/* FAT32 fixture (demof32.fat, `make fat32`)                           */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    int labels, files, dirs;
+    int fillers;  /* F00.TXT..F39.TXT, in root-cluster order */
+    int bad_name; /* non-filler unexpected entry */
+    int saw_label, saw_hello, saw_5kb, saw_dir1;
+} Root32Counts;
+
+static void count_root32(const fat_dirent_t* entry, const uint8_t* raw32,
+                         void* user_data)
+{
+    Root32Counts* counts = user_data;
+
+    (void)raw32;
+    if (entry->attributes & 0x08) { /* volume label */
+        counts->labels++;
+        if (strcmp(entry->name, "DEMOF32") == 0)
+            counts->saw_label = 1;
+        return;
+    }
+    if (strcmp(entry->name, "HELLO.TXT") == 0) {
+        counts->saw_hello = 1;
+        assert(entry->first_cluster == 3);
+        assert(entry->file_size == 12);
+    } else if (strcmp(entry->name, "TEST_5KB.TXT") == 0) {
+        counts->saw_5kb = 1;
+        assert(entry->first_cluster == 4);
+        assert(entry->file_size == 4962);
+    } else if (strcmp(entry->name, "DIR1") == 0) {
+        counts->saw_dir1 = 1;
+        assert(entry->first_cluster == 56);
+        assert(entry->attributes & 0x10);
+    } else if (entry->name[0] == 'F' && strlen(entry->name) == 7) {
+        /* FNN.TXT filler; mtools allocated them in copy order, so the
+         * Nth filler sits at cluster 14+N regardless of which root
+         * cluster of the 2->54->55 chain its dirent landed in */
+        assert(entry->name[1] >= '0' && entry->name[1] <= '9');
+        assert(entry->name[2] >= '0' && entry->name[2] <= '9');
+        int n = (entry->name[1] - '0') * 10 + (entry->name[2] - '0');
+        assert(n <= 39);
+        assert(strcmp(entry->name + 3, ".TXT") == 0);
+        assert(entry->first_cluster == 14u + (uint32_t)n);
+        assert(entry->file_size == (n < 10 ? 14u : 15u));
+        counts->fillers++;
+    } else {
+        counts->bad_name = 1;
+    }
+    if (entry->attributes & 0x10)
+        counts->dirs++;
+    else
+        counts->files++;
+}
+
+static void test_fat32_open(void)
+{
+    fat_ctx_t* ctx = open_image(IMG32_NAME);
+
+    assert(fat_get_type(ctx) == FT_FAT32);
+
+    /* fatStart=32, dataStart=32+2*520=1072, rootDir region absent,
+     * clusterCount=(67584-1072)/1=66512 >= 65525 */
+    const fat_geometry_t* g = fat_geometry(ctx);
+    assert(g != NULL);
+    assert(g->bytes_per_sector == 512);
+    assert(g->sectors_per_cluster == 1);
+    assert(g->reserved_sectors == 32);
+    assert(g->fat_count == 2);
+    assert(g->fat_sectors == 520); /* tableSize32 for FAT32 */
+    assert(g->root_entries == 0);
+    assert(g->total_sectors == 67584); /* totalSectors32 */
+    assert(g->fat_start_sector == 32);
+    assert(g->root_dir_sector == 0);
+    assert(g->root_dir_sectors == 0);
+    assert(g->root_cluster == 2); /* FAT32: root is a cluster chain */
+    assert(g->data_start_sector == 1072);
+    assert(g->cluster_count == 66512);
+    assert(g->cluster_count >= 65525);
+
+    assert(fat_cluster_size(ctx) == 512u);
+
+    fat_close(ctx);
+}
+
+static void test_fat32_fat_entries(void)
+{
+    fat_ctx_t* ctx = open_image(IMG32_NAME);
+
+    /* masked media/reserved entries and the verified chains */
+    assert(fat_at(ctx, 0) == 0x0FFFFFF8); /* media 0xF8 pattern, masked */
+    assert(fat_at(ctx, 1) == 0x0FFFFFFF); /* raw 0xFFFFFFFF masked */
+    assert(fat_at(ctx, 2) == 54);         /* root chain 2->54->55 */
+    assert(fat_at(ctx, 3) == 0x0FFFFFFF); /* hello.txt: single cluster */
+    assert(fat_at(ctx, 4) == 5);          /* test_5kb chain 4->5->..->13 */
+    assert(fat_at(ctx, 12) == 13);
+    assert(fat_at(ctx, 13) == 0x0FFFFFFF);
+    assert(fat_at(ctx, 13) >= 0x0FFFFFF8u); /* EOC at chain end */
+    assert(fat_at(ctx, 14) == 0x0FFFFFFF);  /* F00.TXT */
+    assert(fat_at(ctx, 26) == 0x0FFFFFFF);  /* F12.TXT */
+    assert(fat_at(ctx, 43) == 0x0FFFFFFF);  /* F29.TXT */
+    assert(fat_at(ctx, 53) == 0x0FFFFFFF);  /* F39.TXT */
+    assert(fat_at(ctx, 54) == 55);          /* second root cluster */
+    assert(fat_at(ctx, 55) == 0x0FFFFFFF);  /* root chain ends here */
+    assert(fat_at(ctx, 56) == 0x0FFFFFFF);  /* dir1 */
+    assert(fat_at(ctx, 57) == 0x0FFFFFFF);  /* sub1 */
+    assert(fat_at(ctx, 58) == 0x0FFFFFFF);  /* page.txt */
+    assert(fat_at(ctx, 59) == 0x0FFFFFFF);  /* hoge.txt */
+
+    const fat_geometry_t* g = fat_geometry(ctx);
+    uint32_t v = 0;
+    assert(fat_get_fat_entry(ctx, g->cluster_count + 1, &v) == FAT_OK);
+    assert(fat_get_fat_entry(ctx, g->cluster_count + 2, &v) ==
+           FAT_ERR_INVALID_ARG);
+
+    fat_close(ctx);
+}
+
+static void test_fat32_root_iterate(void)
+{
+    fat_ctx_t* ctx = open_image(IMG32_NAME);
+    Root32Counts counts = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+    /* 44 entries spread over the 3-cluster root chain 2->54->55 */
+    assert(fat_iter_dir(ctx, FAT_CLUSTER_ROOT, count_root32, &counts) ==
+           FAT_OK);
+    assert(counts.labels == 1);
+    assert(counts.files == 42); /* hello + test_5kb + 40 fillers */
+    assert(counts.dirs == 1);   /* dir1 */
+    assert(counts.fillers == 40);
+    assert(counts.bad_name == 0);
+    assert(counts.saw_label && counts.saw_hello && counts.saw_5kb);
+    assert(counts.saw_dir1);
+
+    fat_close(ctx);
+}
+
+static void test_fat32_lookup_read(void)
+{
+    fat_ctx_t* ctx = open_image(IMG32_NAME);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir1", &de) == FAT_OK);
+    assert(de.first_cluster == 56);
+    assert(de.attributes & 0x10);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir1/sub1", &de) == FAT_OK);
+    assert(de.first_cluster == 57);
+
+    /* multi-cluster chain: 4962 bytes over clusters 4->5->..->13 */
+    assert_read_matches_host(ctx, "test_5kb.txt", "test_5kb.txt", 4962);
+    assert_read_string(ctx, "hello.txt", "hello world\n");
+    assert_read_string(ctx, "dir1/hoge.txt", "I am hoge.\n");
+    assert_read_string(ctx, "dir1/sub1/page.txt", "You are page.\n");
+    /* filler reached through the multi-cluster root: F29.TXT lives in the
+     * third root cluster (55) */
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "f29.txt", &de) == FAT_OK);
+    assert(de.first_cluster == 43);
+    assert(de.file_size == 15);
+
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir1/noexist", &de) ==
+           FAT_ERR_NOT_FOUND);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "noexist/foo", &de) ==
+           FAT_ERR_PATH_NOT_FOUND);
+
+    fat_close(ctx);
+}
+
+static void test_fat32_fsinfo(void)
+{
+    fat_ctx_t* ctx = open_image(IMG32_NAME);
+    fat_fsinfo_t fi;
+    memset(&fi, 0, sizeof(fi));
+
+    assert(fat_fsinfo(ctx, &fi) == FAT_OK);
+    /* verified against mdir at fixture-creation time: 34024448 bytes free
+     * = 66454 clusters * 512B exactly (66512 total - 58 in use) */
+    assert(fi.free_cluster_count == 66454);
+    assert(fi.next_free_cluster == 59);
+    assert(fi.free_cluster_count != 0xFFFFFFFFu);
+
+    fat_close(ctx);
+}
+
+static void test_open_mem_errors_fat32(void)
+{
+    size_t size = 0;
+    fat_ctx_t* ctx = NULL;
+    uint8_t* orig = read_image(IMG32_NAME, &size);
+    uint64_t sum_before = checksum(orig, size);
+
+    /* (a) rootCluster = 0: the FAT32 root has no chain head */
+    static const uint8_t rc_zero[4] = {0x00, 0x00, 0x00, 0x00};
+    uint8_t* img = mutated_copy(orig, size, BPB_ROOT_CLUSTER, rc_zero, 4);
+    assert_open_mem_fails(img, size, FAT_ERR_INVALID_BPB);
+    free(img);
+
+    /* (b) rootCluster = cluster_count + 5 = 66517: outside the data region
+     * (valid data clusters are 2..66513) */
+    static const uint8_t rc_oob[4] = {0xD5, 0x03, 0x01, 0x00};
+    img = mutated_copy(orig, size, BPB_ROOT_CLUSTER, rc_oob, 4);
+    assert_open_mem_fails(img, size, FAT_ERR_INVALID_BPB);
+    free(img);
+
+    /* (c) FSInfo lead signature (offset 0 of the FSInfo sector, sector
+     * number taken from BPB@48) zeroed: open still succeeds and fat_fsinfo
+     * degrades to "unknown" instead of trusting the stale counters */
+    img = copy_image(orig, size);
+    unsigned fsinfo_sector =
+        (unsigned)img[BPB_FSINFO_SECTOR] |
+        ((unsigned)img[BPB_FSINFO_SECTOR + 1] << 8);
+    assert(fsinfo_sector == 1);
+    memset(img + (size_t)fsinfo_sector * 512u, 0, 4);
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    fat_fsinfo_t fi;
+    memset(&fi, 0, sizeof(fi));
+    assert(fat_fsinfo(ctx, &fi) == FAT_OK);
+    assert(fi.free_cluster_count == 0xFFFFFFFFu);
+    assert(fi.next_free_cluster == 0xFFFFFFFFu);
+    fat_close(ctx);
+    ctx = NULL;
+
+    /* (d) chain loop through a 32-bit FAT entry: TEST_5KB.TXT runs
+     * 4->5->..->13; FAT[5] = 5 makes it point at itself, so the read must
+     * trip the chain guard instead of spinning */
+    img = copy_image(orig, size);
+    set_fat32_entry(img, 5, 5);
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "test_5kb.txt", &de) == FAT_OK);
+    uint8_t* data = NULL;
+    size_t n = 0;
+    assert(fat_read_file(ctx, &de, &data, &n) == FAT_ERR_BAD_CLUSTER);
+    assert(data == NULL); /* no buffer may escape on the error path */
+    fat_close(ctx);
+    ctx = NULL;
+
+    /* fat_open_mem copies the image: the pristine buffer survives every
+     * mutation round trip untouched */
+    assert(checksum(orig, size) == sum_before);
+    free(orig);
+}
+
 int main(void)
 {
     RUN(test_open);
@@ -639,6 +1164,28 @@ int main(void)
     RUN(test_read_file);
     RUN(test_ctx_lifecycle);
     RUN(test_open_mem_errors);
+
+    if (fixture_present(IMG16_NAME)) {
+        RUN(test_fat16_open);
+        RUN(test_fat16_fat_entries);
+        RUN(test_fat16_root_iterate);
+        RUN(test_fat16_lookup_read);
+    } else {
+        printf("%-40s skipped (%s missing; run: make fat16)\n",
+               "FAT16 suite", IMG16_NAME);
+    }
+
+    if (fixture_present(IMG32_NAME)) {
+        RUN(test_fat32_open);
+        RUN(test_fat32_fat_entries);
+        RUN(test_fat32_root_iterate);
+        RUN(test_fat32_lookup_read);
+        RUN(test_fat32_fsinfo);
+        RUN(test_open_mem_errors_fat32);
+    } else {
+        printf("%-40s skipped (%s missing; run: make fat32)\n",
+               "FAT32 suite", IMG32_NAME);
+    }
 
     return 0;
 }

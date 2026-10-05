@@ -11,7 +11,8 @@
 
 // on-disk structs (packed; migrated from the old fat.h) ------------------
 
-// Extended Boot Record (FAT12/16)
+// Extended Boot Record common tail: at BPB offset 36 for FAT12/16, and at
+// BPB offset 64 (= extended_section[28]) for FAT32, right after FatExtBS32.
 typedef struct {
     uint8_t biosDriveNum;
     uint8_t reserved1;
@@ -21,22 +22,21 @@ typedef struct {
     uint8_t fatTypeLabel[8];
 } __attribute__((packed)) FatExtBS16;
 
-// // FAT32 extended boot record (kept for phase 2)
-// typedef struct {
-//     uint32_t table_size_32;
-//     uint16_t extended_flags;
-//     uint16_t fat_version;
-//     uint32_t root_cluster;
-//     uint16_t fat_info;
-//     uint16_t backup_BS_sector;
-//     uint8_t reserved_0[12];
-//     uint8_t drive_number;
-//     uint8_t reserved_1;
-//     uint8_t boot_signature;
-//     uint32_t volume_id;
-//     uint8_t volume_label[11];
-//     uint8_t fat_type_label[8];
-// } __attribute__((packed)) FatExtBS32;
+// FAT32-specific Extended Boot Record: the 28 type bytes at BPB offset 36.
+// The FatExtBS16 common tail follows at BPB offset 64.
+typedef struct {
+    uint32_t fatsz32;   // sectors per FAT table when tableSize16 == 0
+    uint16_t extFlags;  // bit7: no mirroring, bits3..0: active FAT number
+    uint16_t fsVer;
+    uint32_t rootClus;  // first cluster of the root directory chain
+    uint16_t fsInfo;    // FSInfo sector number (0 = none)
+    uint16_t bkBootSec; // backup boot sector number
+    uint8_t reserved[12];
+} __attribute__((packed)) FatExtBS32;
+
+// compile-time size checks (C99 has no _Static_assert)
+typedef char fat_extbs16_size_check[(sizeof(FatExtBS16) == 26) * 2 - 1];
+typedef char fat_extbs32_size_check[(sizeof(FatExtBS32) == 28) * 2 - 1];
 
 // BIOS Parameter Block
 typedef struct {
@@ -54,7 +54,8 @@ typedef struct {
     uint16_t headSideCount;
     uint32_t hiddenSectorCount;
     uint32_t totalSectors32;
-    // cast to FatExtBS16/32 once the driver knows the FAT type
+    // cast to FatExtBS16 at [0] for FAT12/16; for FAT32, FatExtBS32 occupies
+    // [0..27] and the FatExtBS16 common tail starts at [28]
     uint8_t extended_section[54];
 } __attribute__((packed)) FatBS;
 
@@ -89,18 +90,21 @@ struct fat_ctx {
     size_t image_size;
     enum FAT_TYPE type;
     fat_geometry_t geo;  // validated, host-endian
+    uint16_t fsinfo_sector; // FAT32 BPB FSInfo sector; 0 = none (FAT12/16)
 };
 
 // internal region/FAT accessors (fat_core.c) ------------------------------
 
-// Raw 12-bit FAT entry of `cluster`; no bounds check on top of geo
-// (fat_get_fat_entry validates). Caller ensures a valid context.
-uint32_t fat_raw_fat12(const fat_ctx_t* ctx, uint32_t cluster);
+// Raw FAT[cluster] value, unpacked per the image type (12/16/32-bit wide;
+// FAT32 values masked with 0x0FFFFFFF). FAT_CLUSTER_NOT_FOUND when the FAT
+// region does not cover the index. Caller ensures a valid context.
+uint32_t fat_raw_fat_entry(const fat_ctx_t* ctx, uint32_t cluster);
 
 // Pointer into the image at byte `offset`, or NULL when out of range.
 const uint8_t* fat_region_ptr(const fat_ctx_t* ctx, size_t offset);
 
-// Pointer to the first FAT table, or NULL when out of range.
+// Pointer to the FAT table the context reads (FAT #0, or the active FAT32
+// table), or NULL when out of range.
 const uint8_t* fat_fat_ptr(const fat_ctx_t* ctx);
 
 // Core initializer shared with fat_dev.c: validate the BPB, copy `size`

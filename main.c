@@ -7,7 +7,7 @@
 void fat_print_info(const fat_ctx_t* ctx);
 void fat_print_header_legend(void);
 void fat_print_header_dump(const fat_ctx_t* ctx);
-void fat_print_fat12(const fat_ctx_t* ctx);
+void fat_print_fat(const fat_ctx_t* ctx);
 void fat_print_directory_entry_header_legend(void);
 void fat_print_directory_entry_dump(const fat_dirent_t* entry,
                                     const uint8_t* raw32, void* user_data);
@@ -107,7 +107,7 @@ int main(void) {
     fat_print_header_dump(ctx);
 
     printf("*** FAT table ***\n");
-    fat_print_fat12(ctx);
+    fat_print_fat(ctx);
 
     printf("*** Files and Directories ***\n");
     fat_print_directory_entry_header_legend();

@@ -28,8 +28,12 @@ SANFLAGS = $(CFLAGS) -fsanitize=address,undefined
 
 VOL := DEMOF12
 IMG := demof12.fat
+VOL16 := DEMOF16
+IMG16 := demof16.fat
+VOL32 := DEMOF32
+IMG32 := demof32.fat
 
-.PHONY: default testbuild run test test-san check diag fat12 clean
+.PHONY: default testbuild run test test-san check check-all diag fat12 fat16 fat32 clean
 
 default: $(OUTDIR)/$(TARGET)
 
@@ -64,6 +68,10 @@ test-san: $(SANOUTDIR)/$(TESTTARGET)
 
 check: test test-san
 
+# everything: regenerate all three fixtures (mtools), then run the suites.
+# plain `check` skips the FAT16/FAT32 suites when those images are absent.
+check-all: fat12 fat16 fat32 check
+
 diag: $(OUTDIR)/$(TARGET)
 	#readelf -d $(OUTDIR)/$(TARGET)
 	objdump -p $(OUTDIR)/$(TARGET)
@@ -87,6 +95,51 @@ fat12:
 	mdir -i $(IMG) ::dir1 && \
 	mdir -i $(IMG) ::dir2 && \
 	mdir -i $(IMG) ::dir2/subdir1 && \
+	rm -rf $(SCRATCH)
+
+# 16 MiB image: mformat defaults give 512B sectors/clusters, FATSz16=127,
+# 512 root entries -> (32768-287)/1 = 32481 data clusters, inside the FAT16
+# range [4085, 65524].  Smaller defaults (<= 14 MiB) come out FAT12.
+# demof16.fat is gitignored (16 MiB); regenerate with this target.
+fat16:
+	rm -f $(IMG16)
+	mkdir -p $(SCRATCH) && trap 'rm -rf $(SCRATCH)' EXIT && \
+	echo "hello world" > $(SCRATCH)/hello.txt && \
+	echo "You are page." > $(SCRATCH)/page.txt && \
+	echo "I am hoge." > $(SCRATCH)/hoge.txt && \
+	mformat -C -T 32768 -v $(VOL16) -i $(IMG16) :: && \
+	mcopy -i $(IMG16) $(SCRATCH)/hello.txt :: && \
+	mcopy -i $(IMG16) test_5kb.txt :: && \
+	mmd -i $(IMG16) dir1 dir1/sub1 && \
+	mcopy -i $(IMG16) $(SCRATCH)/page.txt ::dir1/sub1 && \
+	mcopy -i $(IMG16) $(SCRATCH)/hoge.txt ::dir1 && \
+	mdir -i $(IMG16) -/ :: && \
+	mdir -i $(IMG16) ::dir1 && \
+	mdir -i $(IMG16) ::dir1/sub1 && \
+	rm -rf $(SCRATCH)
+
+# 33 MiB image (-F forces FAT32): 512B sectors/clusters, reserved 32,
+# FATSz32=520 -> dataStart 1072, (67584-1072)/1 = 66512 >= 65525 clusters.
+# 32 MiB would fall 29 clusters short of the FAT32 threshold.  The 40
+# F-files push the root directory to 44 entries = 3 clusters (2->54->55), so
+# the root cluster chain itself is exercised.  demof32.fat is gitignored.
+fat32:
+	rm -f $(IMG32)
+	mkdir -p $(SCRATCH) && trap 'rm -rf $(SCRATCH)' EXIT && \
+	echo "hello world" > $(SCRATCH)/hello.txt && \
+	echo "You are page." > $(SCRATCH)/page.txt && \
+	echo "I am hoge." > $(SCRATCH)/hoge.txt && \
+	for i in $$(seq 0 39); do echo "filler file $$i" > $(SCRATCH)/f$$(printf %02d $$i).txt; done && \
+	mformat -C -F -T 67584 -v $(VOL32) -i $(IMG32) :: && \
+	mcopy -i $(IMG32) $(SCRATCH)/hello.txt :: && \
+	mcopy -i $(IMG32) test_5kb.txt :: && \
+	mcopy -i $(IMG32) $(SCRATCH)/f??.txt :: && \
+	mmd -i $(IMG32) dir1 dir1/sub1 && \
+	mcopy -i $(IMG32) $(SCRATCH)/page.txt ::dir1/sub1 && \
+	mcopy -i $(IMG32) $(SCRATCH)/hoge.txt ::dir1 && \
+	mdir -i $(IMG32) -/ :: | tail -3 && \
+	mdir -i $(IMG32) ::dir1 && \
+	mdir -i $(IMG32) ::dir1/sub1 && \
 	rm -rf $(SCRATCH)
 
 clean:

@@ -147,19 +147,22 @@ static void count_root(const fat_dirent_t* entry, const uint8_t* raw32,
             counts->saw_label = 1;
         return;
     }
-    if (strcmp(entry->name, "HELLO.TXT") == 0) {
+    /* Lead adjudication (§28.3, phase 10): the fixture stores these 8.3
+     * names with NTRes lowercase flags, so dirent.name now renders in
+     * lowercase -- the on-disk flags applied, not a regression */
+    if (strcmp(entry->name, "hello.txt") == 0) {
         counts->saw_hello = 1;
         assert(entry->first_cluster == 2);
         assert(entry->file_size == 12);
-    } else if (strcmp(entry->name, "TEST_5KB.TXT") == 0) {
+    } else if (strcmp(entry->name, "test_5kb.txt") == 0) {
         counts->saw_5kb = 1;
         assert(entry->first_cluster == 3);
         assert(entry->file_size == 4962);
-    } else if (strcmp(entry->name, "DIR1") == 0) {
+    } else if (strcmp(entry->name, "dir1") == 0) {
         counts->saw_dir1 = 1;
         assert(entry->first_cluster == 8);
         assert(entry->attributes & 0x10);
-    } else if (strcmp(entry->name, "DIR2") == 0) {
+    } else if (strcmp(entry->name, "dir2") == 0) {
         counts->saw_dir2 = 1;
         assert(entry->first_cluster == 11);
         assert(entry->attributes & 0x10);
@@ -191,7 +194,9 @@ static void count_dir2(const fat_dirent_t* entry, const uint8_t* raw32,
         counts->dots++;
         return;
     }
-    if (strncmp(entry->name, "SUBDIR", 6) != 0)
+    /* Lead adjudication (§28.3, phase 10): the dir2 subdirs carry NTRes
+     * 0x08 and now render as "subdirN" */
+    if (strncmp(entry->name, "subdir", 6) != 0)
         counts->bad_name = 1;
     if (entry->attributes & 0x10)
         counts->subdirs++;
@@ -386,6 +391,59 @@ static void test_name_05_escape(void)
     assert(memcmp(out05, want, sizeof(want)) == 0);
     assert(memcmp(outE5, want, sizeof(want)) == 0);
     assert(memcmp(out05, outE5, sizeof(want)) == 0);
+}
+
+/* phase 10 (§28): NTRes lowercase flags (dirent byte 12: bit3 base, bit4
+ * extension) fold back into the rendered dirent.name, while fat_name_from_83
+ * itself stays uppercase and matching stays case-insensitive. The frozen
+ * fixture carries the flags on disk: hello.txt/test_5kb.txt are 0x18, dir1
+ * is 0x08, the label is 0x00 */
+static void test_nt_rendering(void)
+{
+    fat_ctx_t* ctx = open_fixture();
+
+    fat_dir_t* d = NULL;
+    assert(fat_dir_open(ctx, FAT_CLUSTER_ROOT, &d) == FAT_OK);
+    const fat_dirent_t* entry;
+    const uint8_t* raw32;
+    int saw_hello = 0, saw_dir1 = 0, saw_label = 0;
+    fat_result_t r;
+    while ((r = fat_dir_next(d, &entry, &raw32)) == FAT_OK) {
+        if (raw32[11] & 0x08) { /* volume label: NTRes 0x00, no folding */
+            assert(strcmp(entry->name, "DEMOF12") == 0);
+            assert(raw32[12] == 0x00);
+            saw_label = 1;
+            continue;
+        }
+        if (strcmp(entry->name, "hello.txt") == 0) {
+            assert(raw32[12] == 0x18); /* base + extension lowercase */
+            assert(entry->file_size == 12);
+            saw_hello = 1;
+        } else if (strcmp(entry->name, "dir1") == 0) {
+            assert(raw32[12] == 0x08); /* base only: no extension */
+            saw_dir1 = 1;
+        }
+    }
+    assert(r == FAT_ERR_END_OF_DIR);
+    fat_dir_close(d);
+    assert(saw_hello && saw_dir1 && saw_label);
+
+    /* uppercase queries still resolve (ASCII case-insensitive matching) */
+    fat_dirent_t de;
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "HELLO.TXT", &de) == FAT_OK);
+    assert(de.file_size == 12);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "Dir1", &de) == FAT_OK);
+    assert(de.first_cluster == 8);
+
+    /* the raw renderer is unchanged: flags are applied by dirent_from_raw
+     * only, never by fat_name_from_83 itself */
+    uint8_t name11[11];
+    char out[FAT_NAME_MAX];
+    memcpy(name11, "HELLO   TXT", 11);
+    assert(fat_name_from_83(name11, 0x20, out, sizeof(out)) == FAT_OK);
+    assert(strcmp(out, "HELLO.TXT") == 0);
+
+    fat_close(ctx);
 }
 
 static void test_lookup(void)
@@ -1631,15 +1689,17 @@ static void count_root16(const fat_dirent_t* entry, const uint8_t* raw32,
             counts->saw_label = 1;
         return;
     }
-    if (strcmp(entry->name, "HELLO.TXT") == 0) {
+    /* Lead adjudication (§28.3, phase 10): NTRes-flagged 8.3 names now
+     * render in lowercase */
+    if (strcmp(entry->name, "hello.txt") == 0) {
         counts->saw_hello = 1;
         assert(entry->first_cluster == 2);
         assert(entry->file_size == 12);
-    } else if (strcmp(entry->name, "TEST_5KB.TXT") == 0) {
+    } else if (strcmp(entry->name, "test_5kb.txt") == 0) {
         counts->saw_5kb = 1;
         assert(entry->first_cluster == 3);
         assert(entry->file_size == 4962);
-    } else if (strcmp(entry->name, "DIR1") == 0) {
+    } else if (strcmp(entry->name, "dir1") == 0) {
         counts->saw_dir1 = 1;
         assert(entry->first_cluster == 13);
         assert(entry->attributes & 0x10);
@@ -1795,27 +1855,29 @@ static void count_root32(const fat_dirent_t* entry, const uint8_t* raw32,
             counts->saw_label = 1;
         return;
     }
-    if (strcmp(entry->name, "HELLO.TXT") == 0) {
+    /* Lead adjudication (§28.3, phase 10): NTRes-flagged 8.3 names (files
+     * 0x18, fillers 0x18, dirs 0x08) now render in lowercase */
+    if (strcmp(entry->name, "hello.txt") == 0) {
         counts->saw_hello = 1;
         assert(entry->first_cluster == 3);
         assert(entry->file_size == 12);
-    } else if (strcmp(entry->name, "TEST_5KB.TXT") == 0) {
+    } else if (strcmp(entry->name, "test_5kb.txt") == 0) {
         counts->saw_5kb = 1;
         assert(entry->first_cluster == 4);
         assert(entry->file_size == 4962);
-    } else if (strcmp(entry->name, "DIR1") == 0) {
+    } else if (strcmp(entry->name, "dir1") == 0) {
         counts->saw_dir1 = 1;
         assert(entry->first_cluster == 56);
         assert(entry->attributes & 0x10);
-    } else if (entry->name[0] == 'F' && strlen(entry->name) == 7) {
-        /* FNN.TXT filler; mtools allocated them in copy order, so the
+    } else if (entry->name[0] == 'f' && strlen(entry->name) == 7) {
+        /* fNN.txt filler; mtools allocated them in copy order, so the
          * Nth filler sits at cluster 14+N regardless of which root
          * cluster of the 2->54->55 chain its dirent landed in */
         assert(entry->name[1] >= '0' && entry->name[1] <= '9');
         assert(entry->name[2] >= '0' && entry->name[2] <= '9');
         int n = (entry->name[1] - '0') * 10 + (entry->name[2] - '0');
         assert(n <= 39);
-        assert(strcmp(entry->name + 3, ".TXT") == 0);
+        assert(strcmp(entry->name + 3, ".txt") == 0);
         assert(entry->first_cluster == 14u + (uint32_t)n);
         assert(entry->file_size == (n < 10 ? 14u : 15u));
         counts->fillers++;
@@ -6302,6 +6364,7 @@ int main(void)
     RUN(test_dir2_iterate);
     RUN(test_names);
     RUN(test_name_05_escape);
+    RUN(test_nt_rendering);
     RUN(test_lookup);
     RUN(test_lookup_root_dots);
     RUN(test_lookup_volume_label);

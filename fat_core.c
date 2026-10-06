@@ -263,11 +263,30 @@ static bool fat_is_reserved(const fat_ctx_t* ctx, uint32_t entry) {
 
 // region geometry ----------------------------------------------------------
 
+// NTRes (dirent byte 12) lowercase flags: bit3 = fold the base to lowercase,
+// bit4 = fold the extension. Creators of 8.3-reversible lowercase names
+// store the uppercase 11 bytes plus these flags; folding them back is a
+// rendering concern only (matching stays ASCII case-insensitive). Only
+// ASCII 'A'..'Z' folds -- everything else, 0x05-escaped Kanji included,
+// passes through untouched (§28.2).
+static void nt_lower_apply(uint8_t ntres, char* name) {
+    const bool lower_base = (ntres & 0x08) != 0;
+    const bool lower_ext = (ntres & 0x10) != 0;
+    bool in_ext = false;
+    for (char* p = name; *p != '\0'; p++) {
+        if (*p == '.')
+            in_ext = true; // directories/labels carry no dot: base only
+        else if (*p >= 'A' && *p <= 'Z' && (in_ext ? lower_ext : lower_base))
+            *p = (char)(*p - 'A' + 'a');
+    }
+}
+
 // fill a public fat_dirent_t from 32 raw on-disk bytes
 static void dirent_from_raw(const fat_ctx_t* ctx, const uint8_t* raw32,
                             fat_dirent_t* out) {
     const DirectoryEntry* e = (const DirectoryEntry*)raw32;
     fat_name_from_83(e->name, e->attributes, out->name, FAT_NAME_MAX);
+    nt_lower_apply(e->reserved[0], out->name);
     out->attributes = e->attributes;
     out->creation_time_tenth = e->creationTimeTenthOfSecond;
     out->creation_time = e->creationTime;

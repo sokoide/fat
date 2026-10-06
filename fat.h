@@ -43,8 +43,10 @@ const char* fat_strerror(fat_result_t r);
 
 // parsed directory entry. `name` is the long file name (LFN, rendered as
 // UTF-8) when the entry carries a checksum-valid LFN run, else the 8.3
-// rendering -- either way at most FAT_NAME_MAX bytes including the NUL
-// (an LFN whose UTF-8 form would not fit falls back to the 8.3 name).
+// rendering with the NTRes lowercase flags (byte 12: bit3 base, bit4
+// extension) folded back in -- either way at most FAT_NAME_MAX bytes
+// including the NUL (an LFN whose UTF-8 form would not fit falls back to
+// the 8.3 name).
 typedef struct {
     char name[FAT_NAME_MAX];
     uint8_t attributes;

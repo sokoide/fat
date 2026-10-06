@@ -762,3 +762,66 @@ TDD実施: リードが§20詳細設計+`fat.h`契約コメント確定 → **p7
 ### 27.3 スコープ外
 
 - `/tmp`へのイメージエクスポート（`fat_write`）実演 — mtoolsオラクル往復は§15/§19テストが既にカバー。
+
+## 28. フェーズ10（NTRes小文字フラグ描画）詳細設計（2026-10-07 起草）
+
+目標: §24.4記録の既知制限「`fat_name_from_83`はNTResを無視して大文字描画」を解消し、8.3エントリのNT小文字フラグ（NTRes=dirent byte 12）を描画へ反映する。ユーザー指示（「両方実施」の後半項）による契約変更。
+
+### 28.1 仕様と実測
+
+- NTRes: bit3 (0x08) = ベース部小文字、bit4 (0x10) = 拡張子小文字。フラグは8.3名が実際にその大小で格納されたことを示すメタデータ（Windows/mtoolsが8.3可逆の小文字名を大文字11バイト+フラグで格納する際に使用）。
+- 実測（§24.4・python解析）: 3フィクスチャともHELLO.TXT/TEST_5KB.TXT/F-fillersはNTRes=0x18、DIR1/DIR2は0x08、ラベルは0x00。
+
+### 28.2 実装方針
+
+- **適用ポイントは`dirent_from_raw`（fat_core.c）1箇所のみ**: `fat_name_from_83`呼び出し直後に`raw32[12]`（`DirectoryEntry.reserved[1]`）のフラグで描画名を小文字化。`dir_slot_feed`のLFN結合はこの後に名前を差し替えるため、LFN優先契約は不変（LFN持ちエントリはNTフラグの影響を受けない）。
+- **公開API `fat_name_from_83`は署名・挙動とも無変更**（byte12を引数に取らず、引き続き大文字描画。:339-363の単体テストが固定）。契約変更は`fat_dirent_t.name`の文面のみ（fat.hコメント更新）。
+- **小文字化はASCII 'A'..'Z'のみ**（0x05エスケープの漢字名等、非ASCIIバイトは無傷）。'.'を境にベース/拡張子を分離（ディレクトリ名・ラベルはドットなし=ベース部のみ）。
+- 照合への影響なし: `name_ci_eq`はASCII大小無視、`dir_scan_feed`のrendered比較もci、lookupのエイリアス経路（`fat_name_from_83`大文字）もci。当方の書き込みAPIは8.3名を大文字+NTRes=0で書くため新規エントリは不変。
+
+### 28.3 既存テストへの影響と裁定（契約変更に伴う意図的な期待値更新）
+
+破壊されるname期待値（すべて実ディスクのフラグどおりの正しい描画への更新。リード裁定）:
+
+1. FAT12ルート計数callback（~:150）: `"HELLO.TXT"`→`"hello.txt"`、`"TEST_5KB.TXT"`→`"test_5kb.txt"`、`"DIR1"`→`"dir1"`、`"DIR2"`→`"dir2"`。ラベル`"DEMOF12"`はNTRes=0のため不変。
+2. FAT16（~:1634）とFAT32（~:1798）の同構造callback: 同様に小文字化。
+3. FAT32のF-filler分岐（~:1810）: `entry->name[0]=='F'`→`'f'`、`strcmp(entry->name+3, ".TXT")`→`".txt"`（fillerはNTRes=0x18）。
+4. 影響なし: `fat_name_from_83`単体（:339-363）、`"."`/`".."`、書き込み系の`"NEWFILE.TXT"`（当方書き込みはフラグなし=大文字描画）、LFN名期待値、mdir差分（`upper_eq`・大小無視）、`fat_lookup`系（ci照合）。
+
+### 28.4 新規テスト
+
+- ピン止め: demof12（コミット済みフィクスチャ）のルートを`fat_dir_next`で走査し、`"hello.txt"`（小文字・NTRes=0x18の実ディスク状態）・`"dir1"`（0x08）をnameで検証、`fat_lookup("HELLO.TXT")`（大文字での照会）も`FAT_OK`で同じエントリに解決することを確認。`fat_name_from_83`単体が大文字のままのもう1つの固定点。
+
+### 28.5 検証方針
+
+- `make check`全ok（期待値更新後に120×2）・警告ゼロ、`make demo12/16/32` exit 0（ls/dump表示が小文字に変化する様子を目視）・フィクスチャ不変・`git status`クリーン。
+
+## 29. フェーズ10（NTRes小文字フラグ描画）実施結果（2026-10-07 完了）
+
+§28設計どおりリードが直接実施。変更は`fat_core.c`（`nt_lower_apply`ヘルパ+`dirent_from_raw`の1行）、`fat.h`（`fat_dirent_t.name`コメント文面）、`testmain.c`（裁定修正+新規テスト1件）の3ファイル。
+
+### 29.1 実装概要
+
+- **`nt_lower_apply(ntres, name)`**: bit3でベース部、bit4で拡張子（'.'基準）を小文字化。ASCII 'A'..'Z'のみ畳み込み（0x05エスケープ漢字等は無傷）、ディレクトリ名・ラベルはドットなし=ベース部のみが対象。
+- **適用ポイントは`dirent_from_raw`のみ**（`fat_name_from_83`直後）。LFN結合（`dir_slot_feed`→`lfn_join`）は後に名前を差し替えるためLFN優先契約は不変。`fat_name_from_83`公開APIは署名・大文字描画とも無変更。
+- 照合・書き込みへの影響なし: `name_ci_eq`（ASCII大小無視）でlookup/unlink/dir_scanは不変、当方書き込みAPIは8.3名を大文字+NTRes=0で書くため新規エントリの描画は従来どおり大文字。
+
+### 29.2 裁定修正（凍結テストの意図的期待値更新、§28.3の確定+実施）
+
+1. FAT12/FAT16/FAT32のルート計数callback（`"HELLO.TXT"`→`"hello.txt"`等、ラベル`"DEMOF12/16/32"`はNTRes=0のため不変）。
+2. FAT32のF-filler分岐（`'F'`→`'f'`、`".TXT"`→`".txt"`）。
+3. **グリーン実行で発覚の追加分**: `count_dir2`（FAT12のdir2走査、`strncmp(entry->name, "SUBDIR", 6)`→`"subdir"`）。§28.3の見立て漏れ（dir2配下33サブディレクトリも`mmd`の小文字名でNTRes=0x18/0x08格納だった。python解析で実裝確認後に修正）。
+
+### 29.3 新規テスト
+
+- `test_nt_rendering`（121件目）: demof12ルートの`fat_dir_next`走査で`"hello.txt"`（raw32[12]==0x18・size 12）・`"dir1"`（0x08）・ラベル`"DEMOF12"`（0x00で畳み込みなし）をピン止め、`fat_lookup("HELLO.TXT")`/`("Dir1")`の大文字・混在照会が同一エントリに解決すること、`fat_name_from_83`単体が大文字のままのこと（公開API固定点）を検証。
+
+### 29.4 検証結果（リード）
+
+- クリーンビルド（`rm -rf build build-san`）後`make check` = **242 ok（121×2）・警告ゼロ**（`-Wall -Wextra -Wshadow -Wstrict-prototypes`、通常+ASan/UBSan）。FNV-1aフィクスチャガード通過。
+- `make demo12/16/32` 全exit 0・stderr空。ls/dumpの描画が小文字化（`F hello.txt 12`、`F f00.txt 14`等。ラベル`V DEMOF32`は大文字のまま）を目視確認。書き込み実演セクション（LFN名のため描画影響なし）・FSInfo free数往復も不変。
+- `demof12.fat` md5 `f9d775d1…`不変・`git status`は意図した4ファイル（REVIEW.md/fat.h/fat_core.c/testmain.c）のみ。
+
+### 29.5 残課題
+
+- なし（§25のNTRes描画は本フェーズで閉鎖。残るはpushのみ=ユーザー判断）。

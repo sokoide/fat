@@ -35,7 +35,7 @@ IMG16 := demof16.fat
 VOL32 := DEMOF32
 IMG32 := demof32.fat
 
-.PHONY: default testbuild run test test-san check check-all diag fat12 fat16 fat32 clean
+.PHONY: default testbuild run demo12 demo16 demo32 demo-all test test-san check check-all diag fat12 fat16 fat32 clean
 
 default: $(OUTDIR)/$(TARGET)
 
@@ -61,6 +61,22 @@ $(OUTDIR) $(SANOUTDIR):
 
 run: $(OUTDIR)/$(TARGET)
 	$(OUTDIR)/$(TARGET)
+
+# phase 8: run the demo against each fixture type.  demof12.fat is
+# committed; demof16/demof32.fat are local (make fat16/fat32) -- the
+# targets skip with a hint when the image is absent.
+demo12: $(OUTDIR)/$(TARGET)
+	$(OUTDIR)/$(TARGET) $(IMG)
+
+demo16: $(OUTDIR)/$(TARGET)
+	@if [ -f $(IMG16) ]; then $(OUTDIR)/$(TARGET) $(IMG16); \
+	else echo "$(IMG16) not found -- generate it with 'make fat16'"; fi
+
+demo32: $(OUTDIR)/$(TARGET)
+	@if [ -f $(IMG32) ]; then $(OUTDIR)/$(TARGET) $(IMG32); \
+	else echo "$(IMG32) not found -- generate it with 'make fat32'"; fi
+
+demo-all: fat16 fat32 demo12 demo16 demo32
 
 test: $(OUTDIR)/$(TESTTARGET)
 	$(OUTDIR)/$(TESTTARGET)

@@ -632,3 +632,26 @@ TDD実施: リードが§20詳細設計+`fat.h`契約コメント確定 → **p7
 ### 22.6 分担（実装フェーズ時）
 
 - 単独ウェーブ（main.c+Makefileのみ、所有権競合なし）。リードが直接実施するか単一エージェント（p8-app）。
+
+## 23. フェーズ8（デモmain.cのFAT16/32対応）実施結果（2026-10-06）
+
+§22設計どおりリードが直接実施（単独ウェーブ）。変更は`main.c`と`Makefile`のみ。
+
+### 23.1 実装概要
+
+- **引数化**（§22.2）: `./fatdemo [image-path]`。引数なし=従来どおり`demof12.fat`。
+- **共通セクション**: FAT info（見出しにタイプ名+パス）/ BPBダンプ / FATテーブル / `* /`+`* dir1`+（タイプ別の深いパス）のエントリダンプ / `ls /`+`ls dir1`+（タイプ別）/ cat（hello・test_5kb・dir1/hoge・タイプ別page・`dir1/../hello.txt`）。
+- **存在すれば表示形式**（§22.2）: `lookup_quiet`（stderr出力なし）でpath解決→失敗時はダンプセクションは`(not present in this image)`表示、lsセクションは丸ごとスキップ。実装中に2件のバグを自己発見・修正: ①`FAT_CLUSTER_ROOT`（=0）をプレースホルダに使うとルート判定と衝突（dir1ダンプがルート内容になる）→path文字列で分岐へ、②`fat_lookup`に`"/"`の形式はなくルートセクションがnot-present化→ルートは`FAT_CLUSTER_ROOT`直接イテレートへ。
+- **タイプ固有セクション**（§22.3）: FAT12はdir1/subdir1・dir2/subdir1、FAT16/32はdir1/sub1。FAT32のみFSInfo表示（free count/next free）とルートチェーンのクラスタ単位ダンプ（`root_chain_section`: `fat_get_fat_entry`で2→54→55→EOCを追跡、異常チェーンは途中停止）。
+- **Makefile**（§22.4）: `demo12`/`demo16`/`demo32`（16/32はフィクスチャ不在時ヒント出力でスキップ）、`demo-all`=fat16 fat32生成+3連続実行。`make check`は不変。
+
+### 23.2 検証結果（リード）
+
+- `make demo12`/`demo16`/`demo32`: **全てexit 0・stderr空**。セクション構成の目視検証: FAT12=dir1/subdir1・dir2/subdir1構成、FAT16=dir1/sub1、FAT32=dir1/sub1+FSInfo（free 66454/next 59）+ルートチェーン（2→54→55→0xFFFFFFF=EOCで自然終端）+ルートlsにF-fillers40件（F00.TXT..F39.TXT、LFN名）。
+- 各ダンプセクションが**自分のディレクトリ内容**を表示することを確認（dir1=`.`/`..`/SUBDIR1/HOGE.TXT等。ルート混入バグ修正後）。
+- 回帰: `make check` **240 ok（120×2）**・警告ゼロ不変。`demof12.fat`不変（md5 `f9d775d1…`）。
+- `.PHONY`へdemo12/demo16/demo32/demo-all追加。
+
+### 23.3 スコープ外（§22.5どおり）
+
+- デモの書き込みAPI実演は別フェーズ候補（フィクスチャ保護の/tmpコピー運用設計が必要）。

@@ -577,7 +577,7 @@ TDD実施: リードが§20詳細設計+`fat.h`契約コメント確定 → **p7
 
 - 読み取り: `fat_dir_next`両モードの`dir_slot_feed`に集約 — LFNエントリ（attr 0x0F）を`LfnAcc`に蓄積し、続く8.3で`lfn_join`（降順seq+先頭0x40フラグ+全エントリchecksum一致+UTF-16LE→UTF-8（サロゲートペア対応、`FAT_NAME_MAX`超過はフォールバック））を検証、成立なら`dirent.name`を差し替え。raw32コールバックは常に8.3の32バイト。0xE5/0x00で蓄積リセット、21エントリ超過はpoisoned（malformed耐性）。
 - 照合: `name_ci_eq`（ASCII範囲大小無視）によるrendered名比較（LFN優先、エイリアス8.3も照合）を`DirScan`（lookup/unlink/rmdir/open_write/EXISTS共通）に統合。ボリュームラベル非マッチは維持。
-- 書き込み: `fat_add_dirent`入口で`'/'` `'\\'`拒否（`fat_name_to_83`がたまたま受理する"bad/name"類を封じる）。8.3可逆名は従来経路のまま。LFN経路は`utf8_to_utf16`（妥当性検査: 過長形式・サロゲート・範囲外拒否）→エイリアス`lfn_make_alias`（Windows式BASE~N、スペース除去・無効/非ASCIIは`_`、prefix 6/5/4/3、`~N`は既存live 8.3名と衝突しない最小N）→n+1連続スロット（0xE5 run追跡→0x00→チェーン延長、need=1で旧挙動と完全一致）→整合順序「LFN run（seq降順物理書き込み）→8.3」。
+- 書き込み: `fat_add_dirent`入口で`'/'` `'\\'`拒否（`fat_name_to_83`がたまたま受理する"bad/name"類を封じる）。8.3可逆名は従来経路のまま。LFN経路は`utf8_to_utf16`（妥当性検査: 過長形式・サロゲート・範囲外拒否）→エイリアス`lfn_make_alias`（Windows式BASE~N、スペース除去・無効/非ASCIIは`_`、prefix 6/5/4/3、`~N`は既存live 8.3名と衝突しない最小N）→n+1連続スロット（0xE5 run追跡→0x00→チェーン延長、need=1で旧挙動と完全一致）→整合順序「LFN run（seq降順物理書き込み）→8.3」。エイリアスの非ASCIIは**UTF-8文字単位**で1個の`_`（`lfn_alias_filter`。mtools 4.0.43実測「日本語のなまえ」7文字→`_`×7と一致）。mtoolsとの既知の良性差異2件（裁定文面「~Nを付ける」を優先）: mtoolsは元名位置で8文字消費してから詰める（"a b c d e f.txt"→mtools `ABCD~1`/当方 `ABCDEF~1`）、詰め込み後8文字に収まるなら~Nを省略する（日本語名→mtools `_______`/当方 `______~1`）。相互運用（mdir/mtypeが当方LFNを列挙・タイプ）への影響なし（書き込みオラクルテストで実証）。
 - 削除: `dir_scan_feed`がマッチ時にチェックサム一致LFN runのオフセット群を記録し、`dir_slot_delete`が「LFN群→8.3スロット→チェーン解放」の順で0xE5化（チェックサム不一致のorphanは生存）。`fat_unlink`/`fat_rmdir`共用。
 - 書き込みカーソル: `fat_file_open_write`は`DirScan`のqname照合に切替え、slot束縛（`dirent_slot_patch`）は8.3スロットのまま変更なし。
 - 実装バグ1件をp7-libが自己発見・修正: "bad/name.txt"が`fat_name_to_83`で受理される問題（上記入口拒否で解決）。

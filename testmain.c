@@ -3692,10 +3692,10 @@ static void assert_slot_only_size_cluster_changed(const uint8_t before[32],
 {
     assert(memcmp(before, after, 20) == 0);          /* name..lstAccDate */
     assert(memcmp(before + 22, after + 22, 4) == 0); /* wrtTime/wrtDate */
-    uint32_t cluster = (uint32_t)after[20] |
-                       ((uint32_t)after[21] << 8) |
-                       ((uint32_t)after[26] << 16) |
-                       ((uint32_t)after[27] << 24);
+    uint32_t cluster = ((uint32_t)after[20] << 16) |
+                       ((uint32_t)after[21] << 24) |
+                       (uint32_t)after[26] |
+                       ((uint32_t)after[27] << 8);
     uint32_t size = (uint32_t)after[28] | ((uint32_t)after[29] << 8) |
                     ((uint32_t)after[30] << 16) | ((uint32_t)after[31] << 24);
     assert(cluster == want_cluster);
@@ -4144,8 +4144,8 @@ static void test_rmdir_deleted_slots12(void)
      * leaves only "."/".." plus 0xE5 slots, and rmdir accepts that */
     assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir2/subdir1", &de) == FAT_OK);
     uint32_t d2s1 = de.first_cluster;
-    assert(fat_unlink(ctx, 11, "page.txt") == FAT_OK);
-    assert(fat_unlink(ctx, 11, "test_5kb.txt") == FAT_OK);
+    assert(fat_unlink(ctx, d2s1, "page.txt") == FAT_OK);
+    assert(fat_unlink(ctx, d2s1, "test_5kb.txt") == FAT_OK);
     assert(count_dir_entries(ctx, d2s1) == 2); /* just the dots */
     assert(fat_rmdir(ctx, 11, "subdir1") == FAT_OK);
     assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir2/subdir1", &de) ==
@@ -4177,12 +4177,18 @@ static void test_rmdir_fat32(void)
     assert(fat_fsinfo(ctx, &fi) == FAT_OK);
     assert(fi.free_cluster_count == 66454u);
 
+    /* the fixture's sub1 holds page.txt (cluster 58) -- phase 2 pins that.
+     * unlink it first, then the dots-only directory is removable */
+    assert(fat_unlink(ctx, 57, "page.txt") == FAT_OK);
+    assert(fat_fsinfo(ctx, &fi) == FAT_OK);
+    assert(fi.free_cluster_count == 66454u + 1u);
+
     assert(fat_rmdir(ctx, 56, "sub1") == FAT_OK);
     assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir1/sub1", &de) ==
            FAT_ERR_NOT_FOUND);
     assert(fat_at(ctx, 57) == 0);
     assert(fat_fsinfo(ctx, &fi) == FAT_OK);
-    assert(fi.free_cluster_count == 66454u + 1u);
+    assert(fi.free_cluster_count == 66454u + 2u);
 
     /* non-empty still refuses: dir1 itself */
     assert(fat_rmdir(ctx, FAT_CLUSTER_ROOT, "dir1") == FAT_ERR_DIR_NOT_EMPTY);

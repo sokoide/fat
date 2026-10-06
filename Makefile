@@ -23,7 +23,9 @@ TESTOUTOBJS = $(addprefix $(OUTDIR)/,$(TESTOBJS))
 SANOUTOBJS = $(addprefix $(SANOUTDIR)/,$(TESTOBJS))
 
 CC = clang
-CFLAGS = -std=c99 -Wall -Wextra -Wshadow -Wstrict-prototypes -g -I. -MMD -MP
+# _POSIX_C_SOURCE: the mtools-oracle helpers use popen/pclose, which
+# -std=c99 hides on glibc (macOS libc exposes them unconditionally)
+CFLAGS = -std=c99 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Wshadow -Wstrict-prototypes -g -I. -MMD -MP
 SANFLAGS = $(CFLAGS) -fsanitize=address,undefined
 
 VOL := DEMOF12

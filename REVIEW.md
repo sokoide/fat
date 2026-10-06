@@ -469,3 +469,26 @@ TDD実施: リードが`fat.h`のI/O abstraction契約を先行確定 → **p5-t
 - **p6-test**: testmain.c/Makefile（red確定まで。libファイル・fat.h編集禁止）。
 - **p6-lib**: fat_internal.h/fat_core.c（`fat_strerror`への`DIR_NOT_EMPTY`追加含む）。fat_dev.c/fat_dump.cは変更不要。
 - リードが統合検証（`make check`×2+デモ+フィクスチャ不変+`git status`）、§19記録、コミット。
+
+## 19. フェーズ6実施結果（2026-10-06 完了）
+
+実施形態: 前セッションで契約+RED確定済み（`ef19f2b`）のため、本セッションは**リードがp6-lib緑化を直接実施**（fat_core.cのみ編集、fat.h/fat_internal.h/fat_dev.c/fat_dump.cは変更ゼロ）し、統合検証まで完遂。実行環境はLinux（Ubuntu、clang、mtools 4.0.43）に移行したため、macOS前提だったビルドのポータビリティ修正を含む。
+
+達成（§18.1-18.3実装、fat_core.c +504行）:
+- **削除**: `fat_unlink`/`fat_rmdir`。スロット特定は`dir_scan`流用（`DirScan`に`match_offset`を追加、ボリュームラベルは非マッチ=lookup統一）。整合順序はdirent先頭バイト0xE5→`fat_free_chain`（`dir_slot_delete`共通化）。rmdirは`fat_iter_dir`で空判定（"."/".."は`fat_dot11`/`fat_dotdot11`のraw11バイト比較で除外、0xE5/0x00終端/LFNはイテレータが既にスキップ）、ファイルは`INVALID_ARG`、root（cluster 0 / `geo.root_cluster`）は`INVALID_ARG`。READ_ONLYは両APIとも`INVALID_ARG`。
+- **書き込みカーソル**: `fat_file_open_write`（direntスロットのバイトオフセットを`slot_offset`として保持、READ_ONLY/dir/label拒否）→ `fat_file_truncate`（縮小=dirent size→cut点EOC→`fat_free_chain`、`truncate(0)`=dirent(cluster 0,size 0)→全解放、拡大=部分クラスタ末尾ゼロ化→新クラスタ割当・リンク→dirent size。失敗時は追加クラスタを巻き戻し、dirent size不変）→ `fat_file_write`（上書き/追記を単一ループで処理、クラスタ境界でFAT追従、EOF+境界で`fat_alloc_cluster`、**成功/失敗ともにコミット時にdirentへプレフィックス整合を書き戻し**）。`dirent_slot_patch`は32バイトRMWでfirst-cluster/fileSizeのみ更新（タイスタンプ他はバイト不変=§18.4のスロット整合テストが直接検証）。`fat_strerror`に`DIR_NOT_EMPTY`追加。
+- **EOF-entry書き込みの実装上の要点**: `fat_file_seek`は`offset == size`で再ウォークしないため、書き込み開始時に`pos == size`なら`chain_step`でチェーン最終クラスタを特定し直す（読み取りカーソルの契約「clusterはpos<sizeの間のみ有効」の厳守）。
+
+テスト修正（RED凍結からの逸脱、いずれも**グリーン実行が一度もされていないため潜伏したテスト側バグ**。リード裁決で修正）:
+1. `test_rmdir_deleted_slots12`: `fat_unlink(ctx, 11, ...)` → `fat_unlink(ctx, d2s1, ...)`。page.txt/test_5kb.txtはdir2/subdir1（d2s1=12）にあり、dir2（11）直下には存在しない（テスト自身のコメントの意図どおり）。11のままだと`NOT_FOUND`で原理的にグリーン化不能。
+2. `assert_slot_only_size_cluster_changed`: first-clusterの組立が`(high) | (low << 16)`と高低逆。実フィクスチャでは常に失敗するヘルパーバグ → `(high << 16) | low`に修正。
+3. `test_rmdir_fat32`: 「sub1（cluster 57）は空」という前提が誤り（フェーズ2の`test_fat32_lookup_read`が`dir1/sub1/page.txt`（cluster 58）の存在をピンしているため両立不可能）→ `fat_unlink(ctx, 57, "page.txt")`で空にしてからrmdirする形に再構成、FSInfo期待値を+1/+2に更新。意図（FAT32でのクラスタ解放+FSInfo整合）は保存。
+4. `Makefile`: `-D_POSIX_C_SOURCE=200809L`をCFLAGSに追加。glibcは`-std=c99`で`popen/pclose`を非公開にする（macOSのlibcは非条件付で公開）。mtoolsオラクルヘルパーは旧来からpopenを使用しており、Linuxビルドでは旧フェーズから失敗する問題だった。
+
+検証（リード直接実施）: クリーンビルド `make check` = **91テスト×2全ok（182）、警告ゼロ**（`-Wall -Wextra -Wshadow -Wstrict-prototypes`、通常+ASan/UBSan）。デモexit=0（cat出力正常）。`demof12.fat`はコミット済みフィクスチャ（mtools 4.0.48製、md5 f9d775d1…）を復元のうえ再検証し、スイート内FNV-1aガードも通過。`demof16/demof32.fat`はgitignoreのローカル生成物としてmtools 4.0.43（Ubuntu）で再生成（ハードコードされたクラスタ番号14/15/57/58・フリー数66454等はすべて一致してグリーン=フィクスチャレシピの再現性を確認）。変更3ファイル（+519/-9）。`fat.h`・`fat_internal.h`・`fat_dev.c`・`fat_dump.c`は変更ゼロ。
+
+決定事項:
+- `dir_scan`のマッチ対象からボリュームラベルを除外（lookup/open_write/unlink/rmdirで一貫）。副効用として`fat_add_dirent`のEXISTS判定もラベル非マッチに寄る（fat.hの「a live entry with this name」解釈をlookup規則に統一。既存テストは影響なし=確認済み）。
+- `demof16/demof32.fat`は各マシンで`make fat16`/`make fat32`により再生成する運用を継続（凍結対象はコミット済みの`demof12.fat`のみ）。
+
+残課題: "r+b→rb"フォールバックの実機検証（root環境、引き継ぎ）。フェーズ3 LFNはユーザー見送り継続。デモ（`main.c`）はFAT12フィクスチャのみ。

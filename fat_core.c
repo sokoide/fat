@@ -1125,7 +1125,9 @@ fat_result_t fat_read_file(fat_ctx_t* ctx, const fat_dirent_t* file,
 
 // read cursor over one file's cluster chain; the dirent is copied at open,
 // the context is borrowed (fat_close(ctx) before fat_file_close is a
-// caller error)
+// caller error). Write cursors (fat_file_open_write) additionally bind to
+// the dirent's on-disk slot so truncate/write can patch first-cluster and
+// file-size in place.
 struct fat_file {
     fat_ctx_t* ctx;
     fat_dirent_t dirent; // copy: callers may pass stack objects
@@ -1133,6 +1135,8 @@ struct fat_file {
     uint64_t size;
     uint32_t cluster;    // cluster holding `pos` (valid while pos < size)
     uint32_t index;      // chain index of `cluster`
+    bool writable;       // false for read cursors (fat_file_open)
+    uint64_t slot_offset; // writable only: byte offset of the dirent slot
 };
 
 fat_result_t fat_file_open(fat_ctx_t* ctx, const fat_dirent_t* file,
@@ -1556,6 +1560,7 @@ fat_result_t fat_free_chain(fat_ctx_t* ctx, uint32_t head) {
 // extension links onto. Walks with the fat_dir cursor's rules and guards.
 typedef struct {
     bool exists;        // a live non-deleted entry carries this name
+    size_t match_offset; // byte offset of that entry's slot (when exists)
     bool have_deleted;  // first 0xE5 slot seen (reused as-is)
     size_t deleted_offset;
     bool have_free;     // first 0x00 slot seen (the directory ends there)
@@ -1602,8 +1607,11 @@ static fat_result_t dir_scan(fat_ctx_t* ctx, uint32_t dir_cluster,
             }
             if (head[11] == ATTR_LONG_NAME)
                 continue; // long file name fragment, not an 8.3 name
+            if (head[11] & ATTR_VOLUME_ID)
+                continue; // labels are metadata, never a name match
             if (memcmp(head, name11, 11) == 0) {
                 out->exists = true;
+                out->match_offset = (size_t)off;
                 return FAT_OK;
             }
         }
@@ -1655,8 +1663,11 @@ static fat_result_t dir_scan(fat_ctx_t* ctx, uint32_t dir_cluster,
             }
             if (head[11] == ATTR_LONG_NAME)
                 continue; // long file name fragment, not an 8.3 name
+            if (head[11] & ATTR_VOLUME_ID)
+                continue; // labels are metadata, never a name match
             if (memcmp(head, name11, 11) == 0) {
                 out->exists = true;
+                out->match_offset = (size_t)off;
                 return FAT_OK;
             }
         }
@@ -1873,6 +1884,495 @@ fat_result_t fat_write_file(fat_ctx_t* ctx, uint32_t dir_cluster,
     return FAT_OK;
 }
 
+// deletion + write cursors (phase 6) ------------------------------------------
+
+// first data cluster of a raw directory entry (the dirent_from_raw mirror
+// for the 32 on-disk bytes a scan hands out)
+static uint32_t dirent_first_cluster(const fat_ctx_t* ctx,
+                                     const uint8_t* raw32) {
+    const DirectoryEntry* e = (const DirectoryEntry*)raw32;
+    if (ctx->type == FT_FAT32)
+        return ((uint32_t)e->firstClusterHigh << 16) | e->firstClusterLow;
+    return e->firstClusterLow;
+}
+
+// zero `len` bytes at `offset`, in bounded chunks (an extension can be
+// larger than any sane stack buffer)
+static fat_result_t write_zeros(fat_ctx_t* ctx, uint64_t offset, size_t len) {
+    static const uint8_t zero[4096];
+    while (len > 0) {
+        size_t n = len > sizeof(zero) ? sizeof(zero) : len;
+        fat_result_t r = fat_io_write(ctx, offset, zero, n);
+        if (r != FAT_OK)
+            return r;
+        offset += n;
+        len -= n;
+    }
+    return FAT_OK;
+}
+
+// write `first_cluster` / `file_size` back into the cursor's directory
+// slot (read-modify-write: every other on-disk byte, timestamps included,
+// stays untouched)
+static fat_result_t dirent_slot_patch(fat_file_t* f, uint32_t first_cluster,
+                                      uint32_t file_size) {
+    uint8_t raw[32];
+    fat_result_t r = fat_io_read(f->ctx, f->slot_offset, raw, sizeof(raw));
+    if (r != FAT_OK)
+        return r;
+    if (f->ctx->type == FT_FAT32) {
+        raw[20] = (uint8_t)(first_cluster >> 16); // FirstClusterHigh
+        raw[21] = (uint8_t)(first_cluster >> 24);
+    }
+    raw[26] = (uint8_t)first_cluster; // FirstClusterLow
+    raw[27] = (uint8_t)(first_cluster >> 8);
+    wr32(raw + 28, file_size);
+    return fat_io_write(f->ctx, f->slot_offset, raw, sizeof(raw));
+}
+
+// recompute the cursor's cluster bookkeeping for `pos` (chain_step walk,
+// same guards as every other walker)
+static fat_result_t file_cursor_resync(fat_file_t* f) {
+    if (f->pos >= f->size) {
+        // EOF: reads deliver 0 without touching the cluster, and a seek
+        // re-walks anyway
+        f->cluster = f->dirent.first_cluster;
+        f->index = 0;
+        return FAT_OK;
+    }
+    uint32_t idx =
+        (uint32_t)(f->pos / fat_cluster_size(f->ctx));
+    uint32_t c;
+    fat_result_t r = chain_step(f->ctx, f->dirent.first_cluster, idx, &c);
+    if (r != FAT_OK)
+        return r;
+    f->cluster = c;
+    f->index = idx;
+    return FAT_OK;
+}
+
+// consistency order shared by unlink/rmdir: kill the entry first -- an
+// interruption may leak the chain (fsck recovers), but never leaves a live
+// dirent pointing at freed clusters
+static fat_result_t dir_slot_delete(fat_ctx_t* ctx, size_t slot_offset,
+                                    uint32_t cluster) {
+    static const uint8_t deleted = 0xE5;
+    fat_result_t r = fat_io_write(ctx, slot_offset, &deleted, 1);
+    if (r != FAT_OK)
+        return r;
+    if (cluster < 2)
+        return FAT_OK; // empty file/directory: nothing to free
+    return fat_free_chain(ctx, cluster);
+}
+
+fat_result_t fat_unlink(fat_ctx_t* ctx, uint32_t dir_cluster,
+                        const char* name) {
+    if (ctx == NULL || name == NULL)
+        return FAT_ERR_INVALID_ARG;
+    uint8_t name11[11];
+    fat_result_t r = fat_name_to_83(name, name11);
+    if (r == FAT_ERR_NAME_TOO_LONG)
+        return r;
+    if (r != FAT_OK)
+        return FAT_ERR_INVALID_ARG;
+
+    DirScan scan;
+    r = dir_scan(ctx, dir_cluster, name11, &scan);
+    if (r != FAT_OK)
+        return r;
+    if (!scan.exists)
+        return FAT_ERR_NOT_FOUND;
+
+    uint8_t raw[32];
+    r = fat_io_read(ctx, scan.match_offset, raw, sizeof(raw));
+    if (r != FAT_OK)
+        return r;
+    if (raw[11] & ATTR_DIRECTORY)
+        return FAT_ERR_INVALID_ARG; // directories go through fat_rmdir
+    if (raw[11] & ATTR_READ_ONLY)
+        return FAT_ERR_INVALID_ARG; // the DOS access-denied equivalent
+
+    return dir_slot_delete(ctx, scan.match_offset,
+                           dirent_first_cluster(ctx, raw));
+}
+
+// rmdir emptiness: "." and ".." never count (fat_iter_dir already skips
+// deleted, never-used and LFN slots)
+typedef struct {
+    bool non_dot;
+} RmdirScan;
+
+static void rmdir_cb(const fat_dirent_t* entry, const uint8_t* raw32,
+                     void* user_data) {
+    (void)entry;
+    RmdirScan* s = (RmdirScan*)user_data;
+    if (memcmp(raw32, fat_dot11, 11) == 0 ||
+        memcmp(raw32, fat_dotdot11, 11) == 0)
+        return;
+    s->non_dot = true;
+}
+
+fat_result_t fat_rmdir(fat_ctx_t* ctx, uint32_t dir_cluster,
+                       const char* name) {
+    if (ctx == NULL || name == NULL)
+        return FAT_ERR_INVALID_ARG;
+    uint8_t name11[11];
+    fat_result_t r = fat_name_to_83(name, name11);
+    if (r == FAT_ERR_NAME_TOO_LONG)
+        return r;
+    if (r != FAT_OK)
+        return FAT_ERR_INVALID_ARG; // "." / ".." are not removable names
+
+    DirScan scan;
+    r = dir_scan(ctx, dir_cluster, name11, &scan);
+    if (r != FAT_OK)
+        return r;
+    if (!scan.exists)
+        return FAT_ERR_NOT_FOUND;
+
+    uint8_t raw[32];
+    r = fat_io_read(ctx, scan.match_offset, raw, sizeof(raw));
+    if (r != FAT_OK)
+        return r;
+    if ((raw[11] & ATTR_DIRECTORY) == 0)
+        return FAT_ERR_INVALID_ARG; // a regular file goes through fat_unlink
+    if (raw[11] & ATTR_READ_ONLY)
+        return FAT_ERR_INVALID_ARG;
+    uint32_t cluster = dirent_first_cluster(ctx, raw);
+    // the root itself cannot be removed: the FAT12/16 fixed region carries
+    // no dirent (cluster 0 in a corrupt one) and the FAT32 root chain is
+    // geo.root_cluster
+    if (cluster < 2 || cluster == ctx->geo.root_cluster)
+        return FAT_ERR_INVALID_ARG;
+
+    RmdirScan rs;
+    memset(&rs, 0, sizeof(rs));
+    r = fat_iter_dir(ctx, cluster, rmdir_cb, &rs);
+    if (r != FAT_OK)
+        return r;
+    if (rs.non_dot)
+        return FAT_ERR_DIR_NOT_EMPTY;
+
+    return dir_slot_delete(ctx, scan.match_offset, cluster);
+}
+
+fat_result_t fat_file_open_write(fat_ctx_t* ctx, uint32_t dir_cluster,
+                                 const char* name, fat_file_t** out) {
+    if (ctx == NULL || name == NULL || out == NULL)
+        return FAT_ERR_INVALID_ARG;
+    *out = NULL;
+    uint8_t name11[11];
+    fat_result_t r = fat_name_to_83(name, name11);
+    if (r == FAT_ERR_NAME_TOO_LONG)
+        return r;
+    if (r != FAT_OK)
+        return FAT_ERR_INVALID_ARG;
+
+    DirScan scan;
+    r = dir_scan(ctx, dir_cluster, name11, &scan);
+    if (r != FAT_OK)
+        return r;
+    if (!scan.exists)
+        return FAT_ERR_NOT_FOUND; // creation stays with fat_write_file
+
+    uint8_t raw[32];
+    r = fat_io_read(ctx, scan.match_offset, raw, sizeof(raw));
+    if (r != FAT_OK)
+        return r;
+    // only regular files: ATTR_LONG_NAME (0x0F) carries the volume-id bit,
+    // so the mask rejects LFN entries and labels alike
+    if (raw[11] & (ATTR_DIRECTORY | ATTR_VOLUME_ID))
+        return FAT_ERR_INVALID_ARG;
+    if (raw[11] & ATTR_READ_ONLY)
+        return FAT_ERR_INVALID_ARG;
+
+    fat_file_t* f = calloc(1, sizeof(*f));
+    if (f == NULL)
+        return FAT_ERR_NOMEM;
+    f->ctx = ctx;
+    dirent_from_raw(ctx, raw, &f->dirent);
+    f->size = f->dirent.file_size;
+    f->cluster = f->dirent.first_cluster; // chain errors surface at read
+    f->writable = true;
+    f->slot_offset = scan.match_offset;
+    *out = f;
+    return FAT_OK;
+}
+
+fat_result_t fat_file_truncate(fat_file_t* f, uint64_t size) {
+    if (f == NULL || !f->writable)
+        return FAT_ERR_INVALID_ARG;
+    if (size > 0xFFFFFFFFu)
+        return FAT_ERR_INVALID_ARG; // the dirent's 32-bit fileSize caps it
+    if (size == f->size)
+        return FAT_OK; // nothing to do (pos <= size already)
+
+    fat_ctx_t* ctx = f->ctx;
+    uint32_t cluster_size = fat_cluster_size(ctx);
+    if (cluster_size == 0)
+        return FAT_ERR_INVALID_BPB;
+    uint32_t head = f->dirent.first_cluster;
+    fat_result_t r;
+
+    if (size == 0) {
+        // dirent first (size 0, first_cluster 0), then the chain: the
+        // reverse order could leave size > 0 over a freed chain
+        r = dirent_slot_patch(f, 0, 0);
+        if (r != FAT_OK)
+            return r;
+        f->dirent.first_cluster = 0;
+        f->dirent.file_size = 0;
+        f->size = 0;
+        f->pos = 0;
+        f->cluster = 0;
+        f->index = 0;
+        if (head >= 2) {
+            r = fat_free_chain(ctx, head);
+            if (r != FAT_OK)
+                return r;
+        }
+        return FAT_OK;
+    }
+
+    if (size < f->size) {
+        // shrink: the dirent size moves first so no intermediate state
+        // claims bytes of a chain that is about to be freed
+        r = dirent_slot_patch(f, head, (uint32_t)size);
+        if (r != FAT_OK)
+            return r;
+        f->dirent.file_size = (uint32_t)size;
+        f->size = size;
+        if (f->pos > size)
+            f->pos = size;
+
+        // keep ceil(size / cluster_size) clusters, cut and free the rest
+        uint32_t keep = (uint32_t)((size + cluster_size - 1) / cluster_size);
+        uint32_t last;
+        r = chain_step(ctx, head, keep - 1, &last);
+        if (r != FAT_OK)
+            return r;
+        uint32_t fat;
+        r = fat_raw_fat_entry(ctx, last, &fat);
+        if (r != FAT_OK)
+            return r;
+        if (!fat_is_eoc(ctx, fat)) {
+            if (fat < 2 || fat > ctx->geo.cluster_count + 1)
+                return FAT_ERR_BAD_CLUSTER; // free/bad/reserved mid-chain
+            r = fat_set_fat_entry(ctx, last, fat_eoc_const(ctx));
+            if (r != FAT_OK)
+                return r;
+            r = fat_free_chain(ctx, fat);
+            if (r != FAT_OK)
+                return r;
+        }
+        return file_cursor_resync(f);
+    }
+
+    // grow -----------------------------------------------------------------
+    uint64_t old = f->size;
+    // stale bytes of the last partial cluster become visible: zero them
+    // (up to the new end when the growth stays inside the cluster, up to
+    // the cluster end when new clusters follow)
+    if (old % cluster_size != 0) {
+        uint64_t old_full =
+            (old / cluster_size + 1) * cluster_size;
+        uint64_t zend = size < old_full ? size : old_full;
+        uint32_t c;
+        r = chain_step(ctx, head, (uint32_t)(old / cluster_size), &c);
+        if (r != FAT_OK)
+            return r;
+        uint64_t coff;
+        if (!cluster_offset(ctx, c, &coff))
+            return FAT_ERR_BAD_CLUSTER;
+        r = write_zeros(ctx, coff + old, (size_t)(zend - old));
+        if (r != FAT_OK)
+            return r;
+    }
+
+    uint32_t need = (uint32_t)((size + cluster_size - 1) / cluster_size);
+    uint32_t have = (uint32_t)((old + cluster_size - 1) / cluster_size);
+    uint32_t extra = need - have;
+    if (old == 0 && head >= 2) {
+        // a size-0 entry that still names a chain: the chain holds no file
+        // bytes -- release it and grow as the empty-file case
+        r = fat_free_chain(ctx, head);
+        if (r != FAT_OK)
+            return r;
+        r = dirent_slot_patch(f, 0, 0);
+        if (r != FAT_OK)
+            return r;
+        f->dirent.first_cluster = 0;
+        head = 0;
+    }
+
+    // extend by whole zeroed clusters; on any failure roll the appended
+    // part back -- the dirent size is only patched after the extension is
+    // fully in place, so the file stays at `old` bytes throughout
+    uint32_t tail = 0;    // current last cluster of the chain
+    if (head != 0) {
+        r = chain_step(ctx, head, have - 1, &tail);
+        if (r != FAT_OK)
+            return r;
+    }
+    uint32_t grown_head = 0; // first cluster allocated below
+    uint32_t prev = tail;
+    r = FAT_OK;
+    for (uint32_t i = 0; i < extra; i++) {
+        uint32_t nc;
+        r = fat_alloc_cluster(ctx, &nc);
+        if (r != FAT_OK)
+            break;
+        if (prev == 0)
+            grown_head = nc; // the chain's new head (empty file grew)
+        uint64_t coff;
+        if (!cluster_offset(ctx, nc, &coff)) {
+            fat_free_chain(ctx, nc);
+            if (grown_head == nc)
+                grown_head = 0;
+            r = FAT_ERR_INVALID_BPB;
+            break;
+        }
+        r = write_zeros(ctx, coff, cluster_size);
+        if (r != FAT_OK) {
+            fat_free_chain(ctx, nc);
+            if (grown_head == nc)
+                grown_head = 0;
+            break;
+        }
+        if (prev != 0) {
+            r = fat_set_fat_entry(ctx, prev, nc);
+            if (r != FAT_OK) {
+                fat_free_chain(ctx, nc);
+                break; // nc leaks (EOC-marked); the chain stays consistent
+            }
+        }
+        prev = nc;
+    }
+    if (r != FAT_OK) {
+        // roll back: unlink the appended part, then free it
+        if (grown_head != 0) {
+            if (tail != 0)
+                fat_set_fat_entry(ctx, tail, fat_eoc_const(ctx));
+            fat_free_chain(ctx, grown_head);
+        }
+        return r;
+    }
+
+    uint32_t new_head = head != 0 ? head : grown_head;
+    r = dirent_slot_patch(f, new_head, (uint32_t)size);
+    if (r != FAT_OK)
+        return r;
+    f->dirent.first_cluster = new_head;
+    f->dirent.file_size = (uint32_t)size;
+    f->size = size;
+    return file_cursor_resync(f);
+}
+
+fat_result_t fat_file_write(fat_file_t* f, const uint8_t* buf, size_t len,
+                            size_t* written) {
+    if (f == NULL || buf == NULL || written == NULL)
+        return FAT_ERR_INVALID_ARG;
+    *written = 0;
+    if (!f->writable)
+        return FAT_ERR_INVALID_ARG; // read cursors cannot write
+    if (len == 0)
+        return FAT_OK; // clean no-op (the fat_file_read rule)
+
+    fat_ctx_t* ctx = f->ctx;
+    uint32_t cluster_size = fat_cluster_size(ctx);
+    if (cluster_size == 0)
+        return FAT_ERR_INVALID_BPB;
+
+    uint64_t pos = f->pos;
+    uint32_t cluster = f->cluster;
+    uint32_t index = f->index;
+    size_t done = 0;
+    fat_result_t err = FAT_OK;
+
+    if (f->size > 0 && pos == f->size) {
+        // EOF entry: the cursor's cluster is only valid while pos < size
+        // (seek to EOF does not re-walk), so find the chain's last cluster
+        // the way a seek inside the file would
+        index = (uint32_t)((f->size - 1) / cluster_size);
+        err = chain_step(ctx, f->dirent.first_cluster, index, &cluster);
+        if (err != FAT_OK)
+            return err;
+    }
+
+    while (done < len) {
+        uint32_t offset_in = (uint32_t)(pos % cluster_size);
+        bool in_file = pos < f->size;
+        if (!in_file && offset_in == 0) {
+            // at EOF on a cluster boundary: a fresh cluster is needed
+            // (writes never create holes: EOF mid-cluster keeps filling
+            // the current cluster's tail first)
+            uint32_t nc;
+            err = fat_alloc_cluster(ctx, &nc);
+            if (err != FAT_OK)
+                break;
+            if (f->dirent.first_cluster == 0) {
+                f->dirent.first_cluster = nc; // the chain's new head
+                cluster = nc;
+                index = 0;
+            } else {
+                err = fat_set_fat_entry(ctx, cluster, nc);
+                if (err != FAT_OK)
+                    break; // nc leaks (EOC-marked); the file stays whole
+                cluster = nc;
+                index++;
+            }
+        }
+        uint64_t coff;
+        if (!cluster_offset(ctx, cluster, &coff)) {
+            err = FAT_ERR_BAD_CLUSTER;
+            break;
+        }
+        uint64_t n = cluster_size - offset_in;
+        if (n > len - done)
+            n = len - done;
+        err = fat_io_write(ctx, coff + offset_in, buf + done, (size_t)n);
+        if (err != FAT_OK)
+            break;
+        done += (size_t)n;
+        pos += n;
+        if (pos > f->size)
+            f->size = pos; // extension lands with its bytes
+        if (done == len)
+            break;
+        if (pos < f->size) {
+            // cluster exhausted inside the file: follow the FAT with
+            // fat_file_read's guards
+            uint32_t fat;
+            err = fat_raw_fat_entry(ctx, cluster, &fat);
+            if (err == FAT_ERR_IO)
+                break;
+            if (err != FAT_OK || fat_is_bad(ctx, fat) ||
+                fat_is_eoc(ctx, fat) || fat == 0 ||
+                fat_is_reserved(ctx, fat)) {
+                if (err == FAT_OK)
+                    err = FAT_ERR_BAD_CLUSTER;
+                break;
+            }
+            cluster = fat;
+            index++;
+        }
+        // else: pos == size -- the next iteration allocates
+    }
+
+    // commit whatever landed -- on success and failure alike (the prefix
+    // consistency contract: *written bytes, dirent size included)
+    fat_result_t pr =
+        dirent_slot_patch(f, f->dirent.first_cluster, (uint32_t)f->size);
+    f->dirent.file_size = (uint32_t)f->size;
+    f->pos = pos;
+    f->cluster = cluster;
+    f->index = index;
+    *written = done;
+    if (err != FAT_OK)
+        return err;
+    return pr;
+}
+
 // error strings ------------------------------------------------------------
 
 const char* fat_strerror(fat_result_t r) {
@@ -1907,6 +2407,8 @@ const char* fat_strerror(fat_result_t r) {
         return "directory full";
     case FAT_ERR_EXISTS:
         return "entry already exists";
+    case FAT_ERR_DIR_NOT_EMPTY:
+        return "directory not empty";
     }
     return "unknown error";
 }

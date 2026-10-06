@@ -714,3 +714,51 @@ TDD実施: リードが§20詳細設計+`fat.h`契約コメント確定 → **p7
 - NTRes小文字フラグの描画反映（教育価値は低い・契約変更なしでは非表示が正当）。
 - デモの書き込みAPI実演（§23.3繰越し）。
 - push（`43b2a7e`..HEAD、ユーザー判断）。
+
+## 26. フェーズ9（デモ書き込みAPI実演）詳細設計（2026-10-07 起草）
+
+目標: §23.3/§25繰越しの「デモの書き込みAPI実演」を実施する。変更は`main.c`のみ（Makefile・ライブラリは無変更）。
+
+### 26.1 フィクスチャ保護の設計（本フェーズの主眼）
+
+- 書き込みは**`fat_open_mem`の私的コピー**上で行う（§16.5の遵守）。デモはイメージファイルを`fread`でmallocバッファへ読み込み（slurp）、そのバッファから`fat_open_mem`で独立したctxを開く。ライブラリ書き込みは私的コピーにのみ到達し、**ディスク上の`demof*.fat`は一切不変**（fat.h契約上も保証済み）。セクション末尾に明記する。
+- 永続化（`fat_write`による/tmpエクスポート）は本フェーズでは行わない（実演の本体はAPI挙動であり、ファイル生成は/mtoolsオラクル検証が既にある§15/§19テストの役割）。
+
+### 26.2 実演シナリオ（全タイプ共通・最終セクションに追加）
+
+`*** write API demo (private in-memory copy of <path>) ***`見出しで:
+
+1. （FAT32のみ）FSInfo free_cluster_countを「作成前」に表示。
+2. `fat_write_file`でLFN名`demo write api output.txt`（26バイト本文）を作成 → 結果とエイリアス生成を`fat_lookup`の`name`/`file_size`で表示。free数「作成後」。
+3. `fat_file_open_write`→`fat_file_seek(EOF)`→`fat_file_write`で27バイト追記 → `*written`とsizeを表示。
+4. `fat_file_truncate`で元の25バイトへ縮小 → sizeを表示。
+5. 再lookup→`fat_read_file`で内容をcat（追記→縮小で元本文に戻ったことを確認）。
+6. `fat_unlink` → 再lookupで`NOT_FOUND`（「ディレクトリは元通り」）を表示、free数「削除後」。
+7. 「on-disk image was never touched」を明記。
+
+- 各APIの結果は`fat_strerror`で表示、失敗しても継続（デモのexit 0は維持）。イメージ読み込み失敗時は1行表示してスキップ（§22.2のshow-if-present流）。
+
+### 26.3 検証方針
+
+- `make demo12/16/32`全exit 0・stderr空・**書き込み実演セクションの出力目視**（作成/追記/縮小/復元の数値整合）。
+- 実行後`demof12.fat` md5不変・`git status`クリーン（保護の実証）。
+- `make check` 240 ok不変（テストハーネスはmain.cを含まない）。
+
+## 27. フェーズ9（デモ書き込みAPI実演）実施結果（2026-10-07 完了）
+
+§26設計どおりリードが直接実施（main.cのみ、単独ウェーブ）。変更は+121行（`write_api_demo`/`slurp_image`/`print_free_clusters`と`main`末尾の呼び出し1行）。Makefile・ライブラリ・テストは無変更。
+
+### 27.1 実装概要
+
+- **フィクスチャ保護の実証**: イメージを`slurp_image`でmallocバッファへ読み込み、`fat_open_mem`（私的コピー）で独立ctxを開く。書き込みはコピーにのみ到達し、実行後`demof12.fat` md5 `f9d775d1…`不変・`git status`クリーン（§16.5遵守の実機実証）。
+- **実演シナリオ**（§26.2どおり、全タイプ共通の最終セクション）: LFN名`demo write api output.txt`の`fat_write_file`（26バイト）→ lookup（LFN名+size表示）→ `fat_file_open_write`+seek(EOF)+`fat_file_write`（27バイト追記、size 26→53）→ `fat_file_truncate(26)`（size 53→26）→ 再lookup+`fat_read_file`で本文が元通りであることをcat → `fat_unlink` → lookup NOT_FOUND「directory restored」。FAT32はFSInfo free数をbefore/create後/unlink後の3点で表示。
+
+### 27.2 検証結果（リード）
+
+- `make demo12/16/32`: **全てexit 0・stderr空**。FAT32のfree数遷移 **66454 → 66453（作成）→ 66454（unlink復元）** がFSInfo整合（§12.5）の実演としても機能。
+- 回帰: `make check` **240 ok（120×2）**・警告ゼロ・`demof12.fat`不変・ツリークリーン（コミット前）。
+- 実装中の自己発見バグ: なし（読み戻しは追記/縮小を挟むためlookupのdirentコピーを使わず再lookupする設計）。
+
+### 27.3 スコープ外
+
+- `/tmp`へのイメージエクスポート（`fat_write`）実演 — mtoolsオラクル往復は§15/§19テストが既にカバー。

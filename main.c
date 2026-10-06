@@ -118,6 +118,119 @@ static void cat_file(fat_ctx_t* ctx, const char* path) {
     free(buf);
 }
 
+// ---- write-API demo (phase 9, §26) ---------------------------------------
+// Everything here runs on a private in-memory copy of the image
+// (fat_open_mem): the on-disk fixture is never touched.
+
+// read the whole image file into a malloc'd buffer, or NULL
+static uint8_t* slurp_image(const char* path, size_t* size) {
+    FILE* f = fopen(path, "rb");
+    if (f == NULL)
+        return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    long n = ftell(f);
+    if (n <= 0 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    uint8_t* buf = malloc((size_t)n);
+    if (buf == NULL || fread(buf, 1, (size_t)n, f) != (size_t)n) {
+        free(buf);
+        fclose(f);
+        return NULL;
+    }
+    fclose(f);
+    *size = (size_t)n;
+    return buf;
+}
+
+// FAT32 only: one "free clusters (tag)" line
+static void print_free_clusters(const fat_ctx_t* ctx, const char* tag) {
+    fat_fsinfo_t fi;
+    if (fat_get_type(ctx) == FT_FAT32 && fat_fsinfo(ctx, &fi) == FAT_OK)
+        printf("free clusters (%s): %u\n", tag, fi.free_cluster_count);
+}
+
+static void write_api_demo(const char* fat_path) {
+    printf("*** write API demo (private in-memory copy of %s) ***\n",
+           fat_path);
+
+    size_t size = 0;
+    uint8_t* img = slurp_image(fat_path, &size);
+    fat_ctx_t* ctx = NULL;
+    if (img == NULL || fat_open_mem(img, size, &ctx) != FAT_OK) {
+        printf("(could not open an in-memory copy)\n");
+        free(img);
+        return;
+    }
+
+    static const char demo_name[] = "demo write api output.txt";
+    static const uint8_t body[] = "created by fat_write_file\n";
+    const size_t body_len = sizeof(body) - 1;
+
+    print_free_clusters(ctx, "before");
+    fat_result_t r = fat_write_file(ctx, FAT_CLUSTER_ROOT, demo_name, body,
+                                    body_len, NULL);
+    printf("fat_write_file(\"%s\", %zu bytes): %s\n", demo_name, body_len,
+           fat_strerror(r));
+    print_free_clusters(ctx, "after create");
+
+    fat_dirent_t de;
+    if (r == FAT_OK &&
+        fat_lookup(ctx, FAT_CLUSTER_ROOT, demo_name, &de) == FAT_OK) {
+        printf("lookup: name=\"%s\" size=%u\n", de.name, de.file_size);
+
+        // append through the write cursor
+        fat_file_t* wf = NULL;
+        r = fat_file_open_write(ctx, FAT_CLUSTER_ROOT, demo_name, &wf);
+        if (r == FAT_OK) {
+            static const uint8_t add[] = "appended by fat_file_write\n";
+            size_t written = 0;
+            r = fat_file_seek(wf, fat_file_size(wf));
+            if (r == FAT_OK)
+                r = fat_file_write(wf, add, sizeof(add) - 1, &written);
+            printf("append %zu bytes: %s (size now %llu)\n", written,
+                   fat_strerror(r),
+                   (unsigned long long)fat_file_size(wf));
+
+            // shrink back to the original length
+            r = fat_file_truncate(wf, body_len);
+            printf("fat_file_truncate(%zu): %s (size now %llu)\n", body_len,
+                   fat_strerror(r),
+                   (unsigned long long)fat_file_size(wf));
+            fat_file_close(wf);
+        } else {
+            printf("fat_file_open_write: %s\n", fat_strerror(r));
+        }
+
+        // read the final state back (fresh lookup: the dirent copy above
+        // predates the append/truncate)
+        if (fat_lookup(ctx, FAT_CLUSTER_ROOT, demo_name, &de) == FAT_OK) {
+            uint8_t* buf = NULL;
+            size_t len = 0;
+            if (fat_read_file(ctx, &de, &buf, &len) == FAT_OK) {
+                printf("content after append + truncate (%zu bytes):\n",
+                       len);
+                fwrite(buf, 1, len, stdout);
+                free(buf);
+            }
+        }
+    }
+
+    r = fat_unlink(ctx, FAT_CLUSTER_ROOT, demo_name);
+    printf("fat_unlink(\"%s\"): %s\n", demo_name, fat_strerror(r));
+    if (fat_lookup(ctx, FAT_CLUSTER_ROOT, demo_name, &de) == FAT_ERR_NOT_FOUND)
+        printf("lookup after unlink: not found (directory restored)\n");
+    print_free_clusters(ctx, "after unlink");
+
+    fat_close(ctx);
+    free(img);
+    printf("(the on-disk image was never touched)\n");
+}
+
 // FAT32 only: the root directory lives in a cluster chain, not a fixed
 // region -- walk it cluster by cluster through the FAT
 static void root_chain_section(fat_ctx_t* ctx) {
@@ -224,6 +337,8 @@ int main(int argc, char** argv) {
     // '.' stays in the current directory, '..' walks back to the root
     printf("*** cat /dir1/../hello.txt ***\n");
     cat_file(ctx, "dir1/../hello.txt");
+
+    write_api_demo(fat_path);
 
     fat_close(ctx);
     return 0;

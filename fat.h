@@ -41,7 +41,10 @@ typedef enum {
 
 const char* fat_strerror(fat_result_t r);
 
-// parsed directory entry (name rendered from 8.3; LFN-ready size)
+// parsed directory entry. `name` is the long file name (LFN, rendered as
+// UTF-8) when the entry carries a checksum-valid LFN run, else the 8.3
+// rendering -- either way at most FAT_NAME_MAX bytes including the NUL
+// (an LFN whose UTF-8 form would not fit falls back to the 8.3 name).
 typedef struct {
     char name[FAT_NAME_MAX];
     uint8_t attributes;
@@ -113,8 +116,12 @@ fat_result_t fat_get_fat_entry(const fat_ctx_t* ctx, uint32_t cluster,
 // directory iteration --------------------------------------------------
 
 // Iterate `dir_cluster` (FAT_CLUSTER_ROOT for the root directory).
-// Skips deleted (0xE5) and LFN (attr 0x0F) entries; stops at the first
-// never-used (0x00) entry; guards against broken/looping chains.
+// Deleted (0xE5) and never-used (0x00) slots are skipped as before; LFN
+// (attr 0x0F) entries are joined into the long name of the 8.3 entry they
+// precede (sequence order and the 8.3-name checksum verified). An orphaned
+// or invalid LFN run is ignored and the entry falls back to its 8.3 name;
+// the callback still receives the 8.3 entry's raw 32 bytes. Guards against
+// broken/looping chains.
 fat_result_t fat_iter_dir(fat_ctx_t* ctx, uint32_t dir_cluster,
                           fat_iter_cb cb, void* user_data);
 
@@ -128,7 +135,10 @@ fat_result_t fat_iter_dir(fat_ctx_t* ctx, uint32_t dir_cluster,
 // matching DOS semantics -- the root is its own parent.
 // Intermediate components must have ATTR_DIRECTORY (0x10); the final
 // component may be a file or a directory. Volume-label entries
-// (ATTR_VOLUME_ID) never match, like DOS open().
+// (ATTR_VOLUME_ID) never match, like DOS open(). A component matches an
+// entry when it equals the entry's rendered name (LFN preferred, 8.3
+// fallback) under ASCII case-insensitive comparison -- the same rule for
+// every name-taking API below.
 //   FAT_OK               -> *out filled
 //   FAT_ERR_NOT_FOUND    -> final component missing (or is a volume label)
 //   FAT_ERR_PATH_NOT_FOUND -> intermediate missing / not a directory
@@ -182,8 +192,10 @@ fat_result_t fat_file_read(fat_file_t* f, uint8_t* buf, size_t len,
                            size_t* read);
 
 // Open the existing regular file `name` in `dir_cluster` (FAT_CLUSTER_ROOT
-// = the root directory) for reading AND writing. Unlike fat_file_open the
-// cursor is bound to the file's directory slot, so fat_file_truncate /
+// = the root directory) for reading AND writing; `name` matches by LFN or
+// 8.3 alias (ASCII case-insensitive). Unlike fat_file_open the cursor is
+// bound to the file's directory slot (the 8.3 entry -- LFN runs never
+// change first-cluster or size fields), so fat_file_truncate /
 // fat_file_write can update the entry's first-cluster and file-size fields
 // as they go. Same validation as fat_file_open (a regular file is
 // required); creation stays with fat_write_file:
@@ -221,8 +233,9 @@ void fat_file_close(fat_file_t* f);
 
 // directory cursors ---------------------------------------------------------
 
-// Opaque stepwise directory iterator. Skips deleted (0xE5) and LFN
-// (attr 0x0F) entries exactly like fat_iter_dir.
+// Opaque stepwise directory iterator. Skips deleted (0xE5) and never-used
+// (0x00) entries and joins LFN runs into long names exactly like
+// fat_iter_dir.
 typedef struct fat_dir fat_dir_t;
 
 // Open `dir_cluster` (FAT_CLUSTER_ROOT for the root) for stepwise
@@ -307,24 +320,34 @@ fat_result_t fat_free_chain(fat_ctx_t* ctx, uint32_t head);
 
 // Create `name` in `dir_cluster` (FAT_CLUSTER_ROOT = the root directory),
 // filling the new 32-byte entry from `tmpl` (attributes, timestamps,
-// first_cluster, file_size; the on-disk name comes from `name` via
-// fat_name_to_83). The first deleted (0xE5) slot is reused, else the
-// first never-used (0x00) slot, else the directory chain is extended by
-// one zeroed cluster (subdirectories and the FAT32 root only).
-//   FAT_ERR_EXISTS        -> a live entry with this name already exists
-//   FAT_ERR_NAME_TOO_LONG -> `name` is not representable in 8.3
-//   FAT_ERR_DIR_FULL      -> FAT12/16 root region has no free slot
+// first_cluster, file_size). Names representable in 8.3 (per
+// fat_name_to_83) are stored as before -- a single 8.3 slot. A longer name
+// (up to 255 UTF-8 bytes / 255 UTF-16 chars, no '/' or '\') is stored as an
+// LFN: a generated Windows-style 8.3 alias (BASE~N, collision-numbered
+// against the directory's live 8.3 names) plus the LFN entry run that
+// precedes it -- n+1 consecutive slots are consumed. Slot preference is
+// unchanged from the 8.3 case: the first run of consecutive deleted (0xE5)
+// slots that fits, else the never-used (0x00) region, else the directory
+// chain is extended by zeroed clusters (subdirectories and the FAT32 root
+// only).
+//   FAT_ERR_EXISTS        -> a live entry with this name (LFN or alias)
+//                            already exists
+//   FAT_ERR_NAME_TOO_LONG -> name exceeds the LFN limits or contains
+//                            characters LFN cannot encode
+//   FAT_ERR_DIR_FULL      -> FAT12/16 root region has no fitting slot run
 fat_result_t fat_add_dirent(fat_ctx_t* ctx, uint32_t dir_cluster,
                             const char* name, const fat_dirent_t* tmpl);
 
 // Create a new file `name` in `dir_cluster` holding `size` bytes copied
 // from `data` (data may be NULL only when size is 0). `tmpl` supplies the
 // attributes and timestamps (NULL = ATTR_ARCHIVE and zero timestamps; its
-// first_cluster/file_size fields are ignored). Crash-consistent order:
-// allocate and fill the data chain first, write the dirent last; on any
-// failure everything allocated so far is rolled back (freed) and the
-// error is returned, leaving the directory and FAT as they were.
-// An empty file gets first_cluster 0. An existing name is
+// first_cluster/file_size fields are ignored). Name storage follows
+// fat_add_dirent: 8.3 as-is, longer names as LFN + generated alias.
+// Crash-consistent order: allocate and fill the data chain first, the
+// dirent last (LFN run before the 8.3 slot); on any failure everything
+// allocated so far is rolled back (freed) and the error is returned,
+// leaving the directory and FAT as they were.
+// An empty file gets first_cluster 0. An existing name (LFN or alias) is
 // FAT_ERR_EXISTS -- replacing content is the write cursor's job
 // (fat_file_open_write + fat_file_truncate / fat_file_write).
 fat_result_t fat_write_file(fat_ctx_t* ctx, uint32_t dir_cluster,
@@ -332,11 +355,15 @@ fat_result_t fat_write_file(fat_ctx_t* ctx, uint32_t dir_cluster,
                             size_t size, const fat_dirent_t* tmpl);
 
 // Delete the regular file `name` from `dir_cluster` (FAT_CLUSTER_ROOT =
-// the root directory). Consistency order: the directory slot's first
-// byte is set to 0xE5 first, then the file's cluster chain is freed
-// (FSInfo kept in step) -- an interruption can leak clusters but never
-// leaves a live entry pointing at freed ones. An empty file
-// (first_cluster 0) just loses its entry.
+// the root directory). `name` matches by LFN or 8.3 alias (ASCII
+// case-insensitive). When the matched entry carries an LFN run, its
+// checksum-valid LFN entries are invalidated too (marked 0xE5 with the
+// 8.3 slot; orphaned LFN entries with a mismatching checksum stay as
+// they are). Consistency order: the directory slots' first bytes are set
+// to 0xE5 first, then the file's cluster chain is freed (FSInfo kept in
+// step) -- an interruption can leak clusters but never leaves a live
+// entry pointing at freed ones. An empty file (first_cluster 0) just
+// loses its entry.
 //   FAT_ERR_NOT_FOUND   -> no live entry with this name
 //   FAT_ERR_INVALID_ARG -> entry is a directory, or ATTR_READ_ONLY
 fat_result_t fat_unlink(fat_ctx_t* ctx, uint32_t dir_cluster,
@@ -345,8 +372,8 @@ fat_result_t fat_unlink(fat_ctx_t* ctx, uint32_t dir_cluster,
 // Remove the empty directory `name` from `dir_cluster`. The target must
 // be a directory holding no live entries besides "." and ".." (deleted
 // 0xE5 slots do not block removal); the root directory itself cannot be
-// removed. Same order as fat_unlink: slot marked 0xE5 first, then the
-// chain freed.
+// removed. Name matching and LFN-run invalidation follow fat_unlink.
+// Same order: slots marked 0xE5 first, then the chain freed.
 //   FAT_ERR_NOT_FOUND       -> no live entry with this name
 //   FAT_ERR_INVALID_ARG     -> entry is a regular file, is the root
 //                              directory, or ATTR_READ_ONLY

@@ -512,6 +512,324 @@ fat_result_t fat_get_fat_entry(const fat_ctx_t* ctx, uint32_t cluster,
     return FAT_OK;
 }
 
+// long file names (phase 7, §20) ---------------------------------------------
+
+#define LFN_MAX_ENTRIES 20 // 13 UTF-16 units each: 255 chars + NUL
+#define LFN_MAX_UNITS 255  // name units, terminator excluded
+
+// short-name checksum over the 11 on-disk name bytes (fatgen103)
+static uint8_t lfn_checksum11(const uint8_t name11[11]) {
+    uint8_t sum = 0;
+    for (int i = 0; i < 11; i++)
+        sum = (uint8_t)(((sum & 1u) << 7) + (sum >> 1) + name11[i]);
+    return sum;
+}
+
+// ASCII-range case-insensitive equality; bytes >= 0x80 compare exactly
+// (consistent with fat_name_to_83's to-upper convention; §20.3)
+static bool name_ci_eq(const char* a, const char* b) {
+    const unsigned char* pa = (const unsigned char*)a;
+    const unsigned char* pb = (const unsigned char*)b;
+    while (*pa != 0 && *pb != 0) {
+        unsigned char ca =
+            *pa >= 'a' && *pa <= 'z' ? (unsigned char)(*pa - 'a' + 'A') : *pa;
+        unsigned char cb =
+            *pb >= 'a' && *pb <= 'z' ? (unsigned char)(*pb - 'a' + 'A') : *pb;
+        if (ca != cb)
+            return false;
+        pa++;
+        pb++;
+    }
+    return *pa == 0 && *pb == 0;
+}
+
+// one LFN run in physical order: seq N (0x40 flag) first, down to seq 1
+// directly before the 8.3 follower. `offs` keeps each entry's byte offset
+// so deletion can invalidate the run slot by slot (§20.5).
+typedef struct {
+    uint8_t ents[LFN_MAX_ENTRIES][32];
+    size_t offs[LFN_MAX_ENTRIES];
+    uint32_t count;
+    bool poisoned; // over LFN_MAX_ENTRIES entries: joins fail until reset
+} LfnAcc;
+
+static void lfn_acc_reset(LfnAcc* acc) {
+    acc->count = 0;
+    acc->poisoned = false;
+}
+
+static void lfn_acc_push(LfnAcc* acc, const uint8_t raw[32], size_t off) {
+    if (acc->count >= LFN_MAX_ENTRIES) {
+        acc->poisoned = true; // malformed directory (§20.2)
+        return;
+    }
+    memcpy(acc->ents[acc->count], raw, sizeof(acc->ents[0]));
+    acc->offs[acc->count] = off;
+    acc->count++;
+}
+
+// UTF-16 name-unit offsets within one 32-byte LFN entry
+static const int lfn_unit_off[13] = {1,  3,  5,  7,  9,  14, 16,
+                                     18, 20, 22, 24, 28, 30};
+
+// append cp as UTF-8; false when the NUL-terminated result would not fit
+static bool utf8_put(char* out, size_t cap, size_t* o, uint32_t cp) {
+    uint8_t b[4];
+    size_t n;
+    if (cp < 0x80) {
+        b[0] = (uint8_t)cp;
+        n = 1;
+    } else if (cp < 0x800) {
+        b[0] = (uint8_t)(0xC0 | (cp >> 6));
+        b[1] = (uint8_t)(0x80 | (cp & 0x3F));
+        n = 2;
+    } else if (cp < 0x10000) {
+        b[0] = (uint8_t)(0xE0 | (cp >> 12));
+        b[1] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+        b[2] = (uint8_t)(0x80 | (cp & 0x3F));
+        n = 3;
+    } else {
+        b[0] = (uint8_t)(0xF0 | (cp >> 18));
+        b[1] = (uint8_t)(0x80 | ((cp >> 12) & 0x3F));
+        b[2] = (uint8_t)(0x80 | ((cp >> 6) & 0x3F));
+        b[3] = (uint8_t)(0x80 | (cp & 0x3F));
+        n = 4;
+    }
+    if (*o + n + 1 > cap)
+        return false; // no room for the NUL
+    memcpy(out + *o, b, n);
+    *o += n;
+    return true;
+}
+
+// validate the accumulated run against the follower's 11-byte name and
+// decode it (§20.2): descending sequence with the 0x40 flag on the physical
+// first entry, checksum match on every entry, UTF-16LE -> UTF-8 with
+// surrogate pairs. false -> the caller falls back to the 8.3 rendering.
+static bool lfn_join(const LfnAcc* acc, const uint8_t name11[11],
+                     char* out, size_t cap) {
+    if (acc->poisoned || acc->count == 0)
+        return false;
+    uint32_t n = acc->count;
+    for (uint32_t i = 0; i < n; i++) {
+        uint8_t seq = acc->ents[i][0];
+        if ((seq & 0x3Fu) != (uint8_t)(n - i))
+            return false; // sequence must descend N .. 1
+        if ((seq & 0x40u) != (i == 0 ? 0x40u : 0x00u))
+            return false; // only the physical first entry is flagged
+    }
+    uint8_t csum = lfn_checksum11(name11);
+    for (uint32_t i = 0; i < n; i++)
+        if (acc->ents[i][13] != csum)
+            return false; // orphaned / mismatched run
+
+    // flatten the units in logical order (seq 1 entry first); 0x0000 ends
+    // the name, 0xFFFF is padding
+    uint16_t us[LFN_MAX_ENTRIES * 13];
+    size_t nu = 0;
+    size_t o = 0;
+    for (uint32_t i = n; i-- > 0;) {
+        const uint8_t* ent = acc->ents[i];
+        for (int j = 0; j < 13; j++) {
+            uint16_t u = (uint16_t)(ent[lfn_unit_off[j]] |
+                                    (ent[lfn_unit_off[j] + 1] << 8));
+            if (u == 0x0000)
+                goto units_done;
+            if (u == 0xFFFF)
+                continue; // padding
+            us[nu++] = u;
+        }
+    }
+units_done:
+    for (size_t i = 0; i < nu;) {
+        uint16_t u = us[i];
+        uint32_t cp;
+        if (u >= 0xD800 && u <= 0xDBFF) {
+            if (i + 1 >= nu)
+                return false; // lone high surrogate
+            uint16_t v = us[i + 1];
+            if (v < 0xDC00 || v > 0xDFFF)
+                return false;
+            cp = 0x10000u + (((uint32_t)u - 0xD800u) << 10) +
+                 ((uint32_t)v - 0xDC00u);
+            i += 2;
+        } else if (u >= 0xDC00 && u <= 0xDFFF) {
+            return false; // lone low surrogate
+        } else {
+            cp = u;
+            i++;
+        }
+        if (!utf8_put(out, cap, &o, cp))
+            return false; // UTF-8 form does not fit: 8.3 fallback (§20.2)
+    }
+    if (o == 0)
+        return false; // empty name: not a usable LFN
+    out[o] = '\0';
+    return true;
+}
+
+// decode UTF-8 into UTF-16 units (surrogate pair for cp >= 0x10000);
+// false: invalid UTF-8 or more than LFN_MAX_UNITS units
+static bool utf8_to_utf16(const char* s, uint16_t units[LFN_MAX_UNITS],
+                          size_t* count) {
+    const unsigned char* p = (const unsigned char*)s;
+    size_t n = 0;
+    while (*p != 0) {
+        uint32_t cp;
+        int len;
+        if (*p < 0x80) {
+            cp = *p;
+            len = 1;
+        } else if ((*p & 0xE0u) == 0xC0u) {
+            cp = *p & 0x1Fu;
+            len = 2;
+        } else if ((*p & 0xF0u) == 0xE0u) {
+            cp = *p & 0x0Fu;
+            len = 3;
+        } else if ((*p & 0xF8u) == 0xF0u) {
+            cp = *p & 0x07u;
+            len = 4;
+        } else {
+            return false;
+        }
+        for (int i = 1; i < len; i++) {
+            if ((p[i] & 0xC0u) != 0x80u)
+                return false; // truncated / malformed sequence
+            cp = (cp << 6) | (p[i] & 0x3Fu);
+        }
+        // overlong forms, surrogates and out-of-range code points
+        if ((len == 2 && cp < 0x80) || (len == 3 && cp < 0x800) ||
+            (len == 4 && cp < 0x10000))
+            return false;
+        if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF))
+            return false;
+        p += len;
+        if (cp >= 0x10000u) {
+            if (n + 1 >= LFN_MAX_UNITS)
+                return false;
+            units[n++] = (uint16_t)(0xD800u + ((cp - 0x10000u) >> 10));
+            units[n++] = (uint16_t)(0xDC00u + ((cp - 0x10000u) & 0x3FFu));
+        } else {
+            if (n >= LFN_MAX_UNITS)
+                return false;
+            units[n++] = (uint16_t)cp;
+        }
+    }
+    *count = n;
+    return n > 0;
+}
+
+// LFN write-side name analysis (§20.4): 1..255 UTF-8 bytes, 1..255 UTF-16
+// units, no '/' or '\'. false -> FAT_ERR_NAME_TOO_LONG territory.
+static bool lfn_name_units(const char* name, uint16_t units[LFN_MAX_UNITS],
+                           size_t* count) {
+    size_t bytes = strlen(name);
+    if (bytes == 0 || bytes > 255)
+        return false;
+    if (strchr(name, '/') != NULL || strchr(name, '\\') != NULL)
+        return false;
+    return utf8_to_utf16(name, units, count);
+}
+
+// fill one 32-byte LFN entry: seq byte (0x40 on the logical last = physical
+// first), the 8.3 checksum, and 13 UTF-16LE units from `units` (which
+// includes the 0x0000 terminator; 0xFFFF padding past its end)
+static void lfn_fill_entry(uint8_t raw[32], uint8_t seq, uint8_t csum,
+                           const uint16_t* units, size_t n) {
+    memset(raw, 0, 32);
+    raw[0] = seq;
+    raw[11] = ATTR_LONG_NAME;
+    raw[12] = 0;              // type (always 0)
+    raw[13] = csum;
+    raw[26] = 0;              // firstClusterLow (always 0)
+    raw[27] = 0;
+    size_t base = (size_t)((seq & 0x3Fu) - 1u) * 13u;
+    for (int i = 0; i < 13; i++) {
+        uint16_t v = base + (size_t)i < n ? units[base + (size_t)i] : 0xFFFFu;
+        raw[lfn_unit_off[i]] = (uint8_t)(v & 0xFFu);
+        raw[lfn_unit_off[i] + 1] = (uint8_t)(v >> 8);
+    }
+}
+
+// the ASCII characters an alias cannot carry (§20.4): controls and the
+// invalid set -- each becomes a single '_'. Spaces and periods are not
+// substitution material (they fold away); non-ASCII is per character, in
+// the filter below
+static bool lfn_alias_bad_char(unsigned char c) {
+    if (c < 0x20)
+        return true;
+    return strchr("\"*+,;<=>?[\\]|:", c) != NULL;
+}
+
+// filter `src` (up to `len` bytes) into `dst` (capacity `cap`): spaces and
+// periods fold away, each bad ASCII character becomes '_', each non-ASCII
+// UTF-8 character becomes ONE '_' (lead ruling 2026-10-06; mtools 4.0.43
+// measured: "a long name file" -> ALONGN~1, a 7-char Japanese name -> 7
+// underscores), ASCII letters upcase. Returns the bytes written.
+static size_t lfn_alias_filter(const char* src, size_t len, char* dst,
+                               size_t cap) {
+    size_t o = 0;
+    size_t i = 0;
+    while (i < len && o < cap) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == ' ' || c == '.') {
+            i++;
+            continue;
+        }
+        if (c >= 0x80) {
+            dst[o++] = '_';
+            i++;
+            while (i < len && ((unsigned char)src[i] & 0xC0u) == 0x80u)
+                i++; // skip the rest of the UTF-8 sequence
+            continue;
+        }
+        if (lfn_alias_bad_char(c))
+            c = '_';
+        if (c >= 'a' && c <= 'z')
+            c = (unsigned char)(c - 'a' + 'A');
+        dst[o++] = (char)c;
+        i++;
+    }
+    return o;
+}
+
+// Windows-style alias BASE~N for a long name (§20.4): base prefix from the
+// name start (lfn_alias_filter, prefix shrinks as N gains digits), ~N,
+// space padding; extension from the last '.' (first 3 filtered chars, same
+// filter)
+static void lfn_make_alias(const char* name, unsigned long n,
+                           uint8_t name11[11]) {
+    int digits = 1;
+    for (unsigned long v = n; v >= 10; v /= 10)
+        digits++;
+    size_t plen = (size_t)(8 - 1 - digits);
+
+    const char* lastdot = strrchr(name, '.');
+    size_t baselen = lastdot != NULL ? (size_t)(lastdot - name) : strlen(name);
+
+    char base[8];
+    size_t o = lfn_alias_filter(name, baselen, base, plen);
+    memcpy(name11, base, o);
+    name11[o++] = '~';
+    char digs[8];
+    int nd = 0;
+    for (unsigned long v = n; v > 0; v /= 10)
+        digs[nd++] = (char)('0' + v % 10);
+    while (nd > 0)
+        name11[o++] = (uint8_t)digs[--nd];
+    while (o < 8)
+        name11[o++] = ' ';
+
+    char ext[3];
+    size_t e = 0;
+    if (lastdot != NULL)
+        e = lfn_alias_filter(lastdot + 1, strlen(lastdot + 1), ext,
+                             sizeof(ext));
+    memcpy(&name11[8], ext, e);
+    while (e < 3)
+        name11[8 + e++] = ' ';
+}
+
 // directory iteration --------------------------------------------------------
 
 // the 11-byte on-disk encodings of the dot entries
@@ -533,6 +851,7 @@ struct fat_dir {
     uint32_t visited;   // chain mode: clusters entered so far (loop cap)
     uint32_t fat_next;  // chain mode: FAT value of the current cluster
     uint64_t cluster_off; // chain mode: byte offset of the current cluster
+    LfnAcc lfn;         // LFN entries accumulated before the next 8.3 slot
     fat_dirent_t entry; // cursor-owned storage handed to the caller
     uint8_t raw[32];    // ditto; valid until the next fat_dir_next/close
 };
@@ -629,6 +948,27 @@ fat_result_t fat_dir_open(fat_ctx_t* ctx, uint32_t dir_cluster,
     return FAT_OK;
 }
 
+// feed one just-read 32-byte slot (at byte offset `off`) to the LFN
+// accumulator / entry builder; true when d->entry holds a yieldable entry
+// (the 8.3 slot -- its name replaced by the joined LFN when the run
+// validates). raw32 callbacks always receive the 8.3 bytes (§20.2).
+static bool dir_slot_feed(fat_dir_t* d, uint64_t off) {
+    if (d->raw[0] == 0xE5) {
+        lfn_acc_reset(&d->lfn); // a deleted slot breaks any run
+        return false;
+    }
+    if (d->raw[11] == ATTR_LONG_NAME) {
+        lfn_acc_push(&d->lfn, d->raw, (size_t)off);
+        return false;
+    }
+    dirent_from_raw(d->ctx, d->raw, &d->entry);
+    char lfn[FAT_NAME_MAX];
+    if (lfn_join(&d->lfn, d->raw, lfn, sizeof(lfn)))
+        memcpy(d->entry.name, lfn, strlen(lfn) + 1);
+    lfn_acc_reset(&d->lfn);
+    return true;
+}
+
 fat_result_t fat_dir_next(fat_dir_t* d, const fat_dirent_t** out,
                           const uint8_t** raw32) {
     if (d == NULL || out == NULL)
@@ -646,18 +986,16 @@ fat_result_t fat_dir_next(fat_dir_t* d, const fat_dirent_t** out,
             fat_result_t r = fat_io_read(ctx, off, d->raw, sizeof(d->raw));
             if (r != FAT_OK)
                 return r;
-            // 0x00: no more entries, 0xE5: deleted
-            if (d->raw[0] == 0x00)
+            if (d->raw[0] == 0x00) { // no more entries
+                lfn_acc_reset(&d->lfn);
                 break;
-            if (d->raw[0] == 0xE5)
-                continue;
-            if (d->raw[11] == ATTR_LONG_NAME)
-                continue; // long file name entry
-            dirent_from_raw(d->ctx, d->raw, &d->entry);
-            *out = &d->entry;
-            if (raw32 != NULL)
-                *raw32 = d->raw;
-            return FAT_OK;
+            }
+            if (dir_slot_feed(d, off)) {
+                *out = &d->entry;
+                if (raw32 != NULL)
+                    *raw32 = d->raw;
+                return FAT_OK;
+            }
         }
         d->done = true;
         return FAT_ERR_END_OF_DIR;
@@ -673,20 +1011,17 @@ fat_result_t fat_dir_next(fat_dir_t* d, const fat_dirent_t** out,
             fat_result_t r = fat_io_read(d->ctx, off, d->raw, sizeof(d->raw));
             if (r != FAT_OK)
                 return r;
-            // 0x00: no more entries, 0xE5: deleted
-            if (d->raw[0] == 0x00) {
+            if (d->raw[0] == 0x00) { // no more entries
+                lfn_acc_reset(&d->lfn);
                 end_of_dir = true;
                 break;
             }
-            if (d->raw[0] == 0xE5)
-                continue;
-            if (d->raw[11] == ATTR_LONG_NAME)
-                continue; // long file name entry
-            dirent_from_raw(d->ctx, d->raw, &d->entry);
-            *out = &d->entry;
-            if (raw32 != NULL)
-                *raw32 = d->raw;
-            return FAT_OK;
+            if (dir_slot_feed(d, off)) {
+                *out = &d->entry;
+                if (raw32 != NULL)
+                    *raw32 = d->raw;
+                return FAT_OK;
+            }
         }
         if (end_of_dir)
             break;
@@ -887,8 +1222,8 @@ fat_result_t fat_fsinfo(const fat_ctx_t* ctx, fat_fsinfo_t* out) {
 // path lookup ------------------------------------------------------------------
 
 typedef struct {
-    const uint8_t* name11; // 11-byte on-disk name to match
-    fat_dirent_t hit;      // filled on match
+    const char* name; // rendered name to match (ASCII case-insensitive)
+    fat_dirent_t hit; // filled on match
     bool found;
 } LookupArg;
 
@@ -900,17 +1235,29 @@ static void lookup_cb(const fat_dirent_t* entry, const uint8_t* raw32,
     if (raw32[11] & ATTR_VOLUME_ID)
         return;
     LookupArg* arg = (LookupArg*)user_data;
-    if (!arg->found && memcmp(arg->name11, raw32, 11) == 0) {
+    if (arg->found)
+        return;
+    // §20.3: a name matches the entry's rendered name (LFN preferred, 8.3
+    // fallback); when an LFN replaced the rendering, the 8.3 alias still
+    // names the same entry
+    if (name_ci_eq(arg->name, entry->name)) {
+        arg->found = true;
+        arg->hit = *entry;
+        return;
+    }
+    char alias[FAT_NAME_MAX];
+    if (fat_name_from_83(raw32, raw32[11], alias, sizeof(alias)) == FAT_OK &&
+        name_ci_eq(arg->name, alias)) {
         arg->found = true;
         arg->hit = *entry;
     }
 }
 
-// search one directory for the 11-byte name; false when absent
+// search one directory for the name; false when absent
 static bool lookup_in_dir(fat_ctx_t* ctx, uint32_t dir_cluster,
-                          const uint8_t name11[11], fat_dirent_t* out) {
+                          const char* name, fat_dirent_t* out) {
     LookupArg arg;
-    arg.name11 = name11;
+    arg.name = name;
     arg.found = false;
     if (fat_iter_dir(ctx, dir_cluster, lookup_cb, &arg) != FAT_OK)
         return false;
@@ -963,7 +1310,7 @@ fat_result_t fat_lookup(fat_ctx_t* ctx, uint32_t start_cluster,
                     return FAT_OK;
                 }
                 fat_dirent_t self;
-                if (!lookup_in_dir(ctx, cur, fat_dot11, &self))
+                if (!lookup_in_dir(ctx, cur, ".", &self))
                     return FAT_ERR_PATH_NOT_FOUND;
                 *out = self;
                 return FAT_OK;
@@ -984,7 +1331,7 @@ fat_result_t fat_lookup(fat_ctx_t* ctx, uint32_t start_cluster,
             }
             // resolve via the directory's own ".." entry
             fat_dirent_t dotdot;
-            if (!lookup_in_dir(ctx, cur, fat_dotdot11, &dotdot))
+            if (!lookup_in_dir(ctx, cur, "..", &dotdot))
                 return FAT_ERR_PATH_NOT_FOUND;
             uint32_t parent = dotdot.first_cluster;
             // some tools record the root as 0; FAT32 tools may also record
@@ -1001,15 +1348,10 @@ fat_result_t fat_lookup(fat_ctx_t* ctx, uint32_t start_cluster,
             continue;
         }
 
-        uint8_t name11[11];
-        fat_result_t r = fat_name_to_83(token, name11);
-        if (r == FAT_ERR_NAME_TOO_LONG)
-            return r;
-        if (r != FAT_OK)
-            return FAT_ERR_INVALID_ARG;
-
+        // §20.3: components match by rendered name (LFN preferred, 8.3
+        // fallback, ASCII case-insensitive) -- long components resolve too
         fat_dirent_t hit;
-        if (!lookup_in_dir(ctx, cur, name11, &hit)) {
+        if (!lookup_in_dir(ctx, cur, token, &hit)) {
             return last ? FAT_ERR_NOT_FOUND : FAT_ERR_PATH_NOT_FOUND;
         }
         if (last) {
@@ -1555,23 +1897,130 @@ fat_result_t fat_free_chain(fat_ctx_t* ctx, uint32_t head) {
     return fsinfo_adjust(ctx, (int64_t)freed, &head);
 }
 
-// one-pass directory scan for fat_add_dirent: the first live name
-// collision, the first reusable slot, and (chain mode) the tail cluster an
-// extension links onto. Walks with the fat_dir cursor's rules and guards.
+// one-pass LFN-aware directory scan (§20.3/§20.4): the first live name
+// collision (rendered-name matching), the first reusable slot run, the
+// 0x00 region, (chain mode) the tail cluster an extension links onto, and
+// -- on demand -- every live 8.3 name for alias collision numbering.
+// Walks with the fat_dir cursor's rules and guards.
 typedef struct {
-    bool exists;        // a live non-deleted entry carries this name
-    size_t match_offset; // byte offset of that entry's slot (when exists)
-    bool have_deleted;  // first 0xE5 slot seen (reused as-is)
-    size_t deleted_offset;
-    bool have_free;     // first 0x00 slot seen (the directory ends there)
+    // query
+    const char* qname;   // rendered name to match (NULL: no name query)
+    uint32_t need;       // consecutive slots a new entry requires (>= 1)
+    bool collect_names;  // record live 8.3 name11s (alias collisions)
+    // match results (valid when exists)
+    bool exists;
+    size_t match_offset;     // byte offset of the matched 8.3 slot
+    uint8_t match_name11[11];
+    size_t lfn_offsets[LFN_MAX_ENTRIES]; // checksum-valid run at the match
+    uint32_t lfn_count;                  // (§20.5: what unlink invalidates)
+    // allocation results
+    bool have_del_run;   // first run of consecutive 0xE5 slots that fits
+    size_t del_run_offset;
+    bool have_free;      // first 0x00 slot (the directory ends there)
     size_t free_offset;
-    bool fixed;         // FAT12/16 fixed root region: cannot extend
-    uint32_t tail;      // chain mode: last cluster of the chain
+    uint32_t free_slots; // 0x00 slots left in that cluster / region
+    bool fixed;          // FAT12/16 fixed root region: cannot extend
+    uint32_t tail;       // chain mode: last cluster of the chain
+    // alias collision set (malloc'd; free with dir_scan_cleanup)
+    uint8_t (*names)[11];
+    size_t name_count;
+    size_t name_cap;
+    // scan-internal deleted-run state
+    bool run_open;
+    size_t run_start;
+    uint32_t run_len;
 } DirScan;
 
+static void dir_scan_cleanup(DirScan* s) {
+    free(s->names);
+    s->names = NULL;
+    s->name_count = 0;
+    s->name_cap = 0;
+}
+
+// record one live 8.3 name for alias collision numbering
+static fat_result_t dir_scan_name_add(DirScan* s, const uint8_t raw[32]) {
+    if (s->name_count == s->name_cap) {
+        size_t cap = s->name_cap == 0 ? 16 : s->name_cap * 2;
+        uint8_t (*grown)[11] = realloc(s->names, cap * sizeof(*s->names));
+        if (grown == NULL)
+            return FAT_ERR_NOMEM;
+        s->names = grown;
+        s->name_cap = cap;
+    }
+    memcpy(s->names[s->name_count], raw, 11);
+    s->name_count++;
+    return FAT_OK;
+}
+
+// feed one just-read 32-byte slot at byte offset `off` into the scan;
+// `slots_left` counts this slot through the end of its cluster / region.
+// *stop: stop scanning (0x00 region reached, or the query matched).
+static fat_result_t dir_scan_feed(DirScan* s, LfnAcc* acc, const uint8_t raw[32],
+                                  size_t off, uint32_t slots_left, bool* stop) {
+    *stop = false;
+    if (raw[0] == 0x00) { // never used: the directory ends here
+        lfn_acc_reset(acc);
+        s->have_free = true;
+        s->free_offset = off;
+        s->free_slots = slots_left;
+        *stop = true;
+        return FAT_OK;
+    }
+    if (raw[0] == 0xE5) {
+        lfn_acc_reset(acc); // a deleted slot breaks any run
+        if (!s->run_open) {
+            s->run_open = true;
+            s->run_start = off;
+            s->run_len = 0;
+        }
+        s->run_len++;
+        if (!s->have_del_run && s->run_len >= s->need) {
+            s->have_del_run = true; // first fitting run wins (§20.4)
+            s->del_run_offset = s->run_start;
+        }
+        return FAT_OK;
+    }
+    // a live slot closes any deleted run
+    s->run_open = false;
+    if (raw[11] == ATTR_LONG_NAME) {
+        lfn_acc_push(acc, raw, off);
+        return FAT_OK; // long file name fragment, not an 8.3 name
+    }
+    if (s->collect_names) {
+        fat_result_t r = dir_scan_name_add(s, raw);
+        if (r != FAT_OK)
+            return r;
+    }
+    if (s->qname != NULL && !s->exists && (raw[11] & ATTR_VOLUME_ID) == 0) {
+        // labels are metadata, never a name match
+        char lfn[FAT_NAME_MAX];
+        char rendered[FAT_NAME_MAX];
+        bool has_lfn = lfn_join(acc, raw, lfn, sizeof(lfn));
+        fat_name_from_83(raw, raw[11], rendered, sizeof(rendered));
+        if (name_ci_eq(s->qname, has_lfn ? lfn : rendered) ||
+            (has_lfn && name_ci_eq(s->qname, rendered))) {
+            s->exists = true;
+            s->match_offset = off;
+            memcpy(s->match_name11, raw, 11);
+            // the checksum-valid part of the preceding run dies with this
+            // slot (§20.5); mismatching orphans stay
+            uint8_t csum = lfn_checksum11(raw);
+            for (uint32_t i = 0; i < acc->count; i++)
+                if (acc->ents[i][13] == csum)
+                    s->lfn_offsets[s->lfn_count++] = acc->offs[i];
+            *stop = true;
+            return FAT_OK;
+        }
+    }
+    lfn_acc_reset(acc);
+    return FAT_OK;
+}
+
 static fat_result_t dir_scan(fat_ctx_t* ctx, uint32_t dir_cluster,
-                             const uint8_t name11[11], DirScan* out) {
-    memset(out, 0, sizeof(*out));
+                             DirScan* out) {
+    LfnAcc acc;
+    lfn_acc_reset(&acc);
 
     if (dir_cluster == FAT_CLUSTER_ROOT && ctx->type != FT_FAT32) {
         // the FAT12/16 root directory is a fixed region, not a chain
@@ -1588,32 +2037,17 @@ static fat_result_t dir_scan(fat_ctx_t* ctx, uint32_t dir_cluster,
             return FAT_ERR_INVALID_BPB;
         for (size_t s = 0; s < slots; s++) {
             uint64_t off = offset + (uint64_t)s * sizeof(DirectoryEntry);
-            // the 12 leading bytes carry everything the scan decides on
-            uint8_t head[12];
-            fat_result_t r = fat_io_read(ctx, off, head, sizeof(head));
+            uint8_t raw[32];
+            fat_result_t r = fat_io_read(ctx, off, raw, sizeof(raw));
             if (r != FAT_OK)
                 return r;
-            if (head[0] == 0x00) { // never used: nothing beyond is live
-                out->have_free = true;
-                out->free_offset = (size_t)off;
-                break;
-            }
-            if (head[0] == 0xE5) {
-                if (!out->have_deleted) {
-                    out->have_deleted = true;
-                    out->deleted_offset = (size_t)off;
-                }
-                continue;
-            }
-            if (head[11] == ATTR_LONG_NAME)
-                continue; // long file name fragment, not an 8.3 name
-            if (head[11] & ATTR_VOLUME_ID)
-                continue; // labels are metadata, never a name match
-            if (memcmp(head, name11, 11) == 0) {
-                out->exists = true;
-                out->match_offset = (size_t)off;
+            bool stop;
+            r = dir_scan_feed(out, &acc, raw, (size_t)off,
+                              (uint32_t)(slots - s), &stop);
+            if (r != FAT_OK)
+                return r;
+            if (stop)
                 return FAT_OK;
-            }
         }
         return FAT_OK;
     }
@@ -1641,38 +2075,24 @@ static fat_result_t dir_scan(fat_ctx_t* ctx, uint32_t dir_cluster,
         return r;
     uint32_t visited = 1;
     for (;;) {
-        bool end_of_dir = false;
         for (uint32_t slot = 0; slot < entries_per_cluster; slot++) {
             uint64_t off = data_off + (uint64_t)slot * sizeof(DirectoryEntry);
-            uint8_t head[12];
-            r = fat_io_read(ctx, off, head, sizeof(head));
+            uint8_t raw[32];
+            r = fat_io_read(ctx, off, raw, sizeof(raw));
             if (r != FAT_OK)
                 return r;
-            if (head[0] == 0x00) { // never used: the directory ends here
-                out->have_free = true;
-                out->free_offset = (size_t)off;
-                end_of_dir = true;
-                break;
-            }
-            if (head[0] == 0xE5) {
-                if (!out->have_deleted) {
-                    out->have_deleted = true;
-                    out->deleted_offset = (size_t)off;
-                }
-                continue;
-            }
-            if (head[11] == ATTR_LONG_NAME)
-                continue; // long file name fragment, not an 8.3 name
-            if (head[11] & ATTR_VOLUME_ID)
-                continue; // labels are metadata, never a name match
-            if (memcmp(head, name11, 11) == 0) {
-                out->exists = true;
-                out->match_offset = (size_t)off;
+            bool stop;
+            r = dir_scan_feed(out, &acc, raw, (size_t)off,
+                              entries_per_cluster - slot, &stop);
+            if (r != FAT_OK)
+                return r;
+            if (stop) {
+                // the 0x00 region (or a match): this cluster is the link
+                // point for any chain extension
+                out->tail = cluster;
                 return FAT_OK;
             }
         }
-        if (end_of_dir)
-            break;
 
         // this cluster is exhausted: follow the chain with the cursor's
         // guards (bad/free/reserved, bounds, visited cap)
@@ -1697,28 +2117,147 @@ static fat_result_t dir_scan(fat_ctx_t* ctx, uint32_t dir_cluster,
     return FAT_OK;
 }
 
+// zero `len` bytes at `offset`, in bounded chunks (an extension can be
+// larger than any sane stack buffer)
+static fat_result_t write_zeros(fat_ctx_t* ctx, uint64_t offset, size_t len) {
+    static const uint8_t zero[4096];
+    while (len > 0) {
+        size_t n = len > sizeof(zero) ? sizeof(zero) : len;
+        fat_result_t r = fat_io_write(ctx, offset, zero, n);
+        if (r != FAT_OK)
+            return r;
+        offset += n;
+        len -= n;
+    }
+    return FAT_OK;
+}
+
+// extend a directory chain (chain mode only) with enough zeroed clusters
+// for `want_slots` entries, linked after `tail`; *first_off receives the
+// first new cluster's byte offset. Zeroed before linking so the 0x00
+// terminator semantics never break mid-crash. On failure the chain is
+// restored to its original FAT value and the grown part freed.
+static fat_result_t dir_extend_chain(fat_ctx_t* ctx, uint32_t tail,
+                                     uint32_t want_slots,
+                                     uint64_t* first_off) {
+    uint32_t epc = fat_cluster_size(ctx) / (uint32_t)sizeof(DirectoryEntry);
+    uint32_t want_clusters = ((uint64_t)want_slots + epc - 1) / epc;
+
+    uint32_t fat_orig;
+    fat_result_t r = fat_raw_fat_entry(ctx, tail, &fat_orig);
+    if (r != FAT_OK)
+        return r;
+
+    uint64_t head_off = 0;
+    uint32_t grown_head = 0;
+    uint32_t prev = tail;
+    for (uint32_t i = 0; i < want_clusters; i++) {
+        uint32_t nc;
+        r = fat_alloc_cluster(ctx, &nc);
+        if (r != FAT_OK)
+            break;
+        uint64_t cl_off;
+        if (!cluster_offset(ctx, nc, &cl_off)) {
+            fat_free_chain(ctx, nc);
+            r = FAT_ERR_INVALID_BPB;
+            break;
+        }
+        r = write_zeros(ctx, cl_off, fat_cluster_size(ctx));
+        if (r != FAT_OK) {
+            fat_free_chain(ctx, nc);
+            break;
+        }
+        r = fat_set_fat_entry(ctx, prev, nc);
+        if (r != FAT_OK) {
+            fat_free_chain(ctx, nc);
+            break; // nc leaks (EOC-marked); the chain stays consistent
+        }
+        if (i == 0) {
+            head_off = cl_off;
+            grown_head = nc;
+        }
+        prev = nc;
+    }
+    if (r != FAT_OK) {
+        if (grown_head != 0) {
+            fat_set_fat_entry(ctx, tail, fat_orig);
+            fat_free_chain(ctx, grown_head);
+        }
+        return r;
+    }
+    *first_off = head_off;
+    return FAT_OK;
+}
+
 fat_result_t fat_add_dirent(fat_ctx_t* ctx, uint32_t dir_cluster,
                             const char* name, const fat_dirent_t* tmpl) {
     if (ctx == NULL || name == NULL)
         return FAT_ERR_INVALID_ARG;
+
+    // separators are not storable in any disk name (§20.4). fat_name_to_83
+    // alone would accept e.g. "bad/name.txt" (its base happens to fit 8),
+    // so the rejection is explicit on both routing paths
+    if (strchr(name, '/') != NULL || strchr(name, '\\') != NULL)
+        return FAT_ERR_NAME_TOO_LONG;
+
+    // name routing (§20.4): 8.3-representable names stay on the pure 8.3
+    // path (one slot); longer names take the LFN path
     uint8_t name11[11];
+    uint16_t units[LFN_MAX_UNITS];
+    size_t nunits = 0;
+    uint32_t n_lfn = 0;
     fat_result_t r = fat_name_to_83(name, name11);
-    if (r == FAT_ERR_NAME_TOO_LONG)
+    if (r == FAT_ERR_NAME_TOO_LONG) {
+        if (!lfn_name_units(name, units, &nunits))
+            return FAT_ERR_NAME_TOO_LONG; // not LFN-encodable either
+        n_lfn = (uint32_t)((nunits + 1 + 12) / 13); // units + terminator
+    } else if (r != FAT_OK) {
         return r;
-    if (r != FAT_OK)
-        return FAT_ERR_INVALID_ARG;
+    }
 
     // EXISTS is decided before anything is allocated (a failed add must
     // not move the free-cluster count)
     DirScan scan;
-    r = dir_scan(ctx, dir_cluster, name11, &scan);
-    if (r != FAT_OK)
+    memset(&scan, 0, sizeof(scan));
+    scan.qname = name;
+    scan.need = n_lfn + 1;
+    scan.collect_names = n_lfn > 0; // alias collision numbering needs them
+    r = dir_scan(ctx, dir_cluster, &scan);
+    if (r != FAT_OK) {
+        dir_scan_cleanup(&scan);
         return r;
-    if (scan.exists)
+    }
+    if (scan.exists) {
+        dir_scan_cleanup(&scan);
         return FAT_ERR_EXISTS;
+    }
 
-    // the on-disk name comes from `name`; every other field from tmpl
-    // (NULL = ATTR_ARCHIVE and zero timestamps)
+    if (n_lfn > 0) {
+        // generate the Windows-style alias: the smallest ~N whose 8.3 name
+        // is free among the directory's live entries (§20.4)
+        bool have_alias = false;
+        for (unsigned long n = 1; n <= 999999ul; n++) {
+            uint8_t cand[11];
+            lfn_make_alias(name, n, cand);
+            bool collision = false;
+            for (size_t i = 0; i < scan.name_count && !collision; i++)
+                if (memcmp(scan.names[i], cand, 11) == 0)
+                    collision = true;
+            if (!collision) {
+                memcpy(name11, cand, 11);
+                have_alias = true;
+                break;
+            }
+        }
+        dir_scan_cleanup(&scan);
+        if (!have_alias)
+            return FAT_ERR_DIR_FULL; // no free alias number left
+    } else {
+        dir_scan_cleanup(&scan);
+    }
+
+    // the on-disk name comes from the analysis above; every other field
+    // from tmpl (NULL = ATTR_ARCHIVE and zero timestamps)
     fat_dirent_t def;
     if (tmpl == NULL) {
         memset(&def, 0, sizeof(def));
@@ -1742,50 +2281,49 @@ fat_result_t fat_add_dirent(fat_ctx_t* ctx, uint32_t dir_cluster,
     e.lastWriteDate = tmpl->last_write_date;
     e.fileSize = tmpl->file_size;
 
+    // slot selection (§20.4): the first 0xE5 run that fits, else the 0x00
+    // region, else (chain mode) zero-filled extension clusters
     uint64_t offset;
-    if (scan.have_deleted)
-        offset = scan.deleted_offset; // the deleted slot is reused first
-    else if (scan.have_free)
+    if (scan.have_del_run) {
+        offset = scan.del_run_offset; // reuse from the run head
+    } else if (scan.have_free && scan.free_slots >= scan.need) {
         offset = scan.free_offset;
-    else if (scan.fixed)
+    } else if (scan.fixed) {
         return FAT_ERR_DIR_FULL; // the fixed root region cannot extend
-    else {
-        // extend the chain by exactly one cluster, zeroed: the 0x00
-        // terminator must exist after the new entry
-        uint32_t nc;
-        r = fat_alloc_cluster(ctx, &nc);
+    } else {
+        // extend the chain: entries may start in the 0x00 remainder of
+        // the tail cluster and spill into the new zeroed clusters
+        uint32_t deficit =
+            scan.have_free ? scan.need - scan.free_slots : scan.need;
+        uint64_t ext_off;
+        r = dir_extend_chain(ctx, scan.tail, deficit, &ext_off);
         if (r != FAT_OK)
             return r;
-        uint64_t cl_off;
-        if (!cluster_offset(ctx, nc, &cl_off))
-            return FAT_ERR_INVALID_BPB;
-        // zero it in sector-sized chunks (a cluster can be far larger than
-        // any sane stack buffer)
-        uint8_t zero[4096];
-        memset(zero, 0, sizeof(zero));
-        uint64_t cluster_bytes = fat_cluster_size(ctx);
-        uint64_t done = 0;
-        while (done < cluster_bytes) {
-            uint64_t left = cluster_bytes - done;
-            size_t n = left > sizeof(zero) ? sizeof(zero) : (size_t)left;
-            r = fat_io_write(ctx, cl_off + done, zero, n);
-            if (r != FAT_OK) {
-                fat_free_chain(ctx, nc);
-                return r;
-            }
-            done += n;
-        }
-        r = fat_set_fat_entry(ctx, scan.tail, nc);
-        if (r != FAT_OK) {
-            fat_free_chain(ctx, nc);
-            return r;
-        }
-        offset = cl_off; // slot 0 of the new cluster
+        offset = scan.have_free ? scan.free_offset : ext_off;
     }
 
+    // crash-consistent order (§20.4): the LFN run lands before the 8.3
+    // entry, so an interruption orphans at worst -- never a live name
+    // whose run is missing
     uint8_t raw32[sizeof(DirectoryEntry)];
+    uint8_t csum = lfn_checksum11(name11);
+    uint16_t with_term[LFN_MAX_UNITS + 1];
+    if (n_lfn > 0) {
+        memcpy(with_term, units, nunits * sizeof(uint16_t));
+        with_term[nunits] = 0; // 0x0000 terminator
+        for (uint32_t i = 0; i < n_lfn; i++) {
+            uint8_t seq = (uint8_t)(n_lfn - i); // physical: highest first
+            lfn_fill_entry(raw32, (uint8_t)(seq | (i == 0 ? 0x40 : 0x00)),
+                           csum, with_term, nunits + 1);
+            r = fat_io_write(ctx, offset + (uint64_t)i * sizeof(raw32),
+                             raw32, sizeof(raw32));
+            if (r != FAT_OK)
+                return r;
+        }
+    }
     memcpy(raw32, &e, sizeof(raw32));
-    return fat_io_write(ctx, offset, raw32, sizeof(raw32));
+    return fat_io_write(ctx, offset + (uint64_t)n_lfn * sizeof(raw32),
+                        raw32, sizeof(raw32));
 }
 
 // allocate the data chain for `size` bytes and copy them in, cluster by
@@ -1843,17 +2381,30 @@ fat_result_t fat_write_file(fat_ctx_t* ctx, uint32_t dir_cluster,
     if (data == NULL && size > 0)
         return FAT_ERR_INVALID_ARG;
 
-    uint8_t name11[11];
-    fat_result_t r = fat_name_to_83(name, name11);
-    if (r == FAT_ERR_NAME_TOO_LONG)
-        return r;
-    if (r != FAT_OK)
-        return FAT_ERR_INVALID_ARG;
+    // separators are not storable in any disk name (§20.4; see
+    // fat_add_dirent -- rejected here too so nothing is allocated first)
+    if (strchr(name, '/') != NULL || strchr(name, '\\') != NULL)
+        return FAT_ERR_NAME_TOO_LONG;
 
-    // an existing name is refused before anything is allocated (a failed
-    // write must not move the free-cluster count)
+    // name routing (§20.4): reject up front what fat_add_dirent cannot
+    // store -- 8.3-representable names proceed, longer names must satisfy
+    // the LFN limits
+    uint8_t name11[11];
+    uint16_t units[LFN_MAX_UNITS];
+    size_t nunits = 0;
+    fat_result_t r = fat_name_to_83(name, name11);
+    if (r == FAT_ERR_NAME_TOO_LONG) {
+        if (!lfn_name_units(name, units, &nunits))
+            return FAT_ERR_NAME_TOO_LONG;
+    } else if (r != FAT_OK) {
+        return r;
+    }
+
+    // an existing name (LFN rendering or 8.3 alias) is refused before
+    // anything is allocated (a failed write must not move the
+    // free-cluster count)
     fat_dirent_t hit;
-    if (lookup_in_dir(ctx, dir_cluster, name11, &hit))
+    if (lookup_in_dir(ctx, dir_cluster, name, &hit))
         return FAT_ERR_EXISTS;
 
     // crash-consistent order: data chain first, dirent last
@@ -1896,21 +2447,6 @@ static uint32_t dirent_first_cluster(const fat_ctx_t* ctx,
     return e->firstClusterLow;
 }
 
-// zero `len` bytes at `offset`, in bounded chunks (an extension can be
-// larger than any sane stack buffer)
-static fat_result_t write_zeros(fat_ctx_t* ctx, uint64_t offset, size_t len) {
-    static const uint8_t zero[4096];
-    while (len > 0) {
-        size_t n = len > sizeof(zero) ? sizeof(zero) : len;
-        fat_result_t r = fat_io_write(ctx, offset, zero, n);
-        if (r != FAT_OK)
-            return r;
-        offset += n;
-        len -= n;
-    }
-    return FAT_OK;
-}
-
 // write `first_cluster` / `file_size` back into the cursor's directory
 // slot (read-modify-write: every other on-disk byte, timestamps included,
 // stays untouched)
@@ -1951,13 +2487,19 @@ static fat_result_t file_cursor_resync(fat_file_t* f) {
     return FAT_OK;
 }
 
-// consistency order shared by unlink/rmdir: kill the entry first -- an
-// interruption may leak the chain (fsck recovers), but never leaves a live
-// dirent pointing at freed clusters
-static fat_result_t dir_slot_delete(fat_ctx_t* ctx, size_t slot_offset,
+// consistency order shared by unlink/rmdir: kill the entry first -- the
+// checksum-valid LFN run, then the 8.3 slot (§20.5) -- so an interruption
+// may leak the chain (fsck recovers) but never leaves a live dirent
+// pointing at freed clusters
+static fat_result_t dir_slot_delete(fat_ctx_t* ctx, const DirScan* scan,
                                     uint32_t cluster) {
     static const uint8_t deleted = 0xE5;
-    fat_result_t r = fat_io_write(ctx, slot_offset, &deleted, 1);
+    for (uint32_t i = 0; i < scan->lfn_count; i++) {
+        fat_result_t r = fat_io_write(ctx, scan->lfn_offsets[i], &deleted, 1);
+        if (r != FAT_OK)
+            return r;
+    }
+    fat_result_t r = fat_io_write(ctx, scan->match_offset, &deleted, 1);
     if (r != FAT_OK)
         return r;
     if (cluster < 2)
@@ -1965,19 +2507,32 @@ static fat_result_t dir_slot_delete(fat_ctx_t* ctx, size_t slot_offset,
     return fat_free_chain(ctx, cluster);
 }
 
+// name-taking deletion/cursor APIs share one guard set: only disk names
+// are valid (§20.3) -- "." / ".." never resolve, empty never resolves,
+// and names beyond the LFN bounds cannot be on disk
+static fat_result_t name_query_check(const char* name) {
+    if (name == NULL)
+        return FAT_ERR_INVALID_ARG;
+    if (name[0] == '\0' || strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+        return FAT_ERR_INVALID_ARG;
+    if (strlen(name) > 255)
+        return FAT_ERR_NAME_TOO_LONG;
+    return FAT_OK;
+}
+
 fat_result_t fat_unlink(fat_ctx_t* ctx, uint32_t dir_cluster,
                         const char* name) {
-    if (ctx == NULL || name == NULL)
+    if (ctx == NULL)
         return FAT_ERR_INVALID_ARG;
-    uint8_t name11[11];
-    fat_result_t r = fat_name_to_83(name, name11);
-    if (r == FAT_ERR_NAME_TOO_LONG)
-        return r;
+    fat_result_t r = name_query_check(name);
     if (r != FAT_OK)
-        return FAT_ERR_INVALID_ARG;
+        return r;
 
     DirScan scan;
-    r = dir_scan(ctx, dir_cluster, name11, &scan);
+    memset(&scan, 0, sizeof(scan));
+    scan.qname = name;
+    scan.need = 1;
+    r = dir_scan(ctx, dir_cluster, &scan);
     if (r != FAT_OK)
         return r;
     if (!scan.exists)
@@ -1992,8 +2547,7 @@ fat_result_t fat_unlink(fat_ctx_t* ctx, uint32_t dir_cluster,
     if (raw[11] & ATTR_READ_ONLY)
         return FAT_ERR_INVALID_ARG; // the DOS access-denied equivalent
 
-    return dir_slot_delete(ctx, scan.match_offset,
-                           dirent_first_cluster(ctx, raw));
+    return dir_slot_delete(ctx, &scan, dirent_first_cluster(ctx, raw));
 }
 
 // rmdir emptiness: "." and ".." never count (fat_iter_dir already skips
@@ -2014,17 +2568,17 @@ static void rmdir_cb(const fat_dirent_t* entry, const uint8_t* raw32,
 
 fat_result_t fat_rmdir(fat_ctx_t* ctx, uint32_t dir_cluster,
                        const char* name) {
-    if (ctx == NULL || name == NULL)
+    if (ctx == NULL)
         return FAT_ERR_INVALID_ARG;
-    uint8_t name11[11];
-    fat_result_t r = fat_name_to_83(name, name11);
-    if (r == FAT_ERR_NAME_TOO_LONG)
-        return r;
+    fat_result_t r = name_query_check(name);
     if (r != FAT_OK)
-        return FAT_ERR_INVALID_ARG; // "." / ".." are not removable names
+        return r; // "." / ".." are not removable names
 
     DirScan scan;
-    r = dir_scan(ctx, dir_cluster, name11, &scan);
+    memset(&scan, 0, sizeof(scan));
+    scan.qname = name;
+    scan.need = 1;
+    r = dir_scan(ctx, dir_cluster, &scan);
     if (r != FAT_OK)
         return r;
     if (!scan.exists)
@@ -2053,23 +2607,23 @@ fat_result_t fat_rmdir(fat_ctx_t* ctx, uint32_t dir_cluster,
     if (rs.non_dot)
         return FAT_ERR_DIR_NOT_EMPTY;
 
-    return dir_slot_delete(ctx, scan.match_offset, cluster);
+    return dir_slot_delete(ctx, &scan, cluster);
 }
 
 fat_result_t fat_file_open_write(fat_ctx_t* ctx, uint32_t dir_cluster,
                                  const char* name, fat_file_t** out) {
-    if (ctx == NULL || name == NULL || out == NULL)
+    if (ctx == NULL || out == NULL)
         return FAT_ERR_INVALID_ARG;
     *out = NULL;
-    uint8_t name11[11];
-    fat_result_t r = fat_name_to_83(name, name11);
-    if (r == FAT_ERR_NAME_TOO_LONG)
-        return r;
+    fat_result_t r = name_query_check(name);
     if (r != FAT_OK)
-        return FAT_ERR_INVALID_ARG;
+        return r;
 
     DirScan scan;
-    r = dir_scan(ctx, dir_cluster, name11, &scan);
+    memset(&scan, 0, sizeof(scan));
+    scan.qname = name;
+    scan.need = 1;
+    r = dir_scan(ctx, dir_cluster, &scan);
     if (r != FAT_OK)
         return r;
     if (!scan.exists)

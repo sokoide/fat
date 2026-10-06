@@ -494,3 +494,141 @@ TDD実施: リードが`fat.h`のI/O abstraction契約を先行確定 → **p5-t
 残課題: フェーズ3 LFNはユーザー見送り継続。デモ（`main.c`）はFAT12フィクスチャのみ。
 
 追記（同日、§17.5の完遂）: "r+b→rb"フォールバックを実機検証した（非root・uid 1000）。読み取り専用コピー（chmod 444）に対し`fat_open`が成功（`fopen("r+b")`失敗→`"rb"`フォールバック）、読み取りはバイト一致、キャッシュ書き込み（unlink）は成功、`fat_sync`は`FAT_ERR_IO`、ディスク上のファイルはmd5一致でバイト不変。対照として書き込み可能コピーは`fat_sync`=`FAT_OK`。ASan/UBSan付きで実施（プローブ: `/tmp/p6dbg/p6dbg6.c`）。§17.5は本検証をもって閉鎖。
+
+## 20. フェーズ7（LFN完全対応）詳細設計（2026-10-06 追記）
+
+目標: フェーズ3として見送っていたLFN（Long File Name）を読み書き両面で完全対応する。公開契約の変更は`fat.h`の文面のみ（新API・新enumなし。`fat_dirent_t.name[FAT_NAME_MAX=256]`は当初からLFN前提サイズ）。運用はフェーズ6と同じ: リードが§20設計+契約を確定 → p7-test がRED確定（テスト凍結）→ p7-lib が緑化 → リード検証。
+
+### 20.1 オンディスクLFN仕様（実装対象）
+
+- LFNエントリは属性バイト[11]=0x0F（ATTR_LONG_NAME）。32バイトのうち名前領域は UTF-16LE で3箇所: [1..10]=name1[5]、[14..25]=name2[6]、[28..31]=name3[2]（計13文字/エントリ）。byte0=シーケンス番号（1..20）、論理的に最後のエントリ（=物理的に**最初**）のみ0x40フラグ（0x41..0x5F…最大`0x40|20`）。byte12=型（0）、byte26=firstClusterLow（0）。
+- 物理順序は**逆順**: seq N（最大、0x40付き）が先頭、seq 1が8.3エントリ直前。最大20エントリ=255 UTF-16文字（260文字中5文字は8.3側とNUL終端の冗長分…正確にはLFN最大255文字+NUL）。
+- 名前の終端は0x0000、以降の同名領域は0xFFFFパディング。
+- チェックサム（byte13）: 対応する8.3名11バイトに対し`sum = ((sum & 1) << 7) + (sum >> 1) + name[i]`（mod 256、初期0）。
+
+### 20.2 読み取り（結合・検証・フォールバック）
+
+- 統合ポイントは`fat_dir_next`（fixed/chain両モード）1箇所のみ（`fat_iter_dir`はcursor thin実装、`dir_scan`は12バイトhead比較でLFN非対象）。
+- 走査中のATTR_LONG_NAMEエントリはraw32を一時バッファ（最大20個）に蓄積。8.3エントリに到達したとき:
+  1. シーケンス検証: 蓄積数N、物理先頭が`0x40|N`、以降N-1..1の降順であること。
+  2. チェックサム検証: 全LFNエントリのbyte13が8.3名11バイトのチェックサムに一致すること。
+  3. 復号: UTF-16LE→UTF-8（サロゲートペア対応。0x0000=終端、0xFFFF=パディング）。変換結果（NUL終端込み）が`FAT_NAME_MAX`（256）バイトに収まること。
+  - **全検証パス→`entry->name`にLFN**（属性・クラスタ・サイズ等は8.3エントリから、现行どおり）。**いずれか失敗→8.3名フォールバック**（オーフォン: チェックサム不一致・seq不連続・8.3 follower不在・0xE5/0x00による分断、すべて同様）。
+- 0xE5・0x00エントリで蓄積はリセット（削除済みLFN系列は無視）。蓄積上限20超（不正ディレクトリ）はフォールバック+蓄積リセット。
+- `raw32`コールバックには8.3エントリの32バイトを渡す（dumpビューの互換維持。LFNエントリ自体はコールバックに流れない=現行挙動と同一）。
+
+### 20.3 名前マッチング（lookup/unlink/rmdir/open_write/add_direntのEXISTS判定）
+
+- `fat_dirent_t.name`（LFN優先・8.3フォールバック）との比較に統一。照合は**ASCII範囲で大文字小文字無視**（8.3側が従来`fat_name_to_83`のto-upperでcase-insensitiveだったことと一貫。UTF-8マルチバイト部はバイト完全一致）。
+- `fat_lookup`のパス解決は各コンポーネントをこの規則で照合。"."/".."の特別処理は现行どおり。
+- 既存の8.3エントリのみのフィクスチャでは`fat_name_to_83`で大文字化した名前と`dirent->name`（=8.3描画・大文字）が一致するため、既存テストの照合結果は不変。
+
+### 20.4 書き込み（fat_write_file / fat_add_dirent）
+
+- 名前分流: `fat_name_to_83`が成功する名前（=8.3で可逆表現可能）は**従来経路のまま8.3のみ**（LFNなし。既存テスト互換）。`NAME_TOO_LONG`となる名前はLFN要件（長さ1..255 UTF-8バイトかつ1..255 UTF-16文字、`'/'` `'\\'`を含まない、NUL不含）を満たせばLFN経路:
+  1. **8.3エイリアス生成**（Windows流マングリング）: ベース先頭からprefixを取り、`~N`を付ける。N=1..、prefix長はNの桁に応じ6/5/4/3と縮める。拡張子は最後の`.`以降から3文字（同フィルタ）。文字フィルタは**リード裁定（2026-10-06、p7-test実測に基づく）**: スペースは**除去（詰め）**、無効文字`"*+,;<=>?[\\]|:`・制御文字・非ASCII（0x80以上）は**1文字につき1個の`_`置換**（mtools 4.0.43実測: "a long name file"→`ALONGN~1`、日本語名→`_`並び、Windows実挙動とも一致）。ディレクトリ内既存8.3名（LFNエントリを除く生存エントリ）と衝突しない最小のNを採用。
+  2. **スロット確保**: 必要`n_lfn + 1`連続枠。走査は0xE5の**連続run**を追跡（run >= needならrun先頭を採用）、0x00到達時は0x00以降から連続取得（固定ルートは残スロット数検査→`DIR_FULL`、チェーンは0x00ゼロ埋め延長=现行どおり）。need=1のときは现行の「最初の0xE5→0x00→延長」優先順位と完全一致（既存テスト互換）。
+  3. **整合順序**: データチェーン→LFNエントリ群（seq降順で物理書き込み）→8.3エントリ（最後）。失敗時の巻き戻しは§12.7どおり（確保チェーン解放。スロットは0x00領域に書いた分はそのまま残り得る=8.3エントリ不存在により全员オーフォン化、無害）。
+- UTF-8→UTF-16LE変換（書き込み側）: 1..4バイトUTF-8をデコード、4バイト分はサロゲートペア。255 UTF-16文字上限。終端0x0000+0xFFFFパディング。
+- `fat_write_file`のEXISTS判定はLFN名・エイリアス名の両方で照合（§20.3規則）。
+
+### 20.5 削除（fat_unlink / fat_rmdir）
+
+- §18.1の整合順序（スロット0xE5→チェーン解放）をLFN系列に拡張: マッチした8.3スロットに**先行する連続ATTR_LONG_NAMEエントリのうち、チェックサムが一致するもの**を同時に0xE5化（チェックサム不一致のオーフォンは生存放置=§20.2と対称）。書き込み順は「LFN群→8.3スロット→チェーン解放」。
+- `fat_file_open_write`/`fat_file_truncate`/`fat_file_write`は`slot_offset`束縛のため変更不要（名前解決のみ§20.3対応）。
+
+### 20.6 実装スコールール
+
+- fat_internal.h: LFNエントリのパック/アンパック・チェックサム・UTF-16↔UTF-8変換の内部関数プロトタイプと`fat_dir`構造体へのLFN蓄積バッファ追加（`fat_core.c`内staticでも可。エージェント裁量）。
+- fat_core.c: `fat_dir_next`（両モード）の結合、`lookup_in_dir`/`DirScan`のマッチング拡張（LFN名比較）、`fat_add_dirent`/`fat_write_file`のLFN経路、`dir_slot_delete`のLFN系列化、`fat_lookup`の照替え。stdioゼロ・警告ゼロ維持。
+- fat_dev.c / fat_dump.c / Makefile: 変更不要（予定）。
+
+### 20.7 テスト計画（p7-test）
+
+- フィクスチャは凍結のため、LFN対象は`fat_open_mem`イメージへのヘルパー直接書き込み（LFNエントリ+8.3エントリを合成）またはmtoolsオラクル（`mcopy`のLFN生成を`mdir -b`/`mtype`で比較）で用意。
+- 読み取り: 合成LFN（1/2/20エントリ、日本語・サロゲートペア含む）のname・属性・クラスタ、チェックサム不一致/seq不連続/0x40欠落/孤立LFN（0x00直前）→8.3フォールバック、0xE5分断、UTF-8 255バイト境界。
+- 照合: LFN名lookup成功（case-insensitive）、8.3エイリアス名でも同一エントリ、LFNファイルのunlink/rmdir/open_write/truncate。
+- 書き込み: LFNファイル作成→再読取でLFN名・内容一致、mtoolsオラクル（`mdir`のLFN表示・`mtype`内容一致）、エイリアス衝突で~2、ルート満杯`DIR_FULL`（need>残りスロット）、`fat_write_file`のEXISTS（LFN名・エイリアス名両方）。
+- 削除: LFNファイルunlink→LFN系列全0xE5（バイトオフセット検証）・チェーン解放、オーフョン（チェックサム不一致LFN）は0xE5化されない。
+- 既存91テストはアサーション凍結（LFN結合による`dirent->name`変化はフィクスチャにLFNが存在しないため影響ゼロ）。新規シンボルなし（リンクredは発生しない想定; 全件アサーションred想定）。
+
+### 20.8 分担
+
+- **p7-test**: testmain.c（RED確定まで。libファイル・fat.h編集禁止）。
+- **p7-lib**: fat_internal.h / fat_core.c（緑化）。
+- リードが統合検証（`make check`×2+デモ+フィクスチャ不変+`git status`）、§21記録、コミット。
+
+## 21. フェーズ7（LFN完全対応）実施結果（2026-10-06）
+
+TDD実施: リードが§20詳細設計+`fat.h`契約コメント確定 → **p7-test**が29テスト（計120）を先行記述しRED確定 → **p7-lib**が`fat_core.c`のみで緑化 → リードが統合検証・コードレビュー。
+
+### 21.1 RED確定時のリード検証（プレグリーン期待値検証）
+
+- 個別ハーネス（assert中断回避のper-test実行、`/tmp/p7red/redcheck.c`）で29テストの失敗理由を1件ずつ確認: **22 RED / 7 GREEN**（GREENは設計どおりのロック: ヘルパーmtools実測ピン止め1・フォールバック規定5・8.3非回帰1）。
+- テスト側潜伏バグ1件を発見・裁定修正（凍結逸脱記録付き）: `test_unlink_lfn_orphan_survives` — `put_lfn_run`が常に有効チェックサムを書くため「チェックサム破損orphan」の前提が不成立（実配置 `[slot5=csum有効][slot6=0x42][slot7=8.3(上書き)]`）。slot5のチェックサムを事後破損（`^= 0xFF`）+victim系列をslot6-7+8.3をslot8へ再配置。教訓（p7-testも追試で同意）: 変異注入テストは「ヘルパー出力を破損させる操作」自体を実測裏取りするまでが前提検証。
+- エイリアス生成のスペース処理を裁定確定: **スペースは除去（詰め）**、無効文字・制御文字・非ASCIIは1文字につき1個の`_`（mtools 4.0.43実測: "a long name file"→`ALONGN~1`・日本語名→`_`並び、Windows実挙動と一致）。§20.4文面更新済み。
+- 既存テスト2件の契約置換に伴う裁定修正（p7-libが実装前調査で発見・報告、リードが修正）: `test_add_dirent_errors`/`test_write_file_small`の`"toolongname.txt"`=NAME_TOO_LONG期待はフェーズ4契約（8.3超過=即エラー）の名残でLFN契約と論理的に両立不可能。エラー経路の検証意図を保持し299文字`'a'`（LFN上限255 UTF-8バイト超過）へ置換。§20.7「既存91テスト影響ゼロ」の見立て漏れだった（旧実装ではgreenのためRED検証で発覚不能）。
+- 緑化時のテスト側バグ3件（p7-libが報告、リードが検証のうえ裁定修正、いずれも裁定コメント付き）:
+  1. `test_write_file_lfn_alias_vs_existing_83`: 純8.3で作った`longna~1.txt`の`de.name`期待が小文字 — LFN runを持たないエントリは8.3描画（大文字）が契約。`"LONGNA~1.TXT"`へ修正。
+  2. `test_unlink_lfn_series12`: 「他は不変」memcmpがブート+FAT両ミラーを含む範囲を比較 — テスト自身が`fat_at(cl)==0`（チェーン解放=FAT書き換え）を要求しており原理的に両立不能。ルートスロット0..4のみの比較へ修正。
+  3. `assert_mtype_matches_read`ヘルパ: `popen`コマンドのパスがクオートなし — スペース入りLFN名でsh単語分割によりmtypeが破壊。`"%s"`クオート追加。
+
+### 21.2 実装概要（p7-lib、fat_core.c +728/-191、fat_internal.hは無変更）
+
+- 読み取り: `fat_dir_next`両モードの`dir_slot_feed`に集約 — LFNエントリ（attr 0x0F）を`LfnAcc`に蓄積し、続く8.3で`lfn_join`（降順seq+先頭0x40フラグ+全エントリchecksum一致+UTF-16LE→UTF-8（サロゲートペア対応、`FAT_NAME_MAX`超過はフォールバック））を検証、成立なら`dirent.name`を差し替え。raw32コールバックは常に8.3の32バイト。0xE5/0x00で蓄積リセット、21エントリ超過はpoisoned（malformed耐性）。
+- 照合: `name_ci_eq`（ASCII範囲大小無視）によるrendered名比較（LFN優先、エイリアス8.3も照合）を`DirScan`（lookup/unlink/rmdir/open_write/EXISTS共通）に統合。ボリュームラベル非マッチは維持。
+- 書き込み: `fat_add_dirent`入口で`'/'` `'\\'`拒否（`fat_name_to_83`がたまたま受理する"bad/name"類を封じる）。8.3可逆名は従来経路のまま。LFN経路は`utf8_to_utf16`（妥当性検査: 過長形式・サロゲート・範囲外拒否）→エイリアス`lfn_make_alias`（Windows式BASE~N、スペース除去・無効/非ASCIIは`_`、prefix 6/5/4/3、`~N`は既存live 8.3名と衝突しない最小N）→n+1連続スロット（0xE5 run追跡→0x00→チェーン延長、need=1で旧挙動と完全一致）→整合順序「LFN run（seq降順物理書き込み）→8.3」。
+- 削除: `dir_scan_feed`がマッチ時にチェックサム一致LFN runのオフセット群を記録し、`dir_slot_delete`が「LFN群→8.3スロット→チェーン解放」の順で0xE5化（チェックサム不一致のorphanは生存）。`fat_unlink`/`fat_rmdir`共用。
+- 書き込みカーソル: `fat_file_open_write`は`DirScan`のqname照合に切替え、slot束縛（`dirent_slot_patch`）は8.3スロットのまま変更なし。
+- 実装バグ1件をp7-libが自己発見・修正: "bad/name.txt"が`fat_name_to_83`で受理される問題（上記入口拒否で解決）。
+
+### 21.3 検証結果（リード）
+
+- `make check`: **120テスト×2（通常+ASan/UBSan）全ok**、コンパイラ警告ゼロ（`-Wall -Wextra -Wshadow -Wstrict-prototypes`）。
+- デモ`build/fatdemo` exit 0。`demof12.fat`不変（md5 `f9d775d1…`、`git status`クリーン、テストのFNV-1aガードも通過）。
+- 変更ファイル: `fat_core.c`（実装）・`testmain.c`（+29テスト+裁定修正5箇所）・`fat.h`（契約コメント）・`REVIEW.md`（§20-21）。`fat_internal.h`/`fat_dev.c`/`fat_dump.c`/Makefile変更ゼロ。
+- リードコードレビュー: 結合検証・照合・スロット確保・整合順序・poisoned運用・サロゲート処理を確認、指摘なし。
+
+### 21.4 残課題
+
+- なし（フェーズ7完了。デモのLFN表示は`fat_iter_dir`経由で自動的にLFN名になる）。
+
+## 22. フェーズ8（デモmain.cのFAT16/32対応）詳細設計（2026-10-06 起草、実装は次フェーズ）
+
+目標: デモ（`main.c`）がFAT12フィクスチャ固定（demof12.fat、dir1/dir2構成の固定パス）から、3タイプのフィクスチャすべてを扱えるように段階的に拡張する。ライブラリAPIは既にFAT12/16/32フル対応済みであり、変更はmain.cとMakefile（デモ実行ターゲット）のみを予定。§19残課題「デモはFAT12フィクスチャのみ」の解消。
+
+### 22.1 現状と制約
+
+- `main.c`は`fat_open("demof12.fat")`固定。ダンプ系（`fat_print_info`/`fat_print_header_dump`/`fat_print_fat`）と`fat_lookup`/`fat_read_file`はタイプ非依存に実装済み（FAT32のEBPBダンプ・ルートチェーン走査も§11で対応済み）。
+- セクション構成はFAT12フィクスチャのディレクトリ構造（dir1/dir2/subdir1、特定ファイル名）に固定。
+- 3フィクスチャの共通構造: ルートにHELLO.TXT（12B）・TEST_5KB.TXT（4962B）・DIR1、dir1配下にSUB1（FAT16/32）またはSUBDIR1/SUBDIR2（FAT12）・HOGE.TXT、sub1配下にPAGE.TXT（14B）。FAT32のみF00..F39.TXT（40ファイル）とルートチェーン3クラスタ。
+- demof16/demof32.fatはgitignore・ローカル生成（`make fat16`/`make fat32`）。不在でもデモはFAT12で動作し続ける必要がある。
+
+### 22.2 フェーズ8a: 引数化と共通セクション化（main.c）
+
+- `main(int argc, char** argv)`: `./fatdemo [image-path]`。引数なし=従来どおりdemof12.fat（後方互換）。
+- 共通セクション（全タイプで同じコードパス）: FAT info / BPBダンプ / FATダンプ / ルートiterate（dumpビュー）/ ls / / cat hello.txt / cat test_5kb.txt。
+- タイプで分岐が必要な表示は`fat_get_type()`で分岐（既存ダンプ関数は内部でタイプ対応済みのため、追加は軽微）。
+- 深いパスのセクション（dir1、dir1/sub1 等）は「存在すれば表示」形式へ: lookup失敗（FAT12にsub1が無い等）はstderr警告ではなくセクションスキップに変更。
+
+### 22.3 フェーズ8b: タイプ固有セクション（main.c）
+
+- FAT12: 従来のdir1/dir2/subdir1セクションを維持（共通化された枠組みの上で）。
+- FAT16: dir1/sub1/PAGE.txtの走査・cat。
+- FAT32: FSInfo表示（`fat_fsinfo`。free count/next free）、ルートチェーン（2→54→55）のクラスタ単位ダンプ、F-fillers（F00..F39）のls、dir1/sub1/PAGE.TXTのcat。
+- 出力の対話的な比較可能性のため、セクション見出しはタイプ名を含める（`*** FAT32: FSInfo ***` 等）。
+
+### 22.4 フェーズ8c: Makefileと実行マトリクス
+
+- `make demo12`/`demo16`/`demo32`（16/32はフィクスチャ不在時は生成を促すメッセージでスキップ）、`make demo-all`=fat16 fat32生成+3タイプ連続実行。
+- 各デモのexit=0を検証（リードの統合検証手順に組み込み）。
+- `make check`への影響なし（テストハーネスはtestmain.cで独立）。
+
+### 22.5 テスト方針
+
+- main.cはデモであり新規ユニットテストは追加しない（既存120テストがライブラリ側をカバー）。検証は3タイプ×デモexit=0と目視ダンプ（リード実施）。
+- スコープ外: デモの書き込みAPI実演（fat_write_file等）は別フェーズ候補とする（フィクスチャ保護のため/tmpコピー運用の設計が必要）。
+
+### 22.6 分担（実装フェーズ時）
+
+- 単独ウェーブ（main.c+Makefileのみ、所有権競合なし）。リードが直接実施するか単一エージェント（p8-app）。

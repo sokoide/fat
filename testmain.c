@@ -1472,7 +1472,9 @@ static void assert_mtype_matches_read(fat_ctx_t* ctx, const char* img_name,
                                       const char* path)
 {
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "mtype -i %s ::%s 2>/dev/null", img_name,
+    /* quoted: LFN paths contain spaces (lead adjudication 2026-10-06 --
+     * unquoted, sh word-splitting broke mtype on long names) */
+    snprintf(cmd, sizeof(cmd), "mtype -i \"%s\" ::\"%s\" 2>/dev/null", img_name,
              path);
     FILE* p = popen(cmd, "r");
     if (p == NULL)
@@ -2461,11 +2463,16 @@ static void test_add_dirent_errors(void)
     assert(count_dir_entries(ctx, FAT_CLUSTER_ROOT) == 5);
     fat_close(ctx);
 
-    /* NAME_TOO_LONG and NULL arguments */
+    /* NAME_TOO_LONG and NULL arguments. Lead adjudication 2026-10-06
+     * (phase 7): "toolongname.txt" is a legal LFN now, so the error path
+     * is exercised with a name past the 255-UTF-8-byte LFN limit instead */
     img = copy_image(orig, size);
     assert(fat_open_mem(img, size, &ctx) == FAT_OK);
     free(img);
-    assert(fat_add_dirent(ctx, FAT_CLUSTER_ROOT, "toolongname.txt", &tmpl) ==
+    char toolong[300];
+    memset(toolong, 'a', sizeof(toolong) - 1);
+    toolong[sizeof(toolong) - 1] = '\0';
+    assert(fat_add_dirent(ctx, FAT_CLUSTER_ROOT, toolong, &tmpl) ==
            FAT_ERR_NAME_TOO_LONG);
     assert(fat_add_dirent(NULL, FAT_CLUSTER_ROOT, "x", &tmpl) ==
            FAT_ERR_INVALID_ARG);
@@ -2635,7 +2642,12 @@ static void test_write_file_small(void)
            FAT_ERR_INVALID_ARG);
     assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, NULL, NULL, 0, NULL) ==
            FAT_ERR_INVALID_ARG);
-    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "toolongname.txt", NULL, 0,
+    /* Lead adjudication 2026-10-06 (phase 7): "toolongname.txt" is a legal
+     * LFN now; use a name past the 255-UTF-8-byte LFN limit instead */
+    char toolong[300];
+    memset(toolong, 'a', sizeof(toolong) - 1);
+    toolong[sizeof(toolong) - 1] = '\0';
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, toolong, NULL, 0,
                           NULL) == FAT_ERR_NAME_TOO_LONG);
 
     fat_close(ctx);
@@ -5052,6 +5064,1187 @@ static void test_mtools_overwrite_oracle(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* phase 7: LFN (long file names), §20                                 */
+/*                                                                     */
+/* Fixture facts probed 2026-10-06 (mtools 4.0.43 + od, /tmp/p7probe): */
+/*   - demof12 root: slots 0..4 live (label, HELLO.TXT, TEST_5KB.TXT,  */
+/*     DIR1, DIR2), slots 5..111 are 0x00                              */
+/*   - demof16 root: slots 0..3 live, slot 4.. free (offset 255*512)   */
+/*   - demof32 root chain: cluster 55 (sector 1125) holds 12 entries,  */
+/*     slots 12..15 are 0x00 (byte offset (1072+53)*512)               */
+/*   - mcopy writes "a long name file.txt" as LFN seq2+seq1 plus the   */
+/*     8.3 alias ALONGN~1 TXT (checksum 0x42); the exact slot bytes    */
+/*     are pinned in test_lfn_put_helpers_vs_mcopy below               */
+/*   - mdir -b prints the LFN (not the alias); mtype resolves both     */
+/*   - alias mangling: mtools/Windows drop spaces (a long name ->      */
+/*     ALONGN~1); tests only pin aliases of space-free ASCII names     */
+/*     where the Windows rule is unambiguous                           */
+/* ------------------------------------------------------------------ */
+
+#define F12_ROOT_OFF ((size_t)FIXTURE_ROOT_SECTOR * 512u)
+#define F16_ROOT_OFF (255u * 512u)
+#define F32_CLU55_OFF ((1072u + 53u) * 512u)
+#define LFN_MAX_UNITS 256u /* 255 chars + NUL */
+
+/* short-name checksum over the 11 on-disk name bytes (fatgen103) */
+static uint8_t lfn_checksum11(const uint8_t name11[11])
+{
+    uint8_t sum = 0;
+    for (int i = 0; i < 11; i++)
+        sum = (uint8_t)(((sum & 1u) << 7) + (sum >> 1) + name11[i]);
+    return sum;
+}
+
+/* UTF-8 -> UTF-16 code units (surrogate pair for cp >= 0x10000);
+ * returns the unit count, NUL excluded */
+static size_t utf8_to_utf16(const char* s, uint16_t out[LFN_MAX_UNITS])
+{
+    const unsigned char* p = (const unsigned char*)s;
+    size_t n = 0;
+    while (*p != 0) {
+        uint32_t cp;
+        int len;
+        if (*p < 0x80u) {
+            cp = *p;
+            len = 1;
+        } else if ((*p & 0xE0u) == 0xC0u) {
+            cp = *p & 0x1Fu;
+            len = 2;
+        } else if ((*p & 0xF0u) == 0xE0u) {
+            cp = *p & 0x0Fu;
+            len = 3;
+        } else {
+            cp = *p & 0x07u;
+            len = 4;
+        }
+        for (int i = 1; i < len; i++)
+            cp = (cp << 6) | (p[i] & 0x3Fu);
+        p += len;
+        if (cp >= 0x10000u) {
+            assert(n + 1 < LFN_MAX_UNITS);
+            out[n++] = (uint16_t)(0xD800u + ((cp - 0x10000u) >> 10));
+            out[n++] = (uint16_t)(0xDC00u + ((cp - 0x10000u) & 0x3FFu));
+        } else {
+            assert(n < LFN_MAX_UNITS);
+            out[n++] = (uint16_t)cp;
+        }
+    }
+    return n;
+}
+
+/* synthetic 8.3 slot; `name11` is an exact 11-character string */
+static void put_83_slot(uint8_t* img, size_t off, const char* name11,
+                        uint8_t attr, uint32_t cluster, uint32_t size)
+{
+    assert(strlen(name11) == 11);
+    uint8_t* e = img + off;
+    memset(e, 0, 32);
+    memcpy(e, name11, 11);
+    e[11] = attr;
+    e[26] = (uint8_t)(cluster & 0xFFu);
+    e[27] = (uint8_t)(cluster >> 8);
+    e[28] = (uint8_t)(size & 0xFFu);
+    e[29] = (uint8_t)((size >> 8) & 0xFFu);
+    e[30] = (uint8_t)((size >> 16) & 0xFFu);
+    e[31] = (uint8_t)((size >> 24) & 0xFFu);
+}
+
+/* synthetic LFN run for `utf8_name` at byte offset `off`: seq descending,
+ * 0x40 on the physical first entry, NUL terminator + 0xFFFF padding,
+ * checksum of `name11` in byte 13 of every entry. The caller places the
+ * 8.3 slot right after. Returns the number of 32-byte slots used. */
+static unsigned put_lfn_run(uint8_t* img, size_t off, const char* utf8_name,
+                            const uint8_t name11[11])
+{
+    uint16_t units[LFN_MAX_UNITS];
+    size_t n = utf8_to_utf16(utf8_name, units);
+    assert(n <= 255u);
+    units[n++] = 0; /* terminator */
+    unsigned entries = (unsigned)((n + 12u) / 13u);
+    assert(entries <= 20u);
+    uint8_t csum = lfn_checksum11(name11);
+    static const int unit_off[13] = {1,  3,  5,  7,  9,  14, 16,
+                                     18, 20, 22, 24, 28, 30};
+    for (unsigned e = 0; e < entries; e++) {
+        unsigned seq = entries - e; /* physical order: seq N first */
+        uint8_t* slot = img + off + (size_t)e * 32u;
+        memset(slot, 0, 32);
+        slot[0] = (uint8_t)(seq | (e == 0 ? 0x40u : 0u));
+        slot[11] = 0x0F;
+        slot[12] = 0;
+        slot[13] = csum;
+        size_t base = (size_t)(seq - 1u) * 13u;
+        for (int i = 0; i < 13; i++) {
+            size_t u = base + (size_t)i;
+            uint16_t v = u < n ? units[u] : 0xFFFFu;
+            slot[unit_off[i]] = (uint8_t)(v & 0xFFu);
+            slot[unit_off[i] + 1] = (uint8_t)(v >> 8);
+        }
+    }
+    return entries;
+}
+
+/* stepwise-cursor search: 1 + dirent copy when a live entry renders
+ * exactly as `name` (LFN preferred, 8.3 fallback) */
+static int dir_find(fat_ctx_t* ctx, uint32_t dir_cluster, const char* name,
+                    fat_dirent_t* out)
+{
+    fat_dir_t* d = NULL;
+    if (fat_dir_open(ctx, dir_cluster, &d) != FAT_OK)
+        return 0;
+    int found = 0;
+    while (!found) {
+        const fat_dirent_t* e = NULL;
+        fat_result_t r = fat_dir_next(d, &e, NULL);
+        assert(r == FAT_OK || r == FAT_ERR_END_OF_DIR);
+        if (r != FAT_OK)
+            break;
+        if (strcmp(e->name, name) == 0) {
+            *out = *e;
+            found = 1;
+        }
+    }
+    fat_dir_close(d);
+    return found;
+}
+
+typedef struct {
+    const char* want;
+    int found;
+} LfnNameProbe;
+
+static void lfn_probe_cb(const fat_dirent_t* entry, const uint8_t* raw32,
+                         void* user_data)
+{
+    (void)raw32;
+    LfnNameProbe* p = user_data;
+    if (strcmp(entry->name, p->want) == 0)
+        p->found = 1;
+}
+
+/* 7.0: the synthetic-entry helpers reproduce the exact bytes mtools
+ * 4.0.43 mcopy writes for "a long name file.txt" (od-probed), and the
+ * checksum formula matches the on-disk value. Locks every other LFN
+ * test to a verified ground truth. Green by design (no lib calls). */
+static void test_lfn_put_helpers_vs_mcopy(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+
+    static const char alias11[12] = "ALONGN~1TXT";
+    assert(lfn_checksum11((const uint8_t*)alias11) == 0x42);
+    assert(put_lfn_run(img, F12_ROOT_OFF + 5u * 32u, "a long name file.txt",
+                       (const uint8_t*)alias11) == 2);
+    put_83_slot(img, F12_ROOT_OFF + 7u * 32u, alias11, 0x20, 2, 12);
+
+    /* slot bytes exactly as mcopy wrote them (seq 2, padding after NUL) */
+    static const uint8_t want_seq2[32] = {
+        0x42, 0x69, 0x00, 0x6c, 0x00, 0x65, 0x00, 0x2e, 0x00, 0x74, 0x00,
+        0x0f, 0x00, 0x42, 0x78, 0x00, 0x74, 0x00, 0x00, 0x00, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff};
+    static const uint8_t want_seq1[32] = {
+        0x01, 0x61, 0x00, 0x20, 0x00, 0x6c, 0x00, 0x6f, 0x00, 0x6e, 0x00,
+        0x0f, 0x00, 0x42, 0x67, 0x00, 0x20, 0x00, 0x6e, 0x00, 0x61, 0x00,
+        0x6d, 0x00, 0x65, 0x00, 0x00, 0x00, 0x20, 0x00, 0x66, 0x00};
+    assert(memcmp(img + F12_ROOT_OFF + 5u * 32u, want_seq2, 32) == 0);
+    assert(memcmp(img + F12_ROOT_OFF + 6u * 32u, want_seq1, 32) == 0);
+
+    /* 8.3 slot: name/attr/cluster/size placed (timestamps stay zero) */
+    const uint8_t* s83 = img + F12_ROOT_OFF + 7u * 32u;
+    assert(memcmp(s83, "ALONGN~1TXT", 11) == 0);
+    assert(s83[11] == 0x20);
+    assert(s83[26] == 2 && s83[27] == 0);
+    assert(s83[28] == 12 && s83[29] == 0);
+
+    /* helper round trip: encode units, decode length matches */
+    uint16_t units[LFN_MAX_UNITS];
+    assert(utf8_to_utf16("a long name file.txt", units) == 20);
+    assert(units[0] == 'a' && units[1] == ' ');
+    free(img);
+}
+
+/* 20.2: a checksum-valid one-entry LFN replaces the 8.3 rendering in
+ * dirent->name; attributes, cluster, size still come from the 8.3 slot
+ * and raw32 hands out the 8.3 entry's 32 bytes. */
+static void test_lfn_read_single(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    static const char alias11[12] = "ONELONG NAM"; /* ONELONG.NAM */
+    assert(put_lfn_run(img, F12_ROOT_OFF + 5u * 32u, "onelong.name",
+                       (const uint8_t*)alias11) == 1);
+    put_83_slot(img, F12_ROOT_OFF + 6u * 32u, alias11, 0x20, 2, 12);
+
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+
+    fat_dir_t* d = NULL;
+    assert(fat_dir_open(ctx, FAT_CLUSTER_ROOT, &d) == FAT_OK);
+    int seen = 0;
+    for (;;) {
+        const fat_dirent_t* e = NULL;
+        const uint8_t* raw32 = NULL;
+        fat_result_t r = fat_dir_next(d, &e, &raw32);
+        assert(r == FAT_OK || r == FAT_ERR_END_OF_DIR);
+        if (r != FAT_OK)
+            break;
+        if (strcmp(e->name, "onelong.name") == 0) {
+            seen = 1;
+            assert(e->attributes == 0x20);
+            assert(e->first_cluster == 2);
+            assert(e->file_size == 12);
+            assert(raw32 != NULL); /* the 8.3 slot, never the LFN entry */
+            assert(memcmp(raw32, "ONELONG NAM", 11) == 0);
+            assert(raw32[11] == 0x20);
+        }
+    }
+    fat_dir_close(d);
+    assert(seen); /* RED: lib renders the 8.3 alias, not the LFN */
+
+    /* same joining through the callback iterator */
+    LfnNameProbe probe = {"onelong.name", 0};
+    assert(fat_iter_dir(ctx, FAT_CLUSTER_ROOT, lfn_probe_cb, &probe) ==
+           FAT_OK);
+    assert(probe.found);
+
+    /* the LFN entry points at hello's cluster: content reads through */
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(dir_find(ctx, FAT_CLUSTER_ROOT, "onelong.name", &de));
+    uint8_t* buf = NULL;
+    size_t n = 0;
+    assert(fat_read_file(ctx, &de, &buf, &n) == FAT_OK);
+    assert(n == 12);
+    assert(memcmp(buf, "hello world\n", 12) == 0);
+    free(buf);
+    fat_close(ctx);
+}
+
+/* 20.2: two-entry run (the mcopy layout), joined in sequence order */
+static void test_lfn_read_two_entries(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    static const char alias11[12] = "ALONGN~1TXT";
+    assert(put_lfn_run(img, F12_ROOT_OFF + 5u * 32u, "a long name file.txt",
+                       (const uint8_t*)alias11) == 2);
+    put_83_slot(img, F12_ROOT_OFF + 7u * 32u, alias11, 0x20, 2, 12);
+
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(dir_find(ctx, FAT_CLUSTER_ROOT, "a long name file.txt", &de));
+    assert(de.first_cluster == 2);
+    assert(de.file_size == 12);
+    assert(de.attributes == 0x20);
+    /* the 8.3 rendering must not be the joined name anywhere */
+    assert(!dir_find(ctx, FAT_CLUSTER_ROOT, "ALONGN~1.TXT", &de) ||
+           strcmp(de.name, "a long name file.txt") == 0);
+    fat_close(ctx);
+}
+
+/* 20.2: the 255-character maximum (20 LFN entries + the 8.3 slot) */
+static void test_lfn_read_max_20_entries(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    char name[256];
+    for (int i = 0; i < 255; i++)
+        name[i] = (char)('a' + i % 26);
+    name[255] = '\0';
+    static const char alias11[12] = "MAXNAME TXT";
+    assert(put_lfn_run(img, F12_ROOT_OFF + 5u * 32u, name,
+                       (const uint8_t*)alias11) == 20);
+    put_83_slot(img, F12_ROOT_OFF + 25u * 32u, alias11, 0x20, 0, 0);
+
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(dir_find(ctx, FAT_CLUSTER_ROOT, name, &de)); /* 255 UTF-8 bytes */
+    assert(de.file_size == 0);
+    assert(count_dir_entries(ctx, FAT_CLUSTER_ROOT) == 6);
+    fat_close(ctx);
+}
+
+/* 20.2: multibyte (Japanese) LFN, joined and re-encoded as UTF-8 */
+static void test_lfn_read_japanese(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    static const char alias11[12] = "NIPPON  TXT";
+    assert(put_lfn_run(img, F12_ROOT_OFF + 5u * 32u,
+                       "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E\xE3\x83\x95\xE3"
+                       "\x82\xA1\xE3\x82\xA4\xE3\x83\xAB.txt",
+                       (const uint8_t*)alias11) == 1);
+    put_83_slot(img, F12_ROOT_OFF + 6u * 32u, alias11, 0x20, 2, 12);
+
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(dir_find(ctx, FAT_CLUSTER_ROOT,
+                    "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E\xE3\x83\x95\xE3"
+                    "\x82\xA1\xE3\x82\xA4\xE3\x83\xAB.txt",
+                    &de));
+    assert(de.first_cluster == 2);
+    assert(de.file_size == 12);
+    fat_close(ctx);
+}
+
+/* 20.2: surrogate pair (U+1F389) round-trips UTF-16 -> UTF-8 */
+static void test_lfn_read_surrogate_pair(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    uint16_t units[LFN_MAX_UNITS];
+    const char* name = "emoji \xF0\x9F\x8E\x89 name.txt"; /* 17 units */
+    size_t n = utf8_to_utf16(name, units);
+    assert(n == 17);
+    assert(units[6] == 0xD83C && units[7] == 0xDF89);
+    static const char alias11[12] = "EMOJI_~1TXT";
+    assert(put_lfn_run(img, F12_ROOT_OFF + 5u * 32u, name,
+                       (const uint8_t*)alias11) == 2);
+    put_83_slot(img, F12_ROOT_OFF + 7u * 32u, alias11, 0x20, 2, 12);
+
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(dir_find(ctx, FAT_CLUSTER_ROOT, name, &de));
+    assert(de.first_cluster == 2);
+    fat_close(ctx);
+}
+
+/* 20.2: checksum mismatch -> 8.3 fallback (the LFN run is ignored) */
+static void test_lfn_read_bad_checksum(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    static const char alias11[12] = "LONGNAMETXT";
+    put_lfn_run(img, F12_ROOT_OFF + 5u * 32u, "longnames.txt",
+                (const uint8_t*)alias11);
+    put_83_slot(img, F12_ROOT_OFF + 6u * 32u, alias11, 0x20, 2, 12);
+    img[F12_ROOT_OFF + 5u * 32u + 13u] ^= 0xFF; /* break the checksum */
+
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(!dir_find(ctx, FAT_CLUSTER_ROOT, "longnames.txt", &de));
+    assert(dir_find(ctx, FAT_CLUSTER_ROOT, "LONGNAME.TXT", &de)); /* 8.3 */
+    assert(de.first_cluster == 2);
+    assert(count_dir_entries(ctx, FAT_CLUSTER_ROOT) == 6);
+    fat_close(ctx);
+}
+
+/* 20.2: discontinuous sequence -> fallback */
+static void test_lfn_read_seq_disconnected(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    static const char alias11[12] = "ALONGN~1TXT";
+    put_lfn_run(img, F12_ROOT_OFF + 5u * 32u, "a long name file.txt",
+                (const uint8_t*)alias11);
+    put_83_slot(img, F12_ROOT_OFF + 7u * 32u, alias11, 0x20, 2, 12);
+    img[F12_ROOT_OFF + 6u * 32u] = 0x03; /* seq 3 where 1 is expected */
+
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(!dir_find(ctx, FAT_CLUSTER_ROOT, "a long name file.txt", &de));
+    assert(dir_find(ctx, FAT_CLUSTER_ROOT, "ALONGN~1.TXT", &de));
+    fat_close(ctx);
+}
+
+/* 20.2: missing 0x40 flag on the physical first entry -> fallback */
+static void test_lfn_read_missing_40_flag(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    static const char alias11[12] = "ALONGN~1TXT";
+    put_lfn_run(img, F12_ROOT_OFF + 5u * 32u, "a long name file.txt",
+                (const uint8_t*)alias11);
+    put_83_slot(img, F12_ROOT_OFF + 7u * 32u, alias11, 0x20, 2, 12);
+    img[F12_ROOT_OFF + 5u * 32u] = 0x02; /* 0x42 without the 0x40 flag */
+
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(!dir_find(ctx, FAT_CLUSTER_ROOT, "a long name file.txt", &de));
+    assert(dir_find(ctx, FAT_CLUSTER_ROOT, "ALONGN~1.TXT", &de));
+    fat_close(ctx);
+}
+
+/* 20.2: orphaned LFN (0x00 follows, no 8.3 entry) never surfaces */
+static void test_lfn_read_orphan_no_follower(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    static const char alias11[12] = "ORPHANT TXT";
+    put_lfn_run(img, F12_ROOT_OFF + 5u * 32u, "orphaned lfn.txt",
+                (const uint8_t*)alias11); /* slot 6 stays 0x00: no follower */
+
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(!dir_find(ctx, FAT_CLUSTER_ROOT, "orphaned lfn.txt", &de));
+    assert(!dir_find(ctx, FAT_CLUSTER_ROOT, "ORPHANT.TXT", &de));
+    assert(count_dir_entries(ctx, FAT_CLUSTER_ROOT) == 5); /* unchanged */
+    fat_close(ctx);
+}
+
+/* 20.2: a 0xE5 slot inside the run resets the accumulation -> the
+ * surviving fragment falls back to the 8.3 name */
+static void test_lfn_read_e5_gap(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    static const char alias11[12] = "ALONGN~1TXT";
+    put_lfn_run(img, F12_ROOT_OFF + 5u * 32u, "a long name file.txt",
+                (const uint8_t*)alias11);
+    put_83_slot(img, F12_ROOT_OFF + 7u * 32u, alias11, 0x20, 2, 12);
+    img[F12_ROOT_OFF + 5u * 32u] = 0xE5; /* delete the seq-2 entry */
+
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(!dir_find(ctx, FAT_CLUSTER_ROOT, "a long name file.txt", &de));
+    assert(dir_find(ctx, FAT_CLUSTER_ROOT, "ALONGN~1.TXT", &de));
+    assert(count_dir_entries(ctx, FAT_CLUSTER_ROOT) == 6);
+    fat_close(ctx);
+}
+
+/* 20.3: lookup resolves the LFN (ASCII case-insensitive) and the 8.3
+ * alias to the same entry; an LFN-named directory works as an
+ * intermediate path component. */
+static void test_lfn_lookup_names(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    static const char file11[12] = "ALONGN~1TXT";
+    put_lfn_run(img, F12_ROOT_OFF + 5u * 32u, "a long name file.txt",
+                (const uint8_t*)file11);
+    put_83_slot(img, F12_ROOT_OFF + 7u * 32u, file11, 0x20, 2, 12);
+    /* LFN directory pointing at dir1/subdir1 (cluster 9: only "." "..") */
+    static const char dir11[12] = "LONGDI~1   ";
+    put_lfn_run(img, F12_ROOT_OFF + 8u * 32u, "long directory name",
+                (const uint8_t*)dir11);
+    put_83_slot(img, F12_ROOT_OFF + 10u * 32u, dir11, 0x10, 9, 0);
+
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "a long name file.txt", &de) ==
+           FAT_OK);
+    assert(de.first_cluster == 2);
+    assert(de.file_size == 12);
+    /* every name-taking API compares ASCII case-insensitively */
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "A LONG NAME file.TXT", &de) ==
+           FAT_OK);
+    assert(de.first_cluster == 2);
+    /* the 8.3 alias is the same entry */
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "ALONGN~1.TXT", &de) == FAT_OK);
+    assert(de.first_cluster == 2);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "alongn~1.txt", &de) == FAT_OK);
+    assert(de.first_cluster == 2);
+    /* LFN directory as intermediate component: "." is itself (cluster 9),
+     * ".." is dir1 (cluster 8) per subdir1's dot entries */
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "long directory name/.", &de) ==
+           FAT_OK);
+    assert(de.first_cluster == 9);
+    assert((de.attributes & 0x10) != 0);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "long directory name/..", &de) ==
+           FAT_OK);
+    assert(de.first_cluster == 8);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "no such long name.txt", &de) ==
+           FAT_ERR_NOT_FOUND);
+    fat_close(ctx);
+}
+
+/* 20.3 + 20.5: open_write/truncate/write through an LFN name, then
+ * unlink by the LFN name and rmdir an LFN-named empty directory */
+static void test_lfn_open_write_unlink_rmdir(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    static const char file11[12] = "ALONGN~1TXT";
+    put_lfn_run(img, F12_ROOT_OFF + 5u * 32u, "a long name file.txt",
+                (const uint8_t*)file11);
+    put_83_slot(img, F12_ROOT_OFF + 7u * 32u, file11, 0x20, 2, 12);
+    static const char dir11[12] = "LONGDI~1   ";
+    put_lfn_run(img, F12_ROOT_OFF + 8u * 32u, "long directory name",
+                (const uint8_t*)dir11);
+    put_83_slot(img, F12_ROOT_OFF + 10u * 32u, dir11, 0x10, 9, 0);
+
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+
+    /* write cursor bound by LFN name (aliases the 8.3 slot) */
+    fat_file_t* f = NULL;
+    assert(fat_file_open_write(ctx, FAT_CLUSTER_ROOT, "a long name file.txt",
+                               &f) == FAT_OK);
+    assert(fat_file_truncate(f, 5) == FAT_OK); /* "hello world\n" -> "hello" */
+    assert(fat_file_seek(f, 0) == FAT_OK);
+    size_t w = 0x5A5A;
+    assert(fat_file_write(f, (const uint8_t*)"XYZ", 3, &w) == FAT_OK);
+    assert(w == 3);
+    fat_file_close(f);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "A LONG NAME FILE.TXT", &de) ==
+           FAT_OK);
+    assert(de.file_size == 5);
+    uint8_t buf[8] = {0};
+    fat_file_t* rd = NULL;
+    assert(fat_file_open(ctx, &de, &rd) == FAT_OK);
+    size_t got = 0;
+    assert(fat_file_read(rd, buf, 5, &got) == FAT_OK);
+    assert(got == 5 && memcmp(buf, "XYZlo", 5) == 0);
+    fat_file_close(rd);
+
+    /* unlink by LFN name kills both renderings; the freed cluster is
+     * hello's (shared), so only slot-level effects are checked here */
+    assert(fat_unlink(ctx, FAT_CLUSTER_ROOT, "a long name file.txt") ==
+           FAT_OK);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "a long name file.txt", &de) ==
+           FAT_ERR_NOT_FOUND);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "ALONGN~1.TXT", &de) ==
+           FAT_ERR_NOT_FOUND);
+
+    /* rmdir by LFN name: cluster 9 held only "." and ".." */
+    assert(fat_rmdir(ctx, FAT_CLUSTER_ROOT, "long directory name") ==
+           FAT_OK);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "LONGDI~1", &de) ==
+           FAT_ERR_NOT_FOUND);
+    assert(fat_at(ctx, 9) == 0); /* subdir1's chain released */
+    fat_close(ctx);
+}
+
+/* 20.4: fat_write_file stores an LFN + generated alias; round-trips the
+ * name and the bytes, and the on-disk layout is pinned (slots 5..6,
+ * checksum of the alias, 0x00 terminator after slot 6). */
+static void test_write_file_lfn_roundtrip12(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+
+    static const uint8_t data[15] = "hello lfn data";
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "longnames.txt", data, 14,
+                          NULL) == FAT_OK);
+
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "longnames.txt", &de) == FAT_OK);
+    assert(strcmp(de.name, "longnames.txt") == 0);
+    assert(de.file_size == 14);
+    uint32_t cl = de.first_cluster;
+    assert(cl >= 2u);
+    assert(chain_length(ctx, cl) == 1); /* 14 bytes < 1024 */
+    uint8_t* back = NULL;
+    size_t back_size = 0;
+    assert(fat_read_file(ctx, &de, &back, &back_size) == FAT_OK);
+    assert(back_size == 14 && memcmp(back, data, 14) == 0);
+    free(back);
+
+    /* the alias: LONGNAMES -> 6-char prefix + ~1 = LONGNA~1.TXT */
+    memset(&de, 0, sizeof(de));
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "LONGNA~1.TXT", &de) == FAT_OK);
+    assert(de.first_cluster == cl);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "LongNames.Txt", &de) == FAT_OK);
+    assert(de.first_cluster == cl);
+
+    /* on-disk layout through the export backend: "longnames.txt" is 13
+     * chars = 2 LFN slots (seq 2 holds just the terminator) + the 8.3 */
+    assert(fat_write(ctx, "/tmp/p7_lfnw.fat") == FAT_OK);
+    FILE* fp = fopen("/tmp/p7_lfnw.fat", "rb");
+    assert(fp != NULL);
+    uint8_t* ex = malloc(size);
+    assert(ex != NULL);
+    assert(fread(ex, 1, size, fp) == size);
+    fclose(fp);
+    remove("/tmp/p7_lfnw.fat");
+    const uint8_t* seq2 = ex + F12_ROOT_OFF + 5u * 32u;
+    const uint8_t* seq1 = ex + F12_ROOT_OFF + 6u * 32u;
+    const uint8_t* s83 = ex + F12_ROOT_OFF + 7u * 32u;
+    static const char alias11[12] = "LONGNA~1TXT";
+    assert(seq2[0] == 0x42 && seq2[11] == 0x0F); /* 0x40|2, terminator only */
+    assert(seq2[1] == 0 && seq2[2] == 0 && seq2[3] == 0xFF);
+    assert(seq2[13] == lfn_checksum11((const uint8_t*)alias11));
+    assert(seq1[0] == 0x01 && seq1[11] == 0x0F);
+    assert(seq1[1] == 'l' && seq1[2] == 0 && seq1[3] == 'o' && seq1[4] == 0);
+    assert(seq1[13] == lfn_checksum11((const uint8_t*)alias11));
+    assert(memcmp(s83, alias11, 11) == 0);
+    assert(s83[11] == 0x20);
+    assert(s83[26] == (uint8_t)(cl & 0xFF));
+    assert(s83[27] == (uint8_t)(cl >> 8));
+    assert(s83[28] == 14);
+    assert(ex[F12_ROOT_OFF + 8u * 32u] == 0x00); /* run ends here */
+    free(ex);
+    fat_close(ctx);
+}
+
+/* 20.4: multi-entry names (ASCII 3 slots, Japanese 2 slots) round-trip */
+static void test_write_file_lfn_multi_entry(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+
+    static const uint8_t data[11] = "0123456789";
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "another long file name.txt",
+                          data, 10, NULL) == FAT_OK);
+    const char* jp =
+        "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E\xE3\x81\xAE\xE9\x95\xB7\xE3"
+        "\x81\x84\xE3\x83\x95\xE3\x82\xA1\xE3\x82\xA4\xE3\x83\xAB\xE5\x90"
+        "\x8D.txt";
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, jp, data, 10, NULL) ==
+           FAT_OK);
+
+    assert_write_roundtrip(ctx, FAT_CLUSTER_ROOT,
+                           "another long file name.txt", data, 10, 1);
+    assert_write_roundtrip(ctx, FAT_CLUSTER_ROOT, jp, data, 10, 1);
+    fat_close(ctx);
+}
+
+/* 20.4: alias collisions number ~1, ~2 (both share the 6-char prefix) */
+static void test_write_file_lfn_alias_collision(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "longfile1.txt",
+                          (const uint8_t*)"one", 3, NULL) == FAT_OK);
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "longfile2.txt",
+                          (const uint8_t*)"two", 3, NULL) == FAT_OK);
+
+    fat_dirent_t d1, d2;
+    memset(&d1, 0, sizeof(d1));
+    memset(&d2, 0, sizeof(d2));
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "LONGFI~1.TXT", &d1) == FAT_OK);
+    assert(strcmp(d1.name, "longfile1.txt") == 0);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "LONGFI~2.TXT", &d2) == FAT_OK);
+    assert(strcmp(d2.name, "longfile2.txt") == 0);
+    assert(d1.first_cluster != d2.first_cluster);
+    /* both still reachable by their LFN names */
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "longfile1.txt", &d1) == FAT_OK);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "LONGFILE2.TXT", &d2) == FAT_OK);
+    fat_close(ctx);
+}
+
+/* 20.4: an alias colliding with a live 8.3 name bumps N to ~2 */
+static void test_write_file_lfn_alias_vs_existing_83(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "longna~1.txt",
+                          (const uint8_t*)"A", 1, NULL) == FAT_OK);
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "longnames.txt",
+                          (const uint8_t*)"hello lfn data", 14, NULL) ==
+           FAT_OK);
+
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    /* the plain 8.3 entry keeps ~1 ... Lead adjudication 2026-10-06: the
+     * entry has no LFN run, so de.name is the 8.3 rendering (uppercase) */
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "LONGNA~1.TXT", &de) == FAT_OK);
+    assert(strcmp(de.name, "LONGNA~1.TXT") == 0);
+    assert(de.file_size == 1);
+    /* ... so the LFN takes ~2 */
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "LONGNA~2.TXT", &de) == FAT_OK);
+    assert(strcmp(de.name, "longnames.txt") == 0);
+    assert(de.file_size == 14);
+    fat_close(ctx);
+}
+
+/* 20.4: EXISTS fires for the LFN name, its case variants and the alias */
+static void test_write_file_lfn_exists(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "longnames.txt",
+                          (const uint8_t*)"x", 1, NULL) == FAT_OK);
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "longnames.txt",
+                          (const uint8_t*)"y", 1, NULL) == FAT_ERR_EXISTS);
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "LONGNAMES.TXT",
+                          (const uint8_t*)"y", 1, NULL) == FAT_ERR_EXISTS);
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "LONGNA~1.TXT",
+                          (const uint8_t*)"y", 1, NULL) == FAT_ERR_EXISTS);
+    fat_close(ctx);
+}
+
+/* 20.4: name limits -- 255 chars accepted, 256 and '/'/'\' rejected */
+static void test_write_file_lfn_name_limits(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+
+    char name[300];
+    for (int i = 0; i < 255; i++)
+        name[i] = (char)('a' + i % 26);
+    name[255] = '\0';
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, name,
+                          (const uint8_t*)"x", 1, NULL) == FAT_OK);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, name, &de) == FAT_OK);
+    assert(strcmp(de.name, name) == 0);
+
+    for (int i = 0; i < 256; i++)
+        name[i] = (char)('a' + i % 26);
+    name[256] = '\0';
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, name,
+                          (const uint8_t*)"x", 1, NULL) ==
+           FAT_ERR_NAME_TOO_LONG);
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "bad/name.txt",
+                          (const uint8_t*)"x", 1, NULL) ==
+           FAT_ERR_NAME_TOO_LONG);
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "bad\\name.txt",
+                          (const uint8_t*)"x", 1, NULL) ==
+           FAT_ERR_NAME_TOO_LONG);
+    fat_close(ctx);
+}
+
+/* 20.4: the FAT12 fixed root needs n+1 consecutive slots -- with one
+ * slot left an LFN (2 slots) is DIR_FULL while an 8.3 name still fits */
+static void test_write_file_lfn_dir_full12(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    /* fill slots 5..110 with live dummy 8.3 entries: slot 111 is the
+     * only free one left */
+    char name11[12];
+    for (int i = 0; i < 106; i++) {
+        snprintf(name11, sizeof(name11), "FILLR%03dTXT", i + 1);
+        put_83_slot(img, F12_ROOT_OFF + (size_t)(5 + i) * 32u, name11, 0x20,
+                    0, 0);
+    }
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "longnames.txt",
+                          (const uint8_t*)"x", 1, NULL) == FAT_ERR_DIR_FULL);
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "zz9.txt",
+                          (const uint8_t*)"z", 1, NULL) == FAT_OK);
+    assert(count_dir_entries(ctx, FAT_CLUSTER_ROOT) == 112);
+    fat_close(ctx);
+}
+
+/* 20.4: slot reuse -- unlinking a 4-slot LFN leaves a 0xE5 run that a
+ * later 3-slot LFN must take from the run head (slot 5) */
+static void test_write_file_lfn_slot_reuse(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "another long file name.txt",
+                          (const uint8_t*)"0123456789", 10, NULL) == FAT_OK);
+    assert(fat_unlink(ctx, FAT_CLUSTER_ROOT,
+                      "another long file name.txt") == FAT_OK);
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "longnames.txt",
+                          (const uint8_t*)"hello lfn data", 14, NULL) ==
+           FAT_OK);
+
+    assert(fat_write(ctx, "/tmp/p7_reuse.fat") == FAT_OK);
+    FILE* fp = fopen("/tmp/p7_reuse.fat", "rb");
+    assert(fp != NULL);
+    uint8_t* ex = malloc(size);
+    assert(ex != NULL);
+    assert(fread(ex, 1, size, fp) == size);
+    fclose(fp);
+    remove("/tmp/p7_reuse.fat");
+    const uint8_t* seq2 = ex + F12_ROOT_OFF + 5u * 32u;
+    const uint8_t* s83 = ex + F12_ROOT_OFF + 7u * 32u;
+    assert(seq2[0] == 0x42 && seq2[11] == 0x0F); /* reused from run head */
+    assert(memcmp(s83, "LONGNA~1TXT", 11) == 0);
+    assert(ex[F12_ROOT_OFF + 8u * 32u] == 0xE5); /* leftover of the run */
+    free(ex);
+    fat_close(ctx);
+}
+
+/* 20.4 non-regression: 8.3-representable names never grow LFN entries */
+static void test_write_file_83_no_lfn(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "hello2.txt",
+                          (const uint8_t*)"hello world2\n", 13, NULL) ==
+           FAT_OK);
+    assert(fat_write(ctx, "/tmp/p7_83.fat") == FAT_OK);
+    FILE* fp = fopen("/tmp/p7_83.fat", "rb");
+    assert(fp != NULL);
+    uint8_t* ex = malloc(size);
+    assert(ex != NULL);
+    assert(fread(ex, 1, size, fp) == size);
+    fclose(fp);
+    remove("/tmp/p7_83.fat");
+    for (unsigned i = 0; i < FIXTURE_ROOT_ENTRIES; i++)
+        assert(ex[F12_ROOT_OFF + (size_t)i * 32u + 11u] != 0x0F);
+    assert(memcmp(ex + F12_ROOT_OFF + 5u * 32u, "HELLO2  TXT", 11) == 0);
+    assert(ex[F12_ROOT_OFF + 6u * 32u] == 0x00); /* exactly one slot */
+    free(ex);
+    fat_close(ctx);
+}
+
+/* 20.5: unlink marks the whole checksum-valid run (LFN entries + the
+ * 8.3 slot) 0xE5 at verified byte offsets and frees the data chain;
+ * neighbour slots stay byte-identical */
+static void test_unlink_lfn_series12(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+
+    static const uint8_t data[20] = "0123456789012345678";
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "another long file name.txt",
+                          data, 20, NULL) == FAT_OK);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "another long file name.txt",
+                      &de) == FAT_OK);
+    uint32_t cl = de.first_cluster;
+    uint32_t free_before = count_free_clusters(ctx);
+
+    /* pre-delete snapshot through the export backend */
+    assert(fat_write(ctx, "/tmp/p7_ul.b.fat") == FAT_OK);
+    FILE* fp = fopen("/tmp/p7_ul.b.fat", "rb");
+    assert(fp != NULL);
+    uint8_t* before = malloc(size);
+    assert(before != NULL);
+    assert(fread(before, 1, size, fp) == size);
+    fclose(fp);
+    remove("/tmp/p7_ul.b.fat");
+    /* written layout probed here: 3 LFN slots (5..7) + the 8.3 slot 8 */
+    assert(before[F12_ROOT_OFF + 5u * 32u + 11u] == 0x0F);
+    assert(before[F12_ROOT_OFF + 6u * 32u + 11u] == 0x0F);
+    assert(before[F12_ROOT_OFF + 7u * 32u + 11u] == 0x0F);
+    assert(before[F12_ROOT_OFF + 8u * 32u + 11u] == 0x20);
+    assert(before[F12_ROOT_OFF + 9u * 32u] == 0x00);
+
+    assert(fat_unlink(ctx, FAT_CLUSTER_ROOT, "another long file name.txt") ==
+           FAT_OK);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "another long file name.txt",
+                      &de) == FAT_ERR_NOT_FOUND);
+    assert(fat_at(ctx, cl) == 0); /* chain released */
+    assert(count_free_clusters(ctx) == free_before + 1u);
+
+    assert(fat_write(ctx, "/tmp/p7_ul.a.fat") == FAT_OK);
+    fp = fopen("/tmp/p7_ul.a.fat", "rb");
+    assert(fp != NULL);
+    uint8_t* after = malloc(size);
+    assert(after != NULL);
+    assert(fread(after, 1, size, fp) == size);
+    fclose(fp);
+    remove("/tmp/p7_ul.a.fat");
+    /* every slot of the run starts with 0xE5 ... */
+    for (unsigned i = 5; i <= 8; i++)
+        assert(after[F12_ROOT_OFF + (size_t)i * 32u] == 0xE5);
+    /* ... and nothing else changed. Lead adjudication 2026-10-06: compare
+     * the root slots 0..4 only -- the freed chain legitimately zeroes the
+     * FAT entry in both mirrors (asserted above via fat_at), so the
+     * original whole-prefix memcmp could never hold */
+    assert(memcmp(before + F12_ROOT_OFF, after + F12_ROOT_OFF, 5u * 32u) == 0);
+    assert(memcmp(before + F12_ROOT_OFF + 9u * 32u,
+                  after + F12_ROOT_OFF + 9u * 32u,
+                  size - (F12_ROOT_OFF + 9u * 32u)) == 0);
+    free(before);
+    free(after);
+    fat_close(ctx);
+}
+
+/* 20.5: an orphaned LFN entry (mismatching checksum) directly before
+ * the matched 8.3 slot survives the unlink */
+static void test_unlink_lfn_orphan_survives(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    static const char alias11[12] = "ORPHTESTTXT";
+    /* slot 5: seq-1 entry whose checksum is broken after the fact (orphan;
+     * lead adjudication 2026-10-06: put_lfn_run writes a valid checksum, so
+     * it must be corrupted here or slot 5 would be deleted with the 8.3).
+     * slots 6-7: the victim's 2-entry LFN run ("victim file.txt" = 13 chars
+     * + NUL = 14 units -> 2 entries); slot 8: the 8.3 */
+    put_lfn_run(img, F12_ROOT_OFF + 5u * 32u, "orphan a.txt",
+                (const uint8_t*)alias11);
+    img[F12_ROOT_OFF + 5u * 32u + 13u] ^= 0xFF; /* break the checksum */
+    put_lfn_run(img, F12_ROOT_OFF + 6u * 32u, "victim file.txt",
+                (const uint8_t*)alias11);
+    put_83_slot(img, F12_ROOT_OFF + 8u * 32u, alias11, 0x20, 2, 12);
+
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    assert(fat_unlink(ctx, FAT_CLUSTER_ROOT, "ORPHTEST.TXT") == FAT_OK);
+
+    assert(fat_write(ctx, "/tmp/p7_orph.fat") == FAT_OK);
+    FILE* fp = fopen("/tmp/p7_orph.fat", "rb");
+    assert(fp != NULL);
+    uint8_t* ex = malloc(size);
+    assert(ex != NULL);
+    assert(fread(ex, 1, size, fp) == size);
+    fclose(fp);
+    remove("/tmp/p7_orph.fat");
+    assert(ex[F12_ROOT_OFF + 5u * 32u] == 0x41); /* orphan stays alive */
+    assert(ex[F12_ROOT_OFF + 5u * 32u + 11u] == 0x0F);
+    assert(ex[F12_ROOT_OFF + 6u * 32u] == 0xE5); /* checksum-valid LFN */
+    assert(ex[F12_ROOT_OFF + 7u * 32u] == 0xE5); /* run (2 entries) ... */
+    assert(ex[F12_ROOT_OFF + 8u * 32u] == 0xE5); /* ... and the 8.3 slot */
+    free(ex);
+    fat_close(ctx);
+}
+
+/* 20.7 mtools oracle: an LFN file mtools created must read back through
+ * our APIs exactly as mdir/mtype see it */
+static void test_mtools_lfn_read_oracle(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    write_image("/tmp/p7_mcr.fat", orig, size);
+    free(orig);
+    FILE* fp = fopen("/tmp/p7_payload.txt", "wb");
+    assert(fp != NULL);
+    assert(fwrite("mtools lfn oracle\n", 1, 18, fp) == 18);
+    fclose(fp);
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+             "mcopy -i /tmp/p7_mcr.fat /tmp/p7_payload.txt "
+             "::\"mtools wrote this long name.txt\"");
+    assert(system(cmd) == 0);
+
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open("/tmp/p7_mcr.fat", &ctx) == FAT_OK);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(dir_find(ctx, FAT_CLUSTER_ROOT,
+                    "mtools wrote this long name.txt", &de));
+    assert(de.file_size == 18);
+    uint8_t* buf = NULL;
+    size_t n = 0;
+    assert(fat_read_file(ctx, &de, &buf, &n) == FAT_OK);
+    assert(n == 18 && memcmp(buf, "mtools lfn oracle\n", 18) == 0);
+    free(buf);
+    assert_mtype_matches_read(ctx, "/tmp/p7_mcr.fat",
+                              "mtools wrote this long name.txt");
+    fat_close(ctx);
+
+    remove("/tmp/p7_mcr.fat");
+    remove("/tmp/p7_payload.txt");
+}
+
+/* 20.7 mtools oracle, write direction: our LFN file must be listed by
+ * mdir and typed by mtype (both by LFN and by alias) */
+static void test_mtools_lfn_write_oracle(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "longnames.txt",
+                          (const uint8_t*)"hello lfn data", 14, NULL) ==
+           FAT_OK);
+    assert(fat_write(ctx, "/tmp/p7_mcw.fat") == FAT_OK);
+    fat_close(ctx);
+
+    /* mdir -b lists the LFN (probed: -b prints the long name) */
+    MDirEntry entries[MDIR_MAX];
+    int n = run_mdir_b("/tmp/p7_mcw.fat", "", entries, MDIR_MAX);
+    assert(n >= 0);
+    int seen = 0;
+    for (int i = 0; i < n; i++)
+        if (strcmp(entries[i].name, "longnames.txt") == 0)
+            seen = 1;
+    assert(seen);
+
+    fat_ctx_t* back = NULL;
+    assert(fat_open("/tmp/p7_mcw.fat", &back) == FAT_OK);
+    assert_mtype_matches_read(back, "/tmp/p7_mcw.fat", "longnames.txt");
+    assert_mtype_matches_read(back, "/tmp/p7_mcw.fat", "LONGNA~1.TXT");
+    fat_close(back);
+    remove("/tmp/p7_mcw.fat");
+}
+
+/* 20.2 fixed-root mode on FAT16: synthetic LFN joins + lookups */
+static void test_fat16_lfn_read(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_image(IMG16_NAME, &size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    static const char alias11[12] = "F16LON~1TXT";
+    assert(put_lfn_run(img, F16_ROOT_OFF + 4u * 32u, "f16 long file.txt",
+                       (const uint8_t*)alias11) == 2);
+    put_83_slot(img, F16_ROOT_OFF + 6u * 32u, alias11, 0x20, 2, 12);
+
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(dir_find(ctx, FAT_CLUSTER_ROOT, "f16 long file.txt", &de));
+    assert(de.first_cluster == 2);
+    assert(de.file_size == 12);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "F16 LONG FILE.txt", &de) ==
+           FAT_OK);
+    assert(de.first_cluster == 2);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "F16LON~1.TXT", &de) == FAT_OK);
+    assert(de.first_cluster == 2);
+    fat_close(ctx);
+}
+
+/* 20.2 chain mode on FAT32: LFN joining across the root cluster chain
+ * (synthetic entry placed in the chain's last cluster, 55) */
+static void test_fat32_lfn_read_chain(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_image(IMG32_NAME, &size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    static const char alias11[12] = "F32LON~1TXT";
+    assert(put_lfn_run(img, F32_CLU55_OFF + 12u * 32u, "f32 long file.txt",
+                       (const uint8_t*)alias11) == 2);
+    put_83_slot(img, F32_CLU55_OFF + 14u * 32u, alias11, 0x20, 3, 12);
+
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    LfnNameProbe probe = {"f32 long file.txt", 0};
+    assert(fat_iter_dir(ctx, FAT_CLUSTER_ROOT, lfn_probe_cb, &probe) ==
+           FAT_OK);
+    assert(probe.found);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "f32 long file.txt", &de) ==
+           FAT_OK);
+    assert(de.first_cluster == 3);
+    assert(de.file_size == 12);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "F32LON~1.TXT", &de) == FAT_OK);
+    assert(de.first_cluster == 3);
+    fat_close(ctx);
+}
+
+/* 20.4 on FAT32: LFN creation lands in the root chain's free tail */
+static void test_fat32_write_file_lfn(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_image(IMG32_NAME, &size);
+    uint8_t* img = copy_image(orig, size);
+    free(orig);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+
+    static const uint8_t data[15] = "hello lfn data";
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "longnames.txt", data, 14,
+                          NULL) == FAT_OK);
+    assert_write_roundtrip(ctx, FAT_CLUSTER_ROOT, "longnames.txt", data, 14,
+                           1);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "LONGNA~1.TXT", &de) == FAT_OK);
+    assert(strcmp(de.name, "longnames.txt") == 0);
+    fat_close(ctx);
+}
+
+/* ------------------------------------------------------------------ */
 /* fixture protection (16.5): no test may modify demof12/16/32.fat --  */
 /* writes go through fat_open_mem, custom backends or /tmp copies.     */
 /* FNV-1a snapshots taken first thing, re-checked last thing.          */
@@ -5237,6 +6430,56 @@ int main(void)
     } else {
         printf("%-40s skipped (%s missing; run: make fat32)\n",
                "phase 6 FAT32 suite", IMG32_NAME);
+    }
+
+    /* phase 7: LFN */
+    RUN(test_lfn_put_helpers_vs_mcopy);
+    RUN(test_lfn_read_single);
+    RUN(test_lfn_read_two_entries);
+    RUN(test_lfn_read_max_20_entries);
+    RUN(test_lfn_read_japanese);
+    RUN(test_lfn_read_surrogate_pair);
+    RUN(test_lfn_read_bad_checksum);
+    RUN(test_lfn_read_seq_disconnected);
+    RUN(test_lfn_read_missing_40_flag);
+    RUN(test_lfn_read_orphan_no_follower);
+    RUN(test_lfn_read_e5_gap);
+    RUN(test_lfn_lookup_names);
+    RUN(test_lfn_open_write_unlink_rmdir);
+    RUN(test_write_file_lfn_roundtrip12);
+    RUN(test_write_file_lfn_multi_entry);
+    RUN(test_write_file_lfn_alias_collision);
+    RUN(test_write_file_lfn_alias_vs_existing_83);
+    RUN(test_write_file_lfn_exists);
+    RUN(test_write_file_lfn_name_limits);
+    RUN(test_write_file_lfn_dir_full12);
+    RUN(test_write_file_lfn_slot_reuse);
+    RUN(test_write_file_83_no_lfn);
+    RUN(test_unlink_lfn_series12);
+    RUN(test_unlink_lfn_orphan_survives);
+    if (mtools_present()) {
+        RUN(test_mtools_lfn_read_oracle);
+        RUN(test_mtools_lfn_write_oracle);
+    } else {
+        printf("%-40s skipped (mtools not installed)\n",
+               "test_mtools_lfn_read_oracle");
+        printf("%-40s skipped (mtools not installed)\n",
+               "test_mtools_lfn_write_oracle");
+    }
+    if (fixture_present(IMG16_NAME)) {
+        RUN(test_fat16_lfn_read);
+    } else {
+        printf("%-40s skipped (%s missing; run: make fat16)\n",
+               "test_fat16_lfn_read", IMG16_NAME);
+    }
+    if (fixture_present(IMG32_NAME)) {
+        RUN(test_fat32_lfn_read_chain);
+        RUN(test_fat32_write_file_lfn);
+    } else {
+        printf("%-40s skipped (%s missing; run: make fat32)\n",
+               "test_fat32_lfn_read_chain", IMG32_NAME);
+        printf("%-40s skipped (%s missing; run: make fat32)\n",
+               "test_fat32_write_file_lfn", IMG32_NAME);
     }
 
     RUN(test_fixture_guard_end);

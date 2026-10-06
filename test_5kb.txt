@@ -1,12 +1,80 @@
-001: Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
-002: Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
-003: Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
-004: Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
-005: Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
-006: Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
-007: Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
-008: Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
-009: Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
-010: Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
-011: Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+test_5kb.txt -- a 4,962-byte file copied into every demo image.
 
+hello.txt is only 12 bytes: it fits in a single cluster, and reading it
+never follows a FAT chain.  This file exists to show the opposite case.
+It is deliberately larger than one cluster, so reading it forces the
+library to hop from cluster to cluster through the FAT:
+
+  FAT12 demo image (720 KB floppy, 1024 B/cluster): 5 clusters,
+  chain 3 -> 4 -> 5 -> 6 -> 7.
+
+  FAT16 demo image (16 MiB, 512 B/cluster): 10 clusters.
+  FAT32 demo image (33 MiB, 512 B/cluster): 10 clusters.
+
+The tests pin this file at exactly 4,962 bytes -- the cluster chains and
+sizes they assert depend on it -- so the rest is numbered filler with the
+byte offset of each line, letting you watch a multi-cluster read sweep
+through the file in order.
+001: byte offset  791 -- filler padding to keep the size at 4,962
+002: byte offset  857 -- filler padding to keep the size at 4,962
+003: byte offset  923 -- filler padding to keep the size at 4,962
+004: byte offset  989 -- filler padding to keep the size at 4,962
+005: byte offset 1055 -- filler padding to keep the size at 4,962
+006: byte offset 1121 -- filler padding to keep the size at 4,962
+007: byte offset 1187 -- filler padding to keep the size at 4,962
+008: byte offset 1253 -- filler padding to keep the size at 4,962
+009: byte offset 1319 -- filler padding to keep the size at 4,962
+010: byte offset 1385 -- filler padding to keep the size at 4,962
+011: byte offset 1451 -- filler padding to keep the size at 4,962
+012: byte offset 1517 -- filler padding to keep the size at 4,962
+013: byte offset 1583 -- filler padding to keep the size at 4,962
+014: byte offset 1649 -- filler padding to keep the size at 4,962
+015: byte offset 1715 -- filler padding to keep the size at 4,962
+016: byte offset 1781 -- filler padding to keep the size at 4,962
+017: byte offset 1847 -- filler padding to keep the size at 4,962
+018: byte offset 1913 -- filler padding to keep the size at 4,962
+019: byte offset 1979 -- filler padding to keep the size at 4,962
+020: byte offset 2045 -- filler padding to keep the size at 4,962
+021: byte offset 2111 -- filler padding to keep the size at 4,962
+022: byte offset 2177 -- filler padding to keep the size at 4,962
+023: byte offset 2243 -- filler padding to keep the size at 4,962
+024: byte offset 2309 -- filler padding to keep the size at 4,962
+025: byte offset 2375 -- filler padding to keep the size at 4,962
+026: byte offset 2441 -- filler padding to keep the size at 4,962
+027: byte offset 2507 -- filler padding to keep the size at 4,962
+028: byte offset 2573 -- filler padding to keep the size at 4,962
+029: byte offset 2639 -- filler padding to keep the size at 4,962
+030: byte offset 2705 -- filler padding to keep the size at 4,962
+031: byte offset 2771 -- filler padding to keep the size at 4,962
+032: byte offset 2837 -- filler padding to keep the size at 4,962
+033: byte offset 2903 -- filler padding to keep the size at 4,962
+034: byte offset 2969 -- filler padding to keep the size at 4,962
+035: byte offset 3035 -- filler padding to keep the size at 4,962
+036: byte offset 3101 -- filler padding to keep the size at 4,962
+037: byte offset 3167 -- filler padding to keep the size at 4,962
+038: byte offset 3233 -- filler padding to keep the size at 4,962
+039: byte offset 3299 -- filler padding to keep the size at 4,962
+040: byte offset 3365 -- filler padding to keep the size at 4,962
+041: byte offset 3431 -- filler padding to keep the size at 4,962
+042: byte offset 3497 -- filler padding to keep the size at 4,962
+043: byte offset 3563 -- filler padding to keep the size at 4,962
+044: byte offset 3629 -- filler padding to keep the size at 4,962
+045: byte offset 3695 -- filler padding to keep the size at 4,962
+046: byte offset 3761 -- filler padding to keep the size at 4,962
+047: byte offset 3827 -- filler padding to keep the size at 4,962
+048: byte offset 3893 -- filler padding to keep the size at 4,962
+049: byte offset 3959 -- filler padding to keep the size at 4,962
+050: byte offset 4025 -- filler padding to keep the size at 4,962
+051: byte offset 4091 -- filler padding to keep the size at 4,962
+052: byte offset 4157 -- filler padding to keep the size at 4,962
+053: byte offset 4223 -- filler padding to keep the size at 4,962
+054: byte offset 4289 -- filler padding to keep the size at 4,962
+055: byte offset 4355 -- filler padding to keep the size at 4,962
+056: byte offset 4421 -- filler padding to keep the size at 4,962
+057: byte offset 4487 -- filler padding to keep the size at 4,962
+058: byte offset 4553 -- filler padding to keep the size at 4,962
+059: byte offset 4619 -- filler padding to keep the size at 4,962
+060: byte offset 4685 -- filler padding to keep the size at 4,962
+061: byte offset 4751 -- filler padding to keep the size at 4,962
+062: byte offset 4817 -- filler padding to keep the size at 4,962
+(end of file -- 4,962 bytes)                                                  

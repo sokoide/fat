@@ -36,6 +36,7 @@ typedef enum {
     FAT_ERR_DISK_FULL,       // no free cluster left (fat_alloc_cluster)
     FAT_ERR_DIR_FULL,        // FAT12/16 root directory is full
     FAT_ERR_EXISTS,          // a live entry with this name already exists
+    FAT_ERR_DIR_NOT_EMPTY,   // fat_rmdir target holds live entries
 } fat_result_t;
 
 const char* fat_strerror(fat_result_t r);
@@ -151,8 +152,10 @@ fat_result_t fat_name_to_83(const char* name, uint8_t name11[11]);
 
 // streaming file access ----------------------------------------------------
 
-// Opaque read cursor over one file's cluster chain; decouples reading from
+// Opaque cursor over one file's cluster chain; decouples access from
 // whole-file allocation (fat_read_file) and survives interleaved seeks.
+// Read cursors (fat_file_open) are pure views; write cursors
+// (fat_file_open_write) can also truncate and extend the file in place.
 typedef struct fat_file fat_file_t;
 
 // Bind a cursor to a regular file. The dirent is validated and copied, so
@@ -177,6 +180,41 @@ fat_result_t fat_file_seek(fat_file_t* f, uint64_t offset);
 // meaningful after FAT_OK.
 fat_result_t fat_file_read(fat_file_t* f, uint8_t* buf, size_t len,
                            size_t* read);
+
+// Open the existing regular file `name` in `dir_cluster` (FAT_CLUSTER_ROOT
+// = the root directory) for reading AND writing. Unlike fat_file_open the
+// cursor is bound to the file's directory slot, so fat_file_truncate /
+// fat_file_write can update the entry's first-cluster and file-size fields
+// as they go. Same validation as fat_file_open (a regular file is
+// required); creation stays with fat_write_file:
+//   FAT_ERR_NOT_FOUND    -> no live entry with this name
+//   FAT_ERR_INVALID_ARG  -> entry is not a regular file, or ATTR_READ_ONLY
+fat_result_t fat_file_open_write(fat_ctx_t* ctx, uint32_t dir_cluster,
+                                 const char* name, fat_file_t** out);
+
+// Resize the file to exactly `size` bytes. Growing zero-fills the new
+// bytes (tail of the last cluster plus newly allocated clusters);
+// shrinking frees the clusters that fall entirely past the end -- the
+// kept partial tail keeps its leftover bytes (file_size bounds readers).
+// Truncating to 0 releases the whole chain and resets the entry's
+// first_cluster to 0, like a freshly created empty file. The cursor
+// position is clamped to the new size. Consistency order: the dirent
+// size is updated before clusters are freed (shrink) and after the
+// extension is in place (grow), so no intermediate state dangles.
+// Timestamps are left untouched (determinism; manage them yourself).
+fat_result_t fat_file_truncate(fat_file_t* f, uint64_t size);
+
+// Write `len` bytes from `buf` at the cursor, extending the file and
+// allocating clusters as needed; the cursor advances by *written. Like
+// fat_file_read there are no short writes: FAT_OK means *written == len.
+// On failure the file stays consistent with the prefix that landed
+// (*written receives that byte count, dirent size included). Writes
+// never create holes: the cursor cannot sit past the current size.
+// Argument rules mirror fat_file_read exactly: a NULL buf is
+// FAT_ERR_INVALID_ARG (even for len 0); len 0 with a valid buf is FAT_OK
+// with *written == 0 and nothing touched.
+fat_result_t fat_file_write(fat_file_t* f, const uint8_t* buf, size_t len,
+                            size_t* written);
 
 // Release the cursor. Safe on NULL. The context may outlive it.
 void fat_file_close(fat_file_t* f);
@@ -242,7 +280,10 @@ fat_result_t fat_read_file(fat_ctx_t* ctx, const fat_dirent_t* file,
 // The fat_open_mem backend is a private copy, so the caller's buffer is
 // untouched either way. Read cursors (fat_file_t/fat_dir_t) observe the
 // mutated cache, but keeping them open across structural changes (chain
-// alloc/free, dirent writes) is undefined -- close them first.
+// alloc/free, dirent writes) is undefined -- close them first. Write
+// cursors (fat_file_open_write) are themselves structural: running two
+// cursors over one file, or unlinking an open file, is the caller's
+// responsibility and otherwise undefined.
 
 // Set FAT[cluster] = value in every FAT copy the spec requires: all
 // mirrors when mirroring is enabled, only the active copy when
@@ -284,10 +325,34 @@ fat_result_t fat_add_dirent(fat_ctx_t* ctx, uint32_t dir_cluster,
 // failure everything allocated so far is rolled back (freed) and the
 // error is returned, leaving the directory and FAT as they were.
 // An empty file gets first_cluster 0. An existing name is
-// FAT_ERR_EXISTS -- overwrite/truncate are not in this phase.
+// FAT_ERR_EXISTS -- replacing content is the write cursor's job
+// (fat_file_open_write + fat_file_truncate / fat_file_write).
 fat_result_t fat_write_file(fat_ctx_t* ctx, uint32_t dir_cluster,
                             const char* name, const uint8_t* data,
                             size_t size, const fat_dirent_t* tmpl);
+
+// Delete the regular file `name` from `dir_cluster` (FAT_CLUSTER_ROOT =
+// the root directory). Consistency order: the directory slot's first
+// byte is set to 0xE5 first, then the file's cluster chain is freed
+// (FSInfo kept in step) -- an interruption can leak clusters but never
+// leaves a live entry pointing at freed ones. An empty file
+// (first_cluster 0) just loses its entry.
+//   FAT_ERR_NOT_FOUND   -> no live entry with this name
+//   FAT_ERR_INVALID_ARG -> entry is a directory, or ATTR_READ_ONLY
+fat_result_t fat_unlink(fat_ctx_t* ctx, uint32_t dir_cluster,
+                        const char* name);
+
+// Remove the empty directory `name` from `dir_cluster`. The target must
+// be a directory holding no live entries besides "." and ".." (deleted
+// 0xE5 slots do not block removal); the root directory itself cannot be
+// removed. Same order as fat_unlink: slot marked 0xE5 first, then the
+// chain freed.
+//   FAT_ERR_NOT_FOUND       -> no live entry with this name
+//   FAT_ERR_INVALID_ARG     -> entry is a regular file, is the root
+//                              directory, or ATTR_READ_ONLY
+//   FAT_ERR_DIR_NOT_EMPTY   -> target holds live entries
+fat_result_t fat_rmdir(fat_ctx_t* ctx, uint32_t dir_cluster,
+                       const char* name);
 
 // Export the whole logical image (backend as seen through the cache) to
 // `path` (created/truncated). This is not a cache flush to the backend --

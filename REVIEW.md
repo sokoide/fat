@@ -427,3 +427,45 @@ TDD実施: リードが`fat.h`のI/O abstraction契約を先行確定 → **p5-t
 - §0残課題の`tags`git追跡は既に解除済み（本フェーズ時点で`git ls-files`非対象）。
 
 残課題（フェーズ6候補）: §15残件のoverwrite/truncate・削除（0xE5+チェーン解放）・書き込み側ファイルカーソル。フェーズ3 LFNは引き続きユーザー見送り。
+
+## 18. フェーズ6（書き込み追加: 削除・上書き・truncate）詳細設計（2026-10-06 追記）
+
+目標: §15残課題3件を実装。公開契約は`fat.h`に確定済み（`fat_unlink`/`fat_rmdir`/`fat_file_open_write`/`fat_file_truncate`/`fat_file_write`、新enum `FAT_ERR_DIR_NOT_EMPTY`）。LFNは引き続き見送り。
+
+### 18.1 削除 `fat_unlink` / `fat_rmdir`
+
+- **`fat_unlink(ctx, dir_cluster, name)`**: lookup（NOT_FOUND/ラベル非マッチは既存規則）→ 対象が通常ファイルであること（ATTR_DIRECTORYは`INVALID_ARG`）→ ATTR_READ_ONLYは`INVALID_ARG`（DOSのaccess denied相当）。**整合順序: dirent先頭バイトを0xE5にしてから`fat_free_chain`**（中断時に「解放済みクラスタを指す生存エントリ」を作らない。リークは許容・fsck回復可能）。
+- **`fat_rmdir(ctx, dir_cluster, name)`**: ATTR_DIRECTORY必須（ファイルは`INVALID_ARG`）、root自身は`INVALID_ARG`、空であること=「"."/".."以外の生存エントリなし」（0xE5スロットと0x00終端は阻害しない）でないと`FAT_ERR_DIR_NOT_EMPTY`。削除順序はunlinkと同じ（スロット0xE5→チェーン解放）。
+- スロット特定: `dir_scan`と同じ走査でname11一致+first_cluster一致の生存スロットのバイトオフセットを特定。
+
+### 18.2 書き込みカーソル
+
+- **`fat_file_open_write(ctx, dir_cluster, name)`**: 既存通常ファイルのみ（NOT_FOUND作成なし、ディレクトリ/ラベル/READ_ONLYは`INVALID_ARG`）。読み取りカーソル（`fat_file_open`）との相違点は**direntスロット（バイトオフセット）を保持**し、truncate/writeがfirst_cluster・file_sizeをスロットへ書き戻す点。tell/seek/readは読み取りカーソルと同一規則（sizeはtruncate/write後の値を反映）。
+- **`fat_file_truncate(f, size)`**:
+  - 縮小: **dirent sizeを先に更新**→余剰クラスタ解放（部分クラスタの残バイトは不清掃、file_sizeがreaderを拘束）。位置は`min(pos, size)`にクランプ。
+  - 拡大: ゼロ埋め（元末尾の部分クラスタ+新規クラスタ）→**データ後にdirent size更新**。
+  - `truncate(0)`: チェーン全解放+first_clusterを0に戻す（`fat_write_file`空ファイルと対称）。
+  - タイムスタンプは更新しない（決定論性。phase 4のtmpl方針と整合）。
+- **`fat_file_write(f, buf, len, written)`**: カーソル位置に書き込み、EOF超過時はクラスタ確保して拡張。ショートなし（FAT_OKなら`*written == len`）。失敗時は**一貫したプレフィックス**（書き込めた分のデータ+dirent size）を残してエラー。seekはsize内に限定されるためホールは発生しない。
+
+### 18.3 整合順序の設計根拠（§12.7の継承）
+
+- 削除: dirent無効化→チェーン解放（逆向きは解放済みクラスタへの生存参照を作り得る）。
+- 縮小: dirent size→チェーン解放（逆だとsizeが大きいままチェーン短縮=BAD_CLUSTER参照）。
+- 拡大: データ・チェーン→dirent size（逆だとsizeが到達不能データを主張）。
+- いずれもキャッシュの早期フラッシュ（§16.2）によりディスク上の順序は保証されない点はphase 5と同一前提。
+
+### 18.4 テスト計画（p6-test）
+
+- unlink: スロット0xE5（バイトオフセット検証）、FAT鎖解放・FSInfo増加、空ファイル（cluster 0）、NOT_FOUND、ディレクトリ対象`INVALID_ARG`、READ_ONLY`INVALID_ARG`、周辺エントリ無傷、round-trip再open。
+- rmdir: 空dir削除（dirent+FAT）、`DIR_NOT_EMPTY`、ファイル対象`INVALID_ARG`、root`INVALID_ARG`、0xE5スロットのみのdirは削除可。
+- truncate: 縮小（size・tailクラスタ解放・FAT）、拡大ゼロ埋め（読み戻し0）、`truncate(0)`→first_cluster 0、クランプ、空ファイルからの拡大。
+- write: 同サイズ上書き（内容置換・size不変）、EOF越え拡張（size・チェーン・FSInfo減）、seek中間書き込み、同一カーソルでのread-back、fail-injectバックエンドでのエラー伝播とプレフィックス一貫性、`open_write`のNOT_FOUND/dir/READ_ONLY。
+- オラクル: mtools（`mdel`/`mcopy -o`）との事後状態比較、mtype内容一致。
+- 既存66テストはアサーション凍結。新シンボル5個はリンクred+/tmpスタブハーネス。フィクスチャ保護（memバックエンド/FNV-1aガード）継続。
+
+### 18.5 分担
+
+- **p6-test**: testmain.c/Makefile（red確定まで。libファイル・fat.h編集禁止）。
+- **p6-lib**: fat_internal.h/fat_core.c（`fat_strerror`への`DIR_NOT_EMPTY`追加含む）。fat_dev.c/fat_dump.cは変更不要。
+- リードが統合検証（`make check`×2+デモ+フィクスチャ不変+`git status`）、§19記録、コミット。

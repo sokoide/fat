@@ -491,4 +491,6 @@ TDD実施: リードが`fat.h`のI/O abstraction契約を先行確定 → **p5-t
 - `dir_scan`のマッチ対象からボリュームラベルを除外（lookup/open_write/unlink/rmdirで一貫）。副効用として`fat_add_dirent`のEXISTS判定もラベル非マッチに寄る（fat.hの「a live entry with this name」解釈をlookup規則に統一。既存テストは影響なし=確認済み）。
 - `demof16/demof32.fat`は各マシンで`make fat16`/`make fat32`により再生成する運用を継続（凍結対象はコミット済みの`demof12.fat`のみ）。
 
-残課題: "r+b→rb"フォールバックの実機検証（root環境、引き継ぎ）。フェーズ3 LFNはユーザー見送り継続。デモ（`main.c`）はFAT12フィクスチャのみ。
+残課題: フェーズ3 LFNはユーザー見送り継続。デモ（`main.c`）はFAT12フィクスチャのみ。
+
+追記（同日、§17.5の完遂）: "r+b→rb"フォールバックを実機検証した（非root・uid 1000）。読み取り専用コピー（chmod 444）に対し`fat_open`が成功（`fopen("r+b")`失敗→`"rb"`フォールバック）、読み取りはバイト一致、キャッシュ書き込み（unlink）は成功、`fat_sync`は`FAT_ERR_IO`、ディスク上のファイルはmd5一致でバイト不変。対照として書き込み可能コピーは`fat_sync`=`FAT_OK`。ASan/UBSan付きで実施（プローブ: `/tmp/p6dbg/p6dbg6.c`）。§17.5は本検証をもって閉鎖。

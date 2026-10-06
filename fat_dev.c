@@ -1,5 +1,5 @@
-// fat_dev.c -- file-backed image loading; the only stdio user on the
-// library side. Never prints: failures propagate as fat_result_t.
+// fat_dev.c -- file-backed image loading and flushing; the only stdio user
+// on the library side. Never prints: failures propagate as fat_result_t.
 
 #include "fat_internal.h"
 #include <stdio.h>
@@ -44,4 +44,22 @@ fat_result_t fat_open(const char* path, fat_ctx_t** out) {
     fat_result_t r = fat_ctx_init_mem(out, image, (size_t)fileSize);
     free(image);
     return r;
+}
+
+fat_result_t fat_write(const fat_ctx_t* ctx, const char* path) {
+    if (ctx == NULL || path == NULL)
+        return FAT_ERR_INVALID_ARG;
+
+    FILE* fp = fopen(path, "wb");
+    if (fp == NULL)
+        return FAT_ERR_IO;
+
+    // the whole in-memory image, created/truncated at the destination
+    if (fwrite(ctx->image, 1, ctx->image_size, fp) != ctx->image_size) {
+        fclose(fp);
+        return FAT_ERR_IO;
+    }
+    if (fclose(fp) != 0)
+        return FAT_ERR_IO;
+    return FAT_OK;
 }

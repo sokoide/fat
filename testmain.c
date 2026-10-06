@@ -6,7 +6,8 @@
  *   root: DEMOF12 label (attr 0x08), HELLO.TXT (cluster 2, 12 bytes),
  *         TEST_5KB.TXT (cluster 3, 4962 bytes, chain 3->4->5->6->7),
  *         DIR1 (cluster 8), DIR2 (cluster 11, chain 11->43)
- *   dir1: ".", "..", SUBDIR1 (empty), SUBDIR2 (empty), HOGE.TXT (11 bytes)
+ *   dir1: ".", "..", SUBDIR1 (empty, cluster 9), SUBDIR2 (empty, cluster
+ *         10), HOGE.TXT (11 bytes, cluster 7)
  *   dir2: ".", "..", SUBDIR1..SUBDIR33 spread over clusters 11 and 43
  *   dir2/subdir1: PAGE.TXT (14 bytes), TEST_5KB.TXT (4962 bytes, chain
  *         48->49->50->51->52, byte-identical to the repo test_5kb.txt)
@@ -72,6 +73,7 @@
 /* BPB field offsets (fatgen103 layout, confirmed on the fixture bytes). */
 #define BPB_BYTES_PER_SECTOR 11
 #define BPB_RESERVED_SECTORS 14
+#define BPB_ROOT_ENTRIES     17
 #define BPB_TOTAL_SECTORS16  19
 #define BPB_TOTAL_SECTORS32  32
 #define BPB_ROOT_CLUSTER     44
@@ -2034,6 +2036,988 @@ static void test_open_mem_errors_fat32(void)
     free(orig);
 }
 
+/* ------------------------------------------------------------------ */
+/* phase 4: write support (fat_set_fat_entry, fat_alloc_cluster,       */
+/* fat_free_chain, fat_add_dirent, fat_write_file, fat_write)          */
+/* ------------------------------------------------------------------ */
+
+/* Decode a 12-bit FAT entry from a raw image, FAT table at `base_sector`
+ * (the packing shares a byte between even/odd neighbours). */
+static uint16_t raw_fat12_at(const uint8_t* img, unsigned base_sector,
+                             uint32_t cluster)
+{
+    size_t off = (size_t)base_sector * 512u + cluster * 3u / 2u;
+    if (cluster % 2u == 0u)
+        return (uint16_t)(img[off] | ((img[off + 1] & 0x0Fu) << 8));
+    return (uint16_t)((img[off] >> 4) | ((uint16_t)img[off + 1] << 4));
+}
+
+static void count_any_cb(const fat_dirent_t* entry, const uint8_t* raw32,
+                         void* user_data)
+{
+    (void)entry;
+    (void)raw32;
+    (*(int*)user_data)++;
+}
+
+/* live entry count of a directory (label and dot entries included) */
+static int count_dir_entries(fat_ctx_t* ctx, uint32_t cluster)
+{
+    int n = 0;
+    assert(fat_iter_dir(ctx, cluster, count_any_cb, &n) == FAT_OK);
+    return n;
+}
+
+/* data clusters in the chain headed at `first` (stops at EOC/broken) */
+static uint32_t chain_length(const fat_ctx_t* ctx, uint32_t first)
+{
+    const fat_geometry_t* g = fat_geometry(ctx);
+    uint32_t n = 0;
+    uint32_t c = first;
+    while (c >= 2u && c <= g->cluster_count + 1u && n < 10000u) {
+        n++;
+        c = fat_at(ctx, c);
+    }
+    return n;
+}
+
+/* free data clusters, by the FAT itself (ground truth for FSInfo checks) */
+static uint32_t count_free_clusters(const fat_ctx_t* ctx)
+{
+    uint32_t n = 0;
+    for (uint32_t c = 2u; c <= fat_geometry(ctx)->cluster_count + 1u; c++)
+        if (fat_at(ctx, c) == 0)
+            n++;
+    return n;
+}
+
+/* deterministic write pattern */
+static uint8_t* make_pattern(size_t n)
+{
+    uint8_t* p = malloc(n);
+    assert(p != NULL);
+    for (size_t i = 0; i < n; i++)
+        p[i] = (uint8_t)(i * 7u + 3u);
+    return p;
+}
+
+/* After writing `name` into `dir_cluster`: lookup finds it, the dirent
+ * size/first_cluster are exact, the FAT chain holds `want_clusters` data
+ * clusters, and both fat_read_file and a fat_file_t cursor deliver the
+ * original bytes. `dir_cluster` may be a directory cluster or a start
+ * cluster plus a path (lookup resolves both). */
+static void assert_write_roundtrip(fat_ctx_t* ctx, uint32_t dir_cluster,
+                                   const char* name, const uint8_t* data,
+                                   size_t size, uint32_t want_clusters)
+{
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(fat_lookup(ctx, dir_cluster, name, &de) == FAT_OK);
+    assert(de.file_size == size);
+    if (size == 0) {
+        assert(de.first_cluster == 0); /* empty file: no chain at all */
+        return;
+    }
+    assert(de.first_cluster >= 2u);
+    assert(de.first_cluster <= fat_geometry(ctx)->cluster_count + 1u);
+    assert(chain_length(ctx, de.first_cluster) == want_clusters);
+
+    uint8_t* back = NULL;
+    size_t back_size = 0;
+    assert(fat_read_file(ctx, &de, &back, &back_size) == FAT_OK);
+    assert(back_size == size);
+    assert(memcmp(back, data, size) == 0);
+    free(back);
+
+    fat_file_t* f = NULL;
+    assert(fat_file_open(ctx, &de, &f) == FAT_OK);
+    uint8_t* buf = malloc(size);
+    assert(buf != NULL);
+    size_t got = 0;
+    assert(fat_file_read(f, buf, size, &got) == FAT_OK);
+    assert(got == size);
+    assert(memcmp(buf, data, size) == 0);
+    fat_file_close(f);
+    free(buf);
+}
+
+static void assert_same_geometry(const fat_geometry_t* a,
+                                 const fat_geometry_t* b)
+{
+    assert(a->bytes_per_sector == b->bytes_per_sector);
+    assert(a->sectors_per_cluster == b->sectors_per_cluster);
+    assert(a->reserved_sectors == b->reserved_sectors);
+    assert(a->fat_count == b->fat_count);
+    assert(a->fat_sectors == b->fat_sectors);
+    assert(a->root_entries == b->root_entries);
+    assert(a->total_sectors == b->total_sectors);
+    assert(a->fat_start_sector == b->fat_start_sector);
+    assert(a->root_dir_sector == b->root_dir_sector);
+    assert(a->root_dir_sectors == b->root_dir_sectors);
+    assert(a->root_cluster == b->root_cluster);
+    assert(a->data_start_sector == b->data_start_sector);
+    assert(a->cluster_count == b->cluster_count);
+}
+
+/* 12.1: FAT12 nibble neighbours survive the read-modify-write, both FAT
+ * copies receive the update, and the argument/value ranges hold. */
+static void test_set_fat_entry12(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    const fat_geometry_t* g = fat_geometry(ctx);
+
+    /* 3 (even) and 4 (odd) sit inside the test_5kb chain; 9/10 are a free
+     * even/odd pair.  The written entries change, every neighbour keeps
+     * its original relationship. */
+    assert(fat_set_fat_entry(ctx, 3, 0x123) == FAT_OK);
+    assert(fat_set_fat_entry(ctx, 4, 0x456) == FAT_OK);
+    assert(fat_set_fat_entry(ctx, 9, 0x0AA) == FAT_OK);
+    assert(fat_set_fat_entry(ctx, 10, 0x0BB) == FAT_OK);
+    assert(fat_at(ctx, 2) == 0xFFF);
+    assert(fat_at(ctx, 3) == 0x123);
+    assert(fat_at(ctx, 4) == 0x456);
+    assert(fat_at(ctx, 5) == 6);
+    assert(fat_at(ctx, 6) == 7);
+    assert(fat_at(ctx, 7) == 0xFFF);
+    assert(fat_at(ctx, 8) == 0xFFF);
+    assert(fat_at(ctx, 9) == 0x0AA);
+    assert(fat_at(ctx, 10) == 0x0BB);
+    assert(fat_at(ctx, 11) == 43);
+
+    /* FREE and EOC are ordinary writable values */
+    assert(fat_set_fat_entry(ctx, 9, 0) == FAT_OK);
+    assert(fat_at(ctx, 9) == 0);
+    assert(fat_set_fat_entry(ctx, 9, 0xFFF) == FAT_OK);
+    assert(fat_at(ctx, 9) == 0xFFF);
+
+    /* cluster range: 2..cluster_count+1 */
+    assert(fat_set_fat_entry(NULL, 3, 1) == FAT_ERR_INVALID_ARG);
+    assert(fat_set_fat_entry(ctx, 0, 1) == FAT_ERR_INVALID_ARG);
+    assert(fat_set_fat_entry(ctx, 1, 1) == FAT_ERR_INVALID_ARG);
+    assert(fat_set_fat_entry(ctx, g->cluster_count + 1, 1) == FAT_OK);
+    assert(fat_set_fat_entry(ctx, g->cluster_count + 2, 1) ==
+           FAT_ERR_INVALID_ARG);
+    /* value range: 12-bit entries cap at 0xFFF */
+    assert(fat_set_fat_entry(ctx, 3, 0x1000) == FAT_ERR_INVALID_ARG);
+
+    /* both FAT copies: flush and compare the raw tables byte for byte
+     * (they start identical, so mirrored writes keep them identical) and
+     * decode the touched entries by hand in each table */
+    assert(fat_write(ctx, "/tmp/p4_set12.fat") == FAT_OK);
+    size_t fn = 0;
+    uint8_t* back = read_image("/tmp/p4_set12.fat", &fn);
+    assert(fn == size);
+    assert(memcmp(back + FIXTURE_FAT_SECTOR * 512u, back + 4u * 512u,
+                  3u * 512u) == 0);
+    for (unsigned t = 0; t < 2u; t++) {
+        unsigned base = t == 0u ? FIXTURE_FAT_SECTOR : 4u;
+        assert(raw_fat12_at(back, base, 2) == 0xFFF);
+        assert(raw_fat12_at(back, base, 3) == 0x123);
+        assert(raw_fat12_at(back, base, 4) == 0x456);
+        assert(raw_fat12_at(back, base, 5) == 6);
+        assert(raw_fat12_at(back, base, 6) == 7);
+        assert(raw_fat12_at(back, base, 7) == 0xFFF);
+        assert(raw_fat12_at(back, base, 9) == 0xFFF);
+        assert(raw_fat12_at(back, base, 10) == 0x0BB);
+    }
+    free(back);
+    remove("/tmp/p4_set12.fat");
+
+    fat_close(ctx);
+    free(orig);
+}
+
+/* 12.2: alloc hands out a cluster that was FREE, marks it EOC (the exact
+ * type constant), and a second alloc picks a different one.  A fully
+ * allocated FAT is FAT_ERR_DISK_FULL. */
+static void test_alloc_cluster12(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+
+    uint32_t c1 = 0;
+    uint32_t c2 = 0;
+    assert(fat_alloc_cluster(ctx, &c1) == FAT_OK);
+    assert(c1 >= 2u && c1 <= fat_geometry(ctx)->cluster_count + 1u);
+    assert(raw_fat12_at(orig, FIXTURE_FAT_SECTOR, c1) == 0); /* was free */
+    assert(fat_at(ctx, c1) == 0xFFF); /* now EOC, exact constant */
+    assert(fat_alloc_cluster(ctx, &c2) == FAT_OK);
+    assert(c2 != c1);
+    assert(raw_fat12_at(orig, FIXTURE_FAT_SECTOR, c2) == 0);
+    assert(fat_at(ctx, c2) == 0xFFF);
+    assert(fat_at(ctx, c1) == 0xFFF); /* the second alloc changed nothing */
+
+    assert(fat_alloc_cluster(NULL, &c1) == FAT_ERR_INVALID_ARG);
+    assert(fat_alloc_cluster(ctx, NULL) == FAT_ERR_INVALID_ARG);
+    fat_close(ctx);
+
+    /* DISK_FULL: every data entry nonzero leaves nothing to allocate */
+    img = copy_image(orig, size);
+    for (uint32_t c = 2u; c <= 713u + 1u; c++)
+        if (raw_fat12_at(img, FIXTURE_FAT_SECTOR, c) == 0)
+            set_fat12_entry(img, c, 0x001);
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    assert(fat_alloc_cluster(ctx, &c1) == FAT_ERR_DISK_FULL);
+    fat_close(ctx);
+    free(orig);
+}
+
+/* 12.3: freeing the known chain 3->4->5->6->7 zeroes every entry (and the
+ * first alloc afterwards can take cluster 3 back); a looping chain frees
+ * what it walked and reports FAT_ERR_BAD_CLUSTER. */
+static void test_free_chain12(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+
+    assert(fat_free_chain(ctx, 3) == FAT_OK);
+    for (uint32_t c = 3u; c <= 7u; c++)
+        assert(fat_at(ctx, c) == 0);
+    /* the scan restarts at the lowest cluster, so 3 comes back first */
+    uint32_t c = 0;
+    assert(fat_alloc_cluster(ctx, &c) == FAT_OK);
+    assert(c == 3);
+
+    /* single-cluster chain */
+    assert(fat_free_chain(ctx, 2) == FAT_OK);
+    assert(fat_at(ctx, 2) == 0);
+    fat_close(ctx);
+
+    /* looping chain: FAT[8] = 8 */
+    img = copy_image(orig, size);
+    set_fat12_entry(img, 8, 8);
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    assert(fat_free_chain(ctx, 8) == FAT_ERR_BAD_CLUSTER);
+    assert(fat_at(ctx, 8) == 0); /* the walked entry was still freed */
+
+    assert(fat_free_chain(NULL, 3) == FAT_ERR_INVALID_ARG);
+    assert(fat_free_chain(ctx, 0) == FAT_ERR_INVALID_ARG);
+    assert(fat_free_chain(ctx, 1) == FAT_ERR_INVALID_ARG);
+    assert(fat_free_chain(ctx, fat_geometry(ctx)->cluster_count + 2) ==
+           FAT_ERR_INVALID_ARG);
+    fat_close(ctx);
+    free(orig);
+}
+
+/* 12.4: a plain create in dir1 fills the entry from tmpl (name included
+ * from `name`, not tmpl.name) and our own lookup finds every field. */
+static void test_add_dirent_create(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+
+    fat_dirent_t tmpl;
+    memset(&tmpl, 0, sizeof(tmpl));
+    strcpy(tmpl.name, "IGNORED"); /* on-disk name comes from `name` */
+    tmpl.attributes = 0x20;
+    tmpl.creation_time_tenth = 78;
+    tmpl.creation_time = dos_time_bits(12, 34, 56);
+    tmpl.creation_date = dos_date_bits(2026, 10, 5);
+    tmpl.last_access_date = dos_date_bits(2026, 10, 6);
+    tmpl.last_write_time = dos_time_bits(21, 5, 4);
+    tmpl.last_write_date = dos_date_bits(2025, 12, 31);
+    tmpl.first_cluster = 99;
+    tmpl.file_size = 123;
+
+    assert(fat_add_dirent(ctx, 8, "newfile.txt", &tmpl) == FAT_OK);
+
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir1/newfile.txt", &de) ==
+           FAT_OK);
+    assert(strcmp(de.name, "NEWFILE.TXT") == 0);
+    assert(de.attributes == 0x20);
+    assert(de.creation_time_tenth == 78);
+    assert(de.creation_time == dos_time_bits(12, 34, 56));
+    assert(de.creation_date == dos_date_bits(2026, 10, 5));
+    assert(de.last_access_date == dos_date_bits(2026, 10, 6));
+    assert(de.last_write_time == dos_time_bits(21, 5, 4));
+    assert(de.last_write_date == dos_date_bits(2025, 12, 31));
+    assert(de.first_cluster == 99);
+    assert(de.file_size == 123);
+
+    /* timestamps decode through the public helper */
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+    assert(fat_dos_date_to_tm(de.creation_date, de.creation_time,
+                              de.creation_time_tenth, &tm) == FAT_OK);
+    assert_tm_fields(&tm, 126, 9, 5, 12, 34, 56);
+
+    /* dir1: 5 live entries before, 6 after */
+    assert(count_dir_entries(ctx, 8) == 6);
+
+    fat_close(ctx);
+    free(orig);
+}
+
+/* 12.4: the first deleted (0xE5) slot is reused -- HOGE.TXT's slot in
+ * dir1, raw-verified at the exact byte offset. */
+static void test_add_dirent_reuse(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+
+    /* dir1 = cluster 8, data byte offset (14 + 6*2) * 512; mark the
+     * HOGE.TXT entry deleted (first byte 0xE5) */
+    size_t dir1_off = 26u * 512u;
+    size_t hoge_off = 0;
+    for (unsigned i = 0; i < 32u; i++) {
+        if (memcmp(img + dir1_off + i * 32u, "HOGE    TXT", 11) == 0) {
+            hoge_off = dir1_off + i * 32u;
+            break;
+        }
+    }
+    assert(hoge_off != 0);
+    img[hoge_off] = 0xE5;
+
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+
+    fat_dirent_t tmpl;
+    memset(&tmpl, 0, sizeof(tmpl));
+    tmpl.attributes = 0x20;
+    tmpl.first_cluster = 7;
+    tmpl.file_size = 5;
+    assert(fat_add_dirent(ctx, 8, "hoga.txt", &tmpl) == FAT_OK);
+
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir1/hoga.txt", &de) == FAT_OK);
+    assert(de.first_cluster == 7);
+    assert(de.file_size == 5);
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir1/hoge.txt", &de) ==
+           FAT_ERR_NOT_FOUND);
+
+    /* raw slot check on the flushed image: HOGA sits exactly where HOGE
+     * was, exactly once, and HOGE is gone */
+    assert(fat_write(ctx, "/tmp/p4_reuse.fat") == FAT_OK);
+    size_t fn = 0;
+    uint8_t* back = read_image("/tmp/p4_reuse.fat", &fn);
+    int hoga_count = 0;
+    int hoge_count = 0;
+    size_t hoga_off = 0;
+    for (unsigned i = 0; i < 32u; i++) {
+        if (memcmp(back + dir1_off + i * 32u, "HOGA    TXT", 11) == 0) {
+            hoga_count++;
+            hoga_off = dir1_off + i * 32u;
+        }
+        if (memcmp(back + dir1_off + i * 32u, "HOGE    TXT", 11) == 0)
+            hoge_count++;
+    }
+    assert(hoga_count == 1);
+    assert(hoga_off == hoge_off);
+    assert(hoge_count == 0);
+    free(back);
+    remove("/tmp/p4_reuse.fat");
+
+    /* hoga replaced hoge: still 5 live entries */
+    assert(count_dir_entries(ctx, 8) == 5);
+
+    fat_close(ctx);
+    free(orig);
+}
+
+/* EXISTS / NAME_TOO_LONG / DIR_FULL / INVALID_ARG paths of fat_add_dirent */
+static void test_add_dirent_errors(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    fat_dirent_t tmpl;
+    memset(&tmpl, 0, sizeof(tmpl));
+    tmpl.attributes = 0x20;
+    fat_dirent_t de;
+
+    /* EXISTS: hello.txt is live, the original entry stays untouched */
+    uint8_t* img = copy_image(orig, size);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    assert(fat_add_dirent(ctx, FAT_CLUSTER_ROOT, "hello.txt", &tmpl) ==
+           FAT_ERR_EXISTS);
+    memset(&de, 0, sizeof(de));
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "hello.txt", &de) == FAT_OK);
+    assert(de.file_size == 12);
+    assert(count_dir_entries(ctx, FAT_CLUSTER_ROOT) == 5);
+    fat_close(ctx);
+
+    /* NAME_TOO_LONG and NULL arguments */
+    img = copy_image(orig, size);
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    assert(fat_add_dirent(ctx, FAT_CLUSTER_ROOT, "toolongname.txt", &tmpl) ==
+           FAT_ERR_NAME_TOO_LONG);
+    assert(fat_add_dirent(NULL, FAT_CLUSTER_ROOT, "x", &tmpl) ==
+           FAT_ERR_INVALID_ARG);
+    assert(fat_add_dirent(ctx, FAT_CLUSTER_ROOT, NULL, &tmpl) ==
+           FAT_ERR_INVALID_ARG);
+    fat_close(ctx);
+
+    /* DIR_FULL: rootEntryCount = 5 = exactly the live root entries
+     * (label + hello + test_5kb + dir1 + dir2, slots 0..4), so the fixed
+     * FAT12 root region has no free slot and cannot extend */
+    img = copy_image(orig, size);
+    static const uint8_t re5[2] = {0x05, 0x00};
+    memcpy(img + BPB_ROOT_ENTRIES, re5, 2);
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    assert(fat_add_dirent(ctx, FAT_CLUSTER_ROOT, "extra.txt", &tmpl) ==
+           FAT_ERR_DIR_FULL);
+    memset(&de, 0, sizeof(de));
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "hello.txt", &de) == FAT_OK);
+    assert(de.file_size == 12);
+    fat_close(ctx);
+
+    free(orig);
+}
+
+/* 12.7 + mtools oracle: a 5000-byte file over 5 clusters, byte-exact
+ * through every read path, with mtype/mdir agreeing on the flushed image */
+static void test_write_file_roundtrip12(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+
+    size_t n = 5000;
+    uint8_t* data = make_pattern(n);
+
+    fat_dirent_t tmpl;
+    memset(&tmpl, 0, sizeof(tmpl));
+    tmpl.attributes = 0x20;
+    tmpl.creation_date = dos_date_bits(2026, 2, 3);
+    tmpl.creation_time = dos_time_bits(9, 8, 6);
+    tmpl.last_write_date = dos_date_bits(2026, 2, 3);
+    tmpl.last_write_time = dos_time_bits(9, 8, 6);
+
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "new.txt", data, n,
+                          &tmpl) == FAT_OK);
+    assert_write_roundtrip(ctx, FAT_CLUSTER_ROOT, "new.txt", data, n, 5);
+
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "new.txt", &de) == FAT_OK);
+    assert(de.attributes == 0x20);
+    assert(de.creation_date == dos_date_bits(2026, 2, 3));
+    assert(de.creation_time == dos_time_bits(9, 8, 6));
+    assert(de.last_write_date == dos_date_bits(2026, 2, 3));
+    assert(de.last_write_time == dos_time_bits(9, 8, 6));
+
+    /* attributes arrive verbatim from tmpl (RO|archive; hidden/system
+     * would vanish from mdir's default listing and break the oracle) */
+    memset(&tmpl, 0, sizeof(tmpl));
+    tmpl.attributes = 0x21;
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "attr.txt",
+                          (const uint8_t*)"xyz", 3, &tmpl) == FAT_OK);
+    memset(&de, 0, sizeof(de));
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "attr.txt", &de) == FAT_OK);
+    assert(de.attributes == 0x21);
+
+    /* pre-existing content untouched */
+    assert_read_string(ctx, "hello.txt", "hello world\n");
+
+    /* mtools oracle on the flushed image */
+    assert(fat_write(ctx, "/tmp/p4_rt12.fat") == FAT_OK);
+    assert_mtype_matches_read(ctx, "/tmp/p4_rt12.fat", "new.txt");
+    assert_listing_matches_mdir(ctx, "/tmp/p4_rt12.fat", "",
+                                FAT_CLUSTER_ROOT);
+    remove("/tmp/p4_rt12.fat");
+
+    free(data);
+    fat_close(ctx);
+    free(orig);
+}
+
+/* cluster-count boundaries around 1024-byte clusters (k, k+-1) */
+static void test_write_file_boundaries(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+
+    static const size_t sizes[] = {1023, 1024, 1025, 2048, 2049};
+    static const uint32_t clusters[] = {1, 1, 2, 2, 3};
+    char name[16];
+    for (int i = 0; i < 5; i++) {
+        snprintf(name, sizeof(name), "b%zu.txt", sizes[i]);
+        uint8_t* data = make_pattern(sizes[i]);
+        assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, name, data, sizes[i],
+                              NULL) == FAT_OK);
+        assert_write_roundtrip(ctx, FAT_CLUSTER_ROOT, name, data, sizes[i],
+                               clusters[i]);
+        free(data);
+    }
+
+    fat_close(ctx);
+    free(orig);
+}
+
+/* empty file (no chain, first_cluster 0), tmpl NULL defaults (ATTR_ARCHIVE
+ * + zero timestamps), and the EXISTS / INVALID_ARG / NAME_TOO_LONG paths */
+static void test_write_file_small(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+
+    /* 662 free data clusters: 713 total minus the 51 in use (every
+     * cluster 2..52 holds hello/test_5kb/dir1/dir2 and the 33+2 empty
+     * subdirectories spread under dir1 and dir2; FAT-verified) */
+    uint32_t free_before = count_free_clusters(ctx);
+    assert(free_before == 662u);
+
+    /* empty file: data NULL is only legal with size 0 */
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "empty.txt", NULL, 0,
+                          NULL) == FAT_OK);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "empty.txt", &de) == FAT_OK);
+    assert(de.file_size == 0);
+    assert(de.first_cluster == 0);
+    /* NULL tmpl = ATTR_ARCHIVE and zero timestamps */
+    assert(de.attributes == 0x20);
+    assert(de.creation_time_tenth == 0);
+    assert(de.creation_time == 0);
+    assert(de.creation_date == 0);
+    assert(de.last_access_date == 0);
+    assert(de.last_write_time == 0);
+    assert(de.last_write_date == 0);
+    uint8_t* back = NULL;
+    size_t bn = 0;
+    assert(fat_read_file(ctx, &de, &back, &bn) == FAT_OK);
+    assert(back == NULL);
+    assert(bn == 0);
+
+    /* empty wrote no cluster */
+    assert(count_free_clusters(ctx) == free_before);
+
+    /* EXISTS: the original survives byte for byte */
+    uint8_t one = 'x';
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "hello.txt", &one, 1,
+                          NULL) == FAT_ERR_EXISTS);
+    assert_read_string(ctx, "hello.txt", "hello world\n");
+    assert(count_free_clusters(ctx) == free_before); /* nothing leaked */
+
+    /* data NULL with size > 0 */
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "null.dat", NULL, 10,
+                          NULL) == FAT_ERR_INVALID_ARG);
+    /* NULL ctx / NULL name / unrepresentable name */
+    assert(fat_write_file(NULL, FAT_CLUSTER_ROOT, "x", NULL, 0, NULL) ==
+           FAT_ERR_INVALID_ARG);
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, NULL, NULL, 0, NULL) ==
+           FAT_ERR_INVALID_ARG);
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "toolongname.txt", NULL, 0,
+                          NULL) == FAT_ERR_NAME_TOO_LONG);
+
+    fat_close(ctx);
+    free(orig);
+}
+
+/* 12.7 rollback: DISK_FULL mid-chain leaves the FAT, the directory and
+ * the pre-existing files exactly as they were */
+static void test_write_file_rollback(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+
+    /* fill every free entry except 300 and 301 with a nonzero marker */
+    for (uint32_t c = 2u; c <= 713u + 1u; c++) {
+        if (c == 300u || c == 301u)
+            continue;
+        if (raw_fat12_at(img, FIXTURE_FAT_SECTOR, c) == 0)
+            set_fat12_entry(img, c, 0x001);
+    }
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+
+    size_t n = 5000; /* needs 5 clusters, only 2 are free */
+    uint8_t* data = make_pattern(n);
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "big.txt", data, n,
+                          NULL) == FAT_ERR_DISK_FULL);
+    free(data);
+
+    /* the two clusters were rolled back to FREE, nothing else leaked */
+    assert(fat_at(ctx, 300) == 0);
+    assert(fat_at(ctx, 301) == 0);
+    assert(count_free_clusters(ctx) == 2u);
+    /* no dirent appeared, the originals are intact */
+    assert(count_dir_entries(ctx, FAT_CLUSTER_ROOT) == 5);
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "big.txt", &de) ==
+           FAT_ERR_NOT_FOUND);
+    assert_read_string(ctx, "hello.txt", "hello world\n");
+    assert_read_matches_host(ctx, "test_5kb.txt", "test_5kb.txt", 4962);
+
+    fat_close(ctx);
+    free(orig);
+}
+
+/* write into a subdirectory resolved through lookup */
+static void test_write_file_subdir(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+
+    fat_dirent_t dir;
+    memset(&dir, 0, sizeof(dir));
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir2/subdir1", &dir) == FAT_OK);
+    assert(dir.first_cluster == 12);
+
+    size_t n = 100;
+    uint8_t* data = make_pattern(n);
+    assert(fat_write_file(ctx, dir.first_cluster, "new.txt", data, n,
+                          NULL) == FAT_OK);
+    /* reachable through the full path; 100 bytes fit one 1024B cluster */
+    assert_write_roundtrip(ctx, FAT_CLUSTER_ROOT, "dir2/subdir1/new.txt",
+                           data, n, 1);
+    /* subdir1 had ".", "..", page.txt, test_5kb.txt; now 5 entries */
+    assert(count_dir_entries(ctx, dir.first_cluster) == 5);
+
+    free(data);
+    fat_close(ctx);
+    free(orig);
+}
+
+/* fat_write: flush to an explicit path, reopen with fat_open, everything
+ * survived; NULL handling and an unwritable destination */
+static void test_write_flush(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_fixture(&size);
+    uint8_t* img = copy_image(orig, size);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+
+    size_t n = 5000;
+    uint8_t* data = make_pattern(n);
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "new.txt", data, n,
+                          NULL) == FAT_OK);
+
+    assert(fat_write(NULL, "/tmp/p4_flush12.fat") == FAT_ERR_INVALID_ARG);
+    assert(fat_write(ctx, NULL) == FAT_ERR_INVALID_ARG);
+
+    assert(fat_write(ctx, "/tmp/p4_flush12.fat") == FAT_OK);
+
+    /* exactly the whole image, and it reopens clean */
+    size_t fn = 0;
+    uint8_t* back = read_image("/tmp/p4_flush12.fat", &fn);
+    assert(fn == size);
+    free(back);
+    fat_ctx_t* fresh = NULL;
+    assert(fat_open("/tmp/p4_flush12.fat", &fresh) == FAT_OK);
+    assert(fat_get_type(fresh) == FT_FAT12);
+    assert_same_geometry(fat_geometry(ctx), fat_geometry(fresh));
+
+    fat_dirent_t de;
+    memset(&de, 0, sizeof(de));
+    assert(fat_lookup(fresh, FAT_CLUSTER_ROOT, "new.txt", &de) == FAT_OK);
+    assert(de.file_size == n);
+    uint8_t* rdata = NULL;
+    size_t rn = 0;
+    assert(fat_read_file(fresh, &de, &rdata, &rn) == FAT_OK);
+    assert(rn == n);
+    assert(memcmp(rdata, data, n) == 0);
+    free(rdata);
+    assert_read_string(fresh, "hello.txt", "hello world\n");
+    fat_close(fresh);
+
+    /* an unwritable destination reports FAT_ERR_IO */
+    assert(fat_write(ctx, "/tmp/no_such_dir_p4/x.fat") == FAT_ERR_IO);
+
+    remove("/tmp/p4_flush12.fat");
+    free(data);
+    fat_close(ctx);
+    free(orig);
+}
+
+/* FAT16: entry value ceiling, alloc/free accounting, multi-cluster write */
+static void test_fat16_write(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_image(IMG16_NAME, &size);
+    uint8_t* img = copy_image(orig, size);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    uint32_t before = count_free_clusters(ctx);
+
+    /* set/get roundtrip and the 16-bit value ceiling */
+    assert(fat_at(ctx, 20) == 0); /* free cluster past the fixture chains */
+    assert(fat_set_fat_entry(ctx, 20, 0x1234) == FAT_OK);
+    assert(fat_at(ctx, 20) == 0x1234);
+    assert(fat_set_fat_entry(ctx, 21, 0xFFFF) == FAT_OK); /* EOC */
+    assert(fat_at(ctx, 21) == 0xFFFF);
+    assert(fat_set_fat_entry(ctx, 22, 0x10000) == FAT_ERR_INVALID_ARG);
+    assert(fat_set_fat_entry(ctx, 1, 1) == FAT_ERR_INVALID_ARG);
+
+    /* alloc then free restores the free count exactly */
+    uint32_t c = 0;
+    assert(fat_alloc_cluster(ctx, &c) == FAT_OK);
+    assert(fat_at(ctx, c) == 0xFFFF);
+    assert(fat_set_fat_entry(ctx, 20, 0) == FAT_OK); /* restore */
+    assert(fat_set_fat_entry(ctx, 21, 0) == FAT_OK);
+    assert(fat_free_chain(ctx, c) == FAT_OK);
+    assert(count_free_clusters(ctx) == before);
+
+    /* 1000 bytes over 2 clusters of 512B */
+    size_t n = 1000;
+    uint8_t* data = make_pattern(n);
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "new.txt", data, n,
+                          NULL) == FAT_OK);
+    assert_write_roundtrip(ctx, FAT_CLUSTER_ROOT, "new.txt", data, n, 2);
+    free(data);
+
+    fat_close(ctx);
+    free(orig);
+}
+
+/* FAT32: the upper 4 reserved bits of an entry survive set_fat_entry,
+ * both mirrored tables included */
+static void test_set_fat_entry32(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_image(IMG32_NAME, &size);
+    uint8_t* img = copy_image(orig, size);
+    set_fat32_entry(img, 10, 0xA000000Au); /* reserved nibble 0xA, val 10 */
+    /* keep the mirror (FAT #1, 520 sectors later) in agreement so the
+     * image stays self-consistent */
+    memcpy(img + (size_t)(F32_FAT_SECTOR + 520u) * 512u + 10u * 4u,
+           img + (size_t)F32_FAT_SECTOR * 512u + 10u * 4u, 4);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    const fat_geometry_t* g = fat_geometry(ctx);
+
+    uint32_t before9 = fat_at(ctx, 9);
+    uint32_t before11 = fat_at(ctx, 11);
+    assert(fat_set_fat_entry(ctx, 10, 0x01234567u) == FAT_OK);
+    assert(fat_at(ctx, 10) == 0x01234567u); /* masked readback */
+    assert(fat_at(ctx, 9) == before9);
+    assert(fat_at(ctx, 11) == before11);
+
+    assert(fat_set_fat_entry(ctx, 10, 0x10000000u) == FAT_ERR_INVALID_ARG);
+    assert(fat_set_fat_entry(ctx, 0, 1) == FAT_ERR_INVALID_ARG);
+    assert(fat_set_fat_entry(ctx, g->cluster_count + 2, 1) ==
+           FAT_ERR_INVALID_ARG);
+    assert(fat_set_fat_entry(NULL, 10, 1) == FAT_ERR_INVALID_ARG);
+
+    /* raw check: reserved nibble kept in both FAT copies after flush */
+    assert(fat_write(ctx, "/tmp/p4_set32.fat") == FAT_OK);
+    size_t fn = 0;
+    uint8_t* back = read_image("/tmp/p4_set32.fat", &fn);
+    assert(fn == size);
+    for (unsigned t = 0; t < 2u; t++) {
+        size_t off =
+            (size_t)(F32_FAT_SECTOR + t * 520u) * 512u + 10u * 4u;
+        uint32_t v = (uint32_t)back[off] |
+                     ((uint32_t)back[off + 1] << 8) |
+                     ((uint32_t)back[off + 2] << 16) |
+                     ((uint32_t)back[off + 3] << 24);
+        assert(v == 0xA1234567u); /* 0xA<<28 | 0x01234567 */
+    }
+    free(back);
+    remove("/tmp/p4_set32.fat");
+
+    fat_close(ctx);
+    free(orig);
+}
+
+/* FAT32: FSInfo free count steps down per alloc and back up per free,
+ * and the next-free hint stays a sane cluster number */
+static void test_alloc_free32(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_image(IMG32_NAME, &size);
+    uint8_t* img = copy_image(orig, size);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    const fat_geometry_t* g = fat_geometry(ctx);
+
+    fat_fsinfo_t fi;
+    memset(&fi, 0, sizeof(fi));
+    assert(fat_fsinfo(ctx, &fi) == FAT_OK);
+    uint32_t free_before = fi.free_cluster_count;
+    assert(free_before == 66454u); /* fixture fact, mdir cross-checked */
+
+    uint32_t c = 0;
+    assert(fat_alloc_cluster(ctx, &c) == FAT_OK);
+    assert(fat_at(ctx, c) == 0x0FFFFFFFu); /* EOC, exact constant */
+    assert(fat_fsinfo(ctx, &fi) == FAT_OK);
+    assert(fi.free_cluster_count == free_before - 1u);
+    assert(fi.next_free_cluster >= 2u);
+    assert(fi.next_free_cluster <= g->cluster_count + 1u);
+    assert(fi.next_free_cluster != 0xFFFFFFFFu);
+
+    /* freeing it back restores the count (hint head update is sane) */
+    assert(fat_free_chain(ctx, c) == FAT_OK);
+    assert(fat_at(ctx, c) == 0);
+    assert(fat_fsinfo(ctx, &fi) == FAT_OK);
+    assert(fi.free_cluster_count == free_before);
+    assert(fi.next_free_cluster >= 2u);
+    assert(fi.next_free_cluster <= g->cluster_count + 1u);
+
+    fat_close(ctx);
+    free(orig);
+}
+
+/* FAT32 root chain extension: clusters 2->54->55 hold 44 entries; cluster
+ * 55 has 4 free slots, so the 5th add extends the chain by one zeroed
+ * cluster (one allocation in total -- dirent-only adds take no data). */
+static void test_fat32_root_extend(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_image(IMG32_NAME, &size);
+    uint8_t* img = copy_image(orig, size);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    const fat_geometry_t* g = fat_geometry(ctx);
+
+    assert(count_dir_entries(ctx, FAT_CLUSTER_ROOT) == 44);
+    assert(fat_at(ctx, 55) == 0x0FFFFFFFu); /* chain ends at 55 */
+
+    fat_dirent_t tmpl;
+    memset(&tmpl, 0, sizeof(tmpl));
+    tmpl.attributes = 0x20;
+    for (int i = 1; i <= 5; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "x%d.txt", i);
+        assert(fat_add_dirent(ctx, FAT_CLUSTER_ROOT, name, &tmpl) == FAT_OK);
+    }
+
+    /* the chain grew: 55 now links to a fresh EOC cluster */
+    uint32_t next = fat_at(ctx, 55);
+    assert(next >= 2u && next <= g->cluster_count + 1u);
+    assert(fat_at(ctx, next) == 0x0FFFFFFFu);
+
+    /* 44 + 5 live entries */
+    assert(count_dir_entries(ctx, FAT_CLUSTER_ROOT) == 49);
+
+    /* dirent-only adds allocate exactly the one extension cluster */
+    fat_fsinfo_t fi;
+    memset(&fi, 0, sizeof(fi));
+    assert(fat_fsinfo(ctx, &fi) == FAT_OK);
+    assert(fi.free_cluster_count == 66454u - 1u);
+
+    /* the new cluster is zeroed except for the single fresh entry (x5,
+     * the 5th add, is the one that forced the extension) */
+    assert(fat_write(ctx, "/tmp/p4_ext32.fat") == FAT_OK);
+    size_t fn = 0;
+    uint8_t* back = read_image("/tmp/p4_ext32.fat", &fn);
+    size_t cl_bytes = (size_t)g->sectors_per_cluster * g->bytes_per_sector;
+    size_t cl_off = ((size_t)g->data_start_sector + (next - 2u) *
+                    g->sectors_per_cluster) * g->bytes_per_sector;
+    assert(memcmp(back + cl_off, "X5      TXT", 11) == 0);
+    for (size_t i = 32; i < cl_bytes; i++)
+        assert(back[cl_off + i] == 0);
+    free(back);
+    remove("/tmp/p4_ext32.fat");
+
+    fat_close(ctx);
+    free(orig);
+}
+
+/* FAT32 write_file: FSInfo steps down by the data cluster count, subdirs
+ * work, and the mtools oracle agrees on the flushed image */
+static void test_fat32_write_file(void)
+{
+    size_t size = 0;
+    uint8_t* orig = read_image(IMG32_NAME, &size);
+    uint8_t* img = copy_image(orig, size);
+    fat_ctx_t* ctx = NULL;
+    assert(fat_open_mem(img, size, &ctx) == FAT_OK);
+    free(img);
+    const fat_geometry_t* g = fat_geometry(ctx);
+
+    fat_fsinfo_t fi;
+    memset(&fi, 0, sizeof(fi));
+    assert(fat_fsinfo(ctx, &fi) == FAT_OK);
+    assert(fi.free_cluster_count == 66454u);
+
+    /* 5000 bytes over 10 clusters of 512B */
+    size_t n = 5000;
+    uint8_t* data = make_pattern(n);
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "new.txt", data, n,
+                          NULL) == FAT_OK);
+    assert_write_roundtrip(ctx, FAT_CLUSTER_ROOT, "new.txt", data, n, 10);
+    assert(fat_fsinfo(ctx, &fi) == FAT_OK);
+    assert(fi.free_cluster_count == 66454u - 10u);
+    assert(fi.next_free_cluster >= 2u);
+    assert(fi.next_free_cluster <= g->cluster_count + 1u);
+
+    /* empty file allocates nothing */
+    assert(fat_write_file(ctx, FAT_CLUSTER_ROOT, "empty.txt", NULL, 0,
+                          NULL) == FAT_OK);
+    assert(fat_fsinfo(ctx, &fi) == FAT_OK);
+    assert(fi.free_cluster_count == 66454u - 10u);
+
+    /* write into dir1 (cluster 56), one more cluster */
+    fat_dirent_t dir;
+    memset(&dir, 0, sizeof(dir));
+    assert(fat_lookup(ctx, FAT_CLUSTER_ROOT, "dir1", &dir) == FAT_OK);
+    size_t sn = 100;
+    uint8_t* sdata = make_pattern(sn);
+    assert(fat_write_file(ctx, dir.first_cluster, "sub.txt", sdata, sn,
+                          NULL) == FAT_OK);
+    assert_write_roundtrip(ctx, FAT_CLUSTER_ROOT, "dir1/sub.txt", sdata, sn,
+                           1);
+    assert(fat_fsinfo(ctx, &fi) == FAT_OK);
+    assert(fi.free_cluster_count == 66454u - 11u);
+
+    /* originals intact + mtools oracle on the flushed image */
+    assert_read_string(ctx, "hello.txt", "hello world\n");
+    assert(fat_write(ctx, "/tmp/p4_rt32.fat") == FAT_OK);
+    assert_mtype_matches_read(ctx, "/tmp/p4_rt32.fat", "new.txt");
+    assert_listing_matches_mdir(ctx, "/tmp/p4_rt32.fat", "",
+                                FAT_CLUSTER_ROOT);
+    assert_listing_matches_mdir(ctx, "/tmp/p4_rt32.fat", "dir1",
+                                dir.first_cluster);
+    remove("/tmp/p4_rt32.fat");
+
+    free(sdata);
+    free(data);
+    fat_close(ctx);
+    free(orig);
+}
+
 int main(void)
 {
     RUN(test_open);
@@ -2059,6 +3043,19 @@ int main(void)
         printf("%-40s skipped (mtools not installed)\n", "test_mtools_diff");
     }
 
+    RUN(test_set_fat_entry12);
+    RUN(test_alloc_cluster12);
+    RUN(test_free_chain12);
+    RUN(test_add_dirent_create);
+    RUN(test_add_dirent_reuse);
+    RUN(test_add_dirent_errors);
+    RUN(test_write_file_roundtrip12);
+    RUN(test_write_file_boundaries);
+    RUN(test_write_file_small);
+    RUN(test_write_file_rollback);
+    RUN(test_write_file_subdir);
+    RUN(test_write_flush);
+
     if (fixture_present(IMG16_NAME)) {
         RUN(test_fat16_open);
         RUN(test_fat16_fat_entries);
@@ -2068,6 +3065,7 @@ int main(void)
         RUN(test_fat16_file_stream);
         RUN(test_fat16_dir_cursor);
         RUN(test_boot_fuzz_values_fat16);
+        RUN(test_fat16_write);
         if (mtools_present()) {
             RUN(test_fat16_mtools_diff);
         } else {
@@ -2090,6 +3088,10 @@ int main(void)
         RUN(test_fat32_file_stream);
         RUN(test_fat32_dir_cursor);
         RUN(test_boot_fuzz_values_fat32);
+        RUN(test_set_fat_entry32);
+        RUN(test_alloc_free32);
+        RUN(test_fat32_root_extend);
+        RUN(test_fat32_write_file);
         if (mtools_present()) {
             RUN(test_fat32_mtools_diff);
         } else {

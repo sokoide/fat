@@ -295,3 +295,27 @@ TDD実施: **p-ab-test**がred フェーズで全テスト先行記述（A1/A2/A
 テスト構成: FAT12基盤9 + ファズ/mtools回帰 + FAT16 5 + FAT32 8 + 新API群（file 6/dir 5/dos日時/0x05/ラベル/ルートdots）= 37。
 
 次のステップ（§12設計済み）: フェーズ4書き込み対応（`fat_set_fat_entry`/`fat_alloc_cluster`/`fat_free_chain`/`fat_add_dirent`/`fat_write_file`/`fat_write`、FAT12 RMW・両FATコピー・FSInfo更新・DOSタイムスタンプ・失敗時一貫性順序）。
+
+## 15. フェーズ4実施結果（2026-10-06 完了）
+
+TDD実施: リードが`fat.h`に書き込みAPI契約を先行確定（§12.8から`fat_write_file`の`tmpl`引数と`FAT_ERR_EXISTS`を追加）→ **p4-test**が全テスト先行記述しred確認（既存シンボルはアサーションred、新シンボル6個はリンクred+`/tmp`参照スタブハーネスでテスト自己整合性を立証）→ **p4-lib**がgreen化（テスト凍結・契約変更なし）。中断なし、両エージェント完走。
+
+達成（`fat_core.c`書き込みセクション約540行 + `fat_dev.c`の`fat_write`）:
+- **`fat_set_fat_entry`**: FAT12はread-modify-write（オフセット`cluster*3/2`、偶数/奇数で隣接ニブル保護）。ミラーは全FATコピーへ、extFlags bit7で無効時はactive FATのみ（テーブルkの基底は`reserved_sectors + k*fat_sectors`から導出）。FAT32は上位4予約ビットを既存値から保存。値上限はタイプ別（0xFFF/0xFFFF/0x0FFFFFFF）。
+- **`fat_alloc_cluster`**: FAT32はFSInfoのnext_freeヒントを起点に环形走査（staleは2へフォールバック）。EOCマーク+FSInfo同期。空きなしは`DISK_FULL`（走査は読み取りのみでイメージ不変）。
+- **`fat_free_chain`**: 歩いたエントリをその場でゼロ化（zero-as-you-goでサイクルも自然破壊）、broken/loop時は歩いた分だけ解放済みの状態で`BAD_CLUSTER`。
+- **`fat_add_dirent`**: ワンパス走査（名前衝突/0xE5/0x00/チェーン尾部を1回で収集）。スロット優先順位は**0xE5→0x00→チェーン延長**。FAT12/16固定ルートは`DIR_FULL`。延長は1クラスタゼロ埋め（0x00終端を保証）。
+- **`fat_write_file`**: §12.7のクラッシュ一貫性順序（alloc→データ→dirent最後）、失敗時`fat_free_chain`で完全巻き戻し。EXISTS判定は確保前に実施（失敗書き込みが空きクラスタ数を動かさない）。空ファイルはfirst_cluster 0。
+- **`fat_write`**: イメージ全体を`path`へflush（作成/切捨て）。
+
+テスト（54テスト、+1004行）: ニブル隣接保護（偶数/奇数クラスタ書き込み後の隣接エントリ不変）、両ミラーraw一致、FAT32予約ビット保存（0xA1234567）、FSInfo増減、0xE5スロット再利用（バイトオフセット完全一致）、EXISTS-before-alloc（空き数監視）、`DIR_FULL`（rootEntryCount=5変異）、FAT32ルート延長（49エントリ、FSInfo -1）、クラスタ境界1023/1024/1025/2048/2049→1/1/2/2/3クラスタ、ロールバック（空き2+5クラスタ要求→DISK_FULLで完全復元）、round-trip+mtoolsオラクル（`mtype`バイト一致・`mdir`列挙一致）、`fat_write`でflush→再読込。
+
+検証（リード直接実施）: クリーンビルド `make check` = **54テスト×2全ok、警告ゼロ**（`-Wall -Wextra -Wshadow -Wstrict-prototypes`、通常+ASan/UBSan）。デモexit=0。変更ファイルは`fat.h`/`fat_core.c`/`fat_dev.c`/`testmain.c`の4つ。
+
+設計からの修正・逸脱:
+- **§12.1誤り（正誤）**: 奇数クラスタRMWの設計式`b[1]=value>>8`は誤り。正しくは`b[0]=(b[0]&0x0F)|(value<<4)`、`b[1]=(value>>4)&0xFF`。さらにp4-libが自己発見した`(cluster/2)*3`は奇数で`floor(cluster*3/2)`と一致しない（隣接ニブル破壊）→ `cluster*3/2`（size_t）に修正。
+- **§12.8からの逸脱（3件、全てリード承認済み）**: (1) `fat_write`はpath必須（NULL=open元パスの暗黙状態は廃止） (2) `fat_write_file`に`tmpl`引数追加（時刻ホックより決論的、NULL=ATTR_ARCHIVE+ゼロタイムスタンプ） (3) 新enum `FAT_ERR_EXISTS`（無言上書きより明示拒否）。
+- **p4-libが自己修正したバグ2件**: FAT12奇数オフセット（上記）、スロット優先順位（初期実装は0x00優先だったが契約どおり0xE5優先に修正）。
+- **リード指示の誤りをテスト側が修正**: DIR_FULLのrootEntryCount変異は6でなく5（5生存エントリ+1空きでは追加成功してしまう）。FAT32ルート延長のFSInfo減算は-6でなく-1（`fat_add_dirent`はデータクラスタを確保しない）。
+
+残課題: overwrite/truncate（既存ファイルの再書き込み）、削除（0xE5マーク+チェーン解放）、`fat_file_t`書き込み側カーソル — いずれも本フェーズのスコープ外（契約明記済み）。

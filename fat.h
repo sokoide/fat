@@ -33,6 +33,9 @@ typedef enum {
     FAT_ERR_PATH_NOT_FOUND,  // intermediate directory missing or not a dir
     FAT_ERR_BAD_CLUSTER,     // broken/looping cluster chain
     FAT_ERR_END_OF_DIR,      // directory cursor exhausted (fat_dir_next)
+    FAT_ERR_DISK_FULL,       // no free cluster left (fat_alloc_cluster)
+    FAT_ERR_DIR_FULL,        // FAT12/16 root directory is full
+    FAT_ERR_EXISTS,          // a live entry with this name already exists
 } fat_result_t;
 
 const char* fat_strerror(fat_result_t r);
@@ -228,5 +231,60 @@ fat_result_t fat_fsinfo(const fat_ctx_t* ctx, fat_fsinfo_t* out);
 //   FAT_ERR_BAD_CLUSTER  -> chain ends before file_size or loops
 fat_result_t fat_read_file(fat_ctx_t* ctx, const fat_dirent_t* file,
                            uint8_t** out, size_t* out_size);
+
+// write support -------------------------------------------------------------
+// All write APIs mutate the in-memory image owned by `ctx` (the copy made
+// at fat_open/fat_open_mem); the original file is untouched until
+// fat_write() flushes. Read cursors (fat_file_t/fat_dir_t) observe the
+// mutated image, but keeping them open across structural changes (chain
+// alloc/free, dirent writes) is undefined -- close them first.
+
+// Set FAT[cluster] = value in every FAT copy the spec requires: all
+// mirrors when mirroring is enabled, only the active copy when
+// BPB_ExtFlags disables mirroring. `value` is the unpacked entry, at most
+// 0xFFF / 0xFFFF / 0x0FFFFFFF by image type (larger is INVALID_ARG);
+// FAT32 upper 4 reserved bits keep their on-disk value. `cluster` must be
+// a valid data cluster (2..cluster_count+1).
+fat_result_t fat_set_fat_entry(fat_ctx_t* ctx, uint32_t cluster,
+                               uint32_t value);
+
+// Find a free cluster, mark it EOC and return it via `out`. The FSInfo
+// free count / next-free hint are kept in step (FAT32). The cluster's data
+// bytes are NOT cleared -- zero them yourself when extending a directory.
+//   FAT_ERR_DISK_FULL -> no free cluster remains
+fat_result_t fat_alloc_cluster(fat_ctx_t* ctx, uint32_t* out);
+
+// Free the whole chain headed at `head`: every entry becomes 0 in all
+// required FAT copies, FSInfo counts are updated. A broken/looping chain
+// frees the entries that were walked, then reports FAT_ERR_BAD_CLUSTER.
+fat_result_t fat_free_chain(fat_ctx_t* ctx, uint32_t head);
+
+// Create `name` in `dir_cluster` (FAT_CLUSTER_ROOT = the root directory),
+// filling the new 32-byte entry from `tmpl` (attributes, timestamps,
+// first_cluster, file_size; the on-disk name comes from `name` via
+// fat_name_to_83). The first deleted (0xE5) slot is reused, else the
+// first never-used (0x00) slot, else the directory chain is extended by
+// one zeroed cluster (subdirectories and the FAT32 root only).
+//   FAT_ERR_EXISTS        -> a live entry with this name already exists
+//   FAT_ERR_NAME_TOO_LONG -> `name` is not representable in 8.3
+//   FAT_ERR_DIR_FULL      -> FAT12/16 root region has no free slot
+fat_result_t fat_add_dirent(fat_ctx_t* ctx, uint32_t dir_cluster,
+                            const char* name, const fat_dirent_t* tmpl);
+
+// Create a new file `name` in `dir_cluster` holding `size` bytes copied
+// from `data` (data may be NULL only when size is 0). `tmpl` supplies the
+// attributes and timestamps (NULL = ATTR_ARCHIVE and zero timestamps; its
+// first_cluster/file_size fields are ignored). Crash-consistent order:
+// allocate and fill the data chain first, write the dirent last; on any
+// failure everything allocated so far is rolled back (freed) and the
+// error is returned, leaving the directory and FAT as they were.
+// An empty file gets first_cluster 0. An existing name is
+// FAT_ERR_EXISTS -- overwrite/truncate are not in this phase.
+fat_result_t fat_write_file(fat_ctx_t* ctx, uint32_t dir_cluster,
+                            const char* name, const uint8_t* data,
+                            size_t size, const fat_dirent_t* tmpl);
+
+// Flush the whole in-memory image to `path` (created/truncated).
+fat_result_t fat_write(const fat_ctx_t* ctx, const char* path);
 
 #endif

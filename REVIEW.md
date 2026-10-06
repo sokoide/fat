@@ -319,3 +319,111 @@ TDD実施: リードが`fat.h`に書き込みAPI契約を先行確定（§12.8�
 - **リード指示の誤りをテスト側が修正**: DIR_FULLのrootEntryCount変異は6でなく5（5生存エントリ+1空きでは追加成功してしまう）。FAT32ルート延長のFSInfo減算は-6でなく-1（`fat_add_dirent`はデータクラスタを確保しない）。
 
 残課題: overwrite/truncate（既存ファイルの再書き込み）、削除（0xE5マーク+チェーン解放）、`fat_file_t`書き込み側カーソル — いずれも本フェーズのスコープ外（契約明記済み）。
+
+## 16. フェーズ5（I/O抽象化）詳細設計（2026-10-06 追記）
+
+目標: 「イメージ丸ごとRAM載せ」を廃止し、`fat_io_t`バックエンド+セクタキャッシュ経由に全領域アクセスを置換。RAM載せは`fat_io_mem`の一実装に。ファイル/ブロックデバイス/FUSE等の並列バックエンドを可能にする。公開契約は`fat.h`のI/O abstractionセクションに確定済み（`fat_io_t` vtable、`fat_io_mem`/`fat_io_file`/`fat_open_io`/`fat_sync`）。
+
+### 16.1 バックエンド契約（fat.h）
+
+- vtable構造体は公開・ユーザー埋め込み可能（独自構造体の**先頭メンバ**として埋め、ダウンキャストで回収）。
+- read/write/size/close。size()は不変。範囲外転送は`FAT_ERR_IO`、長さ0は`FAT_OK`。closeはNULL可、呼ばれるのはctxクローズ時ちょうど1回。
+- 所有権: `fat_open_io`成功時ctxがioを所有（`fat_close`がflush+close）。失敗時は呼び出し側維持。
+- `fat_io_file`: fopen "r+b"、失敗時"rb"フォールバック（読み取り専用ファイルでも開ける。書き込みはflush時に`FAT_ERR_IO`）。
+
+### 16.2 セクタキャッシュ仕様（fat_core.c内部）
+
+- **direct-mapped 16スロット**、スロット=1セクタ（BPB確定後に`bytes_per_sector`分を確保）。インデックス=`セクタ番号 % 16`。
+- スロット: {valid, dirty, セクタ番号, データ}。読み: ヒット→コピー、ミス→追い出し（dirtyなら`io->write`でフラッシュ）→`io->read`で充填。書き: 対象セクタを充填（ミスなら読み）→バイト修正→dirtyマーク（**write-back**）。
+- `fat_sync(ctx)`: 全dirtyスロットをフラッシュ。`fat_close`: best-effortでフラッシュ→`io->close`→キャッシュ/ctx解放。フラッシュ失敗は`fat_sync`でのみ観測可能（closeはvoid）。
+- 教育目的の設計判断: LRUでなくdirect-mapped（O(1)・説明容易）。ミラーFATテーブル間の衝突により性能低下はあり得るが正しくはない。
+- **sync前の早期フラッシュ**: スロット衝突による追い出しでdirtyセクタは`fat_sync`以前にフラッシュされ得る。よって「sync前にバックエンド不変」は一般には保証されない（fat.h文面を「no later than fat_sync()/fat_close()」に修正済み）。
+
+### 16.3 内部API（fat_internal.h、p5-core所有）
+
+```c
+// キャッシュ経由の読み書き。任意スパン対応（セクタ境界を跨ぐFAT12
+// エントリを含む）、[0, ctx->image_size)で境界検査、長さ0はFAT_OK。
+fat_result_t fat_io_read(fat_ctx_t* ctx, uint64_t offset, void* buf, size_t len);
+fat_result_t fat_io_write(fat_ctx_t* ctx, uint64_t offset, const void* buf, size_t len);
+```
+
+- `struct fat_ctx`から`uint8_t* image`を削除し、`fat_io_t* io`+キャッシュ配列+`image_size`（=open時の`io->size()`スナップショット）へ。
+- BPB検証はctx構築前のため`io->read`直接（512バイト）。`fat_ctx_init_mem`は`fat_ctx_init(fat_io_t* io, fat_ctx_t** out)`へ置換（失敗時ioを閉じない）。
+- **ポインタ保持の全面禁止**: `fat_region_ptr`/`fat_fat_ptr`/`cluster_ptr`/`cluster_mut_ptr`/`fat_mut_ptr`は廃止。全アクセスを`fat_io_read`/`fat_io_write`のオフセット演算に置換。カーソル（`fat_dir_t`/`fat_file_t`）は生ポインタを保持せず、`fat_dir_next`は32バイトを直接`d->raw`へio_read（キャッシュで安価）。`fat_read_file`/`fat_file_read`はユーザーバッファへ直接io_read。
+
+### 16.4 既存APIの再実装
+
+| API | 新実装 |
+|---|---|
+| `fat_open(path)` | `fat_io_file`構築+`fat_open_io`（全読み込み廃止） |
+| `fat_open_mem` | `fat_io_mem`（呼び出し側バッファの私的コピー）+`fat_open_io` |
+| `fat_write(ctx, path)` | 論理イメージ全体のエクスポート（キャッシュ経由読みでチャンク単位にfwrite）。バックエンドへのフラッシュではない |
+| 書き込みAPI群 | 全操作がキャッシュ経由に。§12.7の失敗時一貫性順序はキャッシュのRAM整合性で保存 |
+
+### 16.5 意味論の変更（文書化済み）
+
+- `fat_open`で開いたファイルへの書き込みは、`fat_sync`/`fat_close`で**ファイル本体に到達する**（旧: RAMコピーのみ、`fat_write`で明示エクスポート）。
+- **フィクスチャ保護（重要）**: `demof12/16/32.fat`を`fat_open`+書き込み+closeで変更してはならない。書き込み系テストは`fat_open_mem`かカスタムバックエンドか/tmpコピーで行う。デモ（main.c）は読み取りのみのため無変更・無影響。
+
+### 16.6 エラー伝播
+
+- バックエンドread/write失敗は起動元APIから`FAT_ERR_IO`で伝播。BPB読み取り失敗は`FAT_ERR_IO`、内容不正は従来どおり`FAT_ERR_INVALID_BPB`。
+
+### 16.7 テスト計画（p5-test）
+
+- カスタム計数バックエンド（構造体埋め込みイディオムの動作保証）: read/write呼び出しパターン・呼び出しオフセット・境界外`FAT_ERR_IO`・close厳密1回。
+- write-back可視性: 書き込み直後はバックエンドバッファ不変、`fat_sync`後に変化が一致、closeでもフラッシュ。
+- read fail注入: N回目のread失敗→起動APIが`FAT_ERR_IO`。
+- FAT12セクタ跨ぎエントリ: クラスタ341（バイトオフセット511、`341*3/2=511`）のRMWがセクタ境界を正しく跨ぐことと隣接エントリ340/342不変。
+- `fat_io_file`実ファイルround-trip（/tmpコピーで）: 書き込み→sync→再open。
+- 既存54テスト: **アサーション凍結**。内部構造消滅に伴う機械的適応（例: `ctx->image`直接参照の除去）のみ許可、全件レポートで列挙。
+- 新シンボルはリンクred+/tmp参照スタブハーネスで自己整合性立証（前回と同じ手順）。
+
+### 16.8 分担
+
+- **p5-test**: testmain.c/Makefile（red確定まで。libファイル・fat.h編集禁止）。
+- **p5-core**: fat_internal.h/fat_core.c（キャッシュ、`fat_io_read/write`、全ポインタアクセス置換、`fat_open_io`/`fat_sync`、ctx再構成）。
+- **p5-dev**: fat_dev.c（`fat_io_mem`/`fat_io_file`、`fat_open`/`fat_open_mem`の薄ラッパー化、`fat_write`エクスポート）。
+- **p5-dump**: fat_dump.c（ポインタアクセス排除、`fat_io_read`/`fat_get_fat_entry`経由へ）。
+- main.c（デモ）は読み取りのみのため変更不要。リードが統合検証（`make check`×2+デモ、§17記録）。
+
+### 16.9 RED確定（2026-10-06、p5-test完了）
+
+- テスト66（新規12、旧54は**機械的適応ゼロ**・アサーション凍結）。リンクred=undefined 4シンボル（`fat_io_mem`/`fat_io_file`/`fat_open_io`/`fat_sync`）、アサーションred 1（`test_open_write_reaches_file`: 現行libはclose後もファイル不変）、lib非依存2はstubで立証。`/tmp/p5stub`ハーネスでテスト自己整合性と旧54非侵害を立証（残57 green実測）。
+- フィクスチャ保護実測: FNV-1aガードテスト（スイート先頭スナップショット→末尾再検証）、全実行後`git status`で0件変更。
+- 確定した契約論点（リード裁決）:
+  1. **eviction早期フラッシュを許容**。writeback可視性テストは「非衝突セクタのsync前不変」（`fat_set_fat_entry`のみ使用）と「sync/close後の最終状態」に分離。
+  2. **openは`io->read`ちょうど1回**（512バイトBOOTセクタ）。<512Bバックエンドは事前sizeチェックで`INVALID_BPB`にせず、read失敗の伝播で`FAT_ERR_IO`。
+  3. 失敗時の`*out`値は未規定のまま（テストはNULL初期化のみ）。`fat_sync(NULL)`は`FAT_ERR_INVALID_ARG`に規定（doc追記）。
+  4. `fat_io_file`の"r+b→rb"フォールバックは実行環境がrootで検証不可。書き込み失敗伝播はfail-injectバックエンドで一般契約として検証済み。
+- スコープ追加（ユーザー指示）: §10 noteの**dump色サイクルstatic解消**（`fat_dump.c:9`の`static int fat_print_color`）をp5-dumpに割当。
+
+## 17. フェーズ5実施結果（2026-10-06 完了）
+
+TDD実施: リードが`fat.h`のI/O abstraction契約を先行確定 → **p5-test**が66テストを先行記述しred確定（§16.9）→ **p5-core**（キャッシュ/`fat_io_read`/`fat_io_write`/ctx再構成/全ポインタアクセス置換）・**p5-dev**（`fat_io_mem`/`fat_io_file`/`fat_open`/`fat_open_mem`の薄ラッパー化/`fat_write`エクスポート）・**p5-dump**（`fat_io_read`/`fat_get_fat_entry`経由化+色サイクルstatic解消）が並列green化 → リードが統合検証。
+
+達成:
+- **`fat_io_t`バックエンド**: vtable公開・ユーザー構造体先頭埋め込み（ダウンキャスト回収）。`fat_io_mem`（私的コピー）・`fat_io_file`（"r+b"→"rb"フォールバック）・`fat_open_io`（openは512Bブートセクタ読み込みちょうど1回、vtable NULL検査、成功でctxがio所有・失敗で呼び出し側維持）。
+- **セクタキャッシュ**: direct-mapped 16スロット（インデックス=`sector%16`）、write-back、dirty追い出し時の早期フラッシュ許容（fat.h文面「no later than fat_sync()/fat_close()」に整合）。フラッシュ失敗時スロットはdirtyのまま（`fat_sync`が再試行）。充填失敗時キャッシュ状態不変。
+- **`fat_io_read`/`fat_io_write`**: 任意スパン（FAT12セクタ跨ぎ対応）、`[0, image_size)`境界検査、長さ0は`FAT_OK`。`struct fat_ctx`から`uint8_t* image`を削除し`image_size`スナップショットへ。`fat_region_ptr`等ポインタ保持アクセサは全面廃止（残存ゼロをgrep確認）。キャッシュ外の直接`io->`呼び出しはflush/fill/init/closeの4箇所のみ。
+- **FAT12セクタ跨ぎ実証**: クラスタ341（バイトオフセット511）のRMWが340/342を破壊しないことをテスト確認。
+- **dump色サイクルstatic解消**: `fat_print_color`廃止、色カウンタは呼び出しローカル（`int* color`引数）。出力同一性は「旧staticは常に使用前にCL_REDリセット」により保存（§10 note閉鎖）。
+
+テスト（66テスト、+679行、新規12・旧54は適応ゼロ）: 計数バックエンド（read/writeパターン・境界外`FAT_ERR_IO`・close厳密1回）、writeback可視性（sync前不変=非衝突セクタ/`fat_set_fat_entry`のみ、sync/close後最終状態）、read/write失敗注入→`FAT_ERR_IO`伝播、`fat_io_file`実ファイルround-trip、`fat_open`書き込みがファイル本体に到達、FNV-1aフィクスチャガード（スイート先頭スナップショット→末尾再検証）。
+
+検証（リード直接実施）: クリーンビルド `make check` = **66テスト×2全ok（132）、警告ゼロ**（`-Wall -Wextra -Wshadow -Wstrict-prototypes`、通常+ASan/UBSan）。デモexit=0。変更7ファイル（+1639/-368）。`git status`でフィクスチャ0件変更。
+
+設計からの修正・逸脱（リード裁決、§16.9記載の再録）:
+1. fat.hの「sync時にのみ書き戻し」文面は§16.2と矛盾 → **早期フラッシュ許容**に修正（テストは非衝突セクタの不変性に分離）。
+2. `fat_open_mem`はsize<512を事前検査して`INVALID_BPB`（旧契約互換）。`fat_open_io`はread失敗伝播の`FAT_ERR_IO`（事前sizeチェックなし）— 同じ100B入力でもAPIで挙動が分かれる。
+3. open時の`io->read`はブートセクタ512Bちょうど1回（<512Bバックエンドは`FAT_ERR_IO`）。
+4. 失敗時の`*out`は未規定。`fat_sync(NULL)`は`FAT_ERR_INVALID_ARG`。
+5. "r+b→rb"フォールバックは実行環境がrootで検証不可（書き込み失敗伝播はfail-injectで一般契約検証済み）。
+6. **dumpのパディング出力バグ修正**（M2級の表示バグ）: FAT12ダンプが末尾`000 `パディングを行単位に出力していた（103行→72行、実エントリはバイト同一）。旧テストは影響ゼロ（dumpはスナップショット非検証だったため）。
+
+決定事項:
+- **フィクスチャ戦略（§5未決定の決着）**: 凍結+ハッシュガード。`demof*.fat`はgit追跡の実物のまま、テストスイートがFNV-1aでスナップショット→再検証、CI相当の`git status`検証はリード実行。mtools再生成によるOEM差異問題はOEMアサート削除済みで非再発。
+- §0残課題の`tags`git追跡は既に解除済み（本フェーズ時点で`git ls-files`非対象）。
+
+残課題（フェーズ6候補）: §15残件のoverwrite/truncate・削除（0xE5+チェーン解放）・書き込み側ファイルカーソル。フェーズ3 LFNは引き続きユーザー見送り。

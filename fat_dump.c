@@ -1,17 +1,19 @@
 // fat_dump.c -- human-facing dump views (BPB, FAT table, directory tree).
 // The only file on the library side that prints; keeps the color.h dep.
+// Views never hold image pointers: bytes arrive in local buffers through
+// fat_io_read and the public accessors, so they work on any backend.
 
 #include "fat_internal.h"
 #include "color.h"
 #include <stdio.h>
 
-// view state (cycled legend colors), shared by the printers below
-static int fat_print_color;
-
-static void increment_color(void) {
-    fat_print_color += 1;
-    if (fat_print_color >= CL_GRAY + 1)
-        fat_print_color = CL_RED;
+// legend/byte printers cycle the colors CL_RED..CL_GRAY. The cycle counter
+// lives in each caller's frame and is passed as *color: no file-scope
+// state, so dump calls on different contexts never share it (reentrant).
+static void increment_color(int* color) {
+    *color += 1;
+    if (*color >= CL_GRAY + 1)
+        *color = CL_RED;
 }
 
 static const char* fat_type_name(const fat_ctx_t* ctx) {
@@ -66,24 +68,25 @@ void fat_print_info(const fat_ctx_t* ctx) {
     printf("* data cluster count %u\n", geo->cluster_count);
 }
 
-static void fat_print_legend(const char* legend) {
-    cl(fat_print_color);
+static void fat_print_legend(const char* legend, int* color) {
+    cl(*color);
     printf("- %s\n", legend);
-    increment_color();
+    increment_color(color);
 }
 
-static void fat_print_idx(const uint8_t* base, int* idx, const int len) {
-    cl(fat_print_color);
+static void fat_print_idx(const uint8_t* base, int* idx, const int len,
+                          int* color) {
+    cl(*color);
     for (int i = 0; i < len; i++) {
         printf("%02x ", (base)[*idx + i]);
     }
     *idx = *idx + len;
-    increment_color();
+    increment_color(color);
 }
 
-static void fat_print_idxstr(const uint8_t* base, int* idxStr,
-                             const int len) {
-    cl(fat_print_color);
+static void fat_print_idxstr(const uint8_t* base, int* idxStr, const int len,
+                             int* color) {
+    cl(*color);
     for (int i = 0; i < len; i++) {
         uint8_t u = base[*idxStr + i];
         if (40 <= u && u <= 126)
@@ -92,39 +95,38 @@ static void fat_print_idxstr(const uint8_t* base, int* idxStr,
             printf("**");
     }
     *idxStr = *idxStr + len;
-    increment_color();
+    increment_color(color);
 }
 
-static void fat_print_idx_wide(const uint8_t* base, int* idx,
-                               const int* lens) {
+static void fat_print_idx_wide(const uint8_t* base, int* idx, const int* lens) {
     int idxStr = *idx;
-    fat_print_color = CL_RED;
+    int color = CL_RED;
     for (int i = 0; lens[i] > 0; i++) {
-        fat_print_idx(base, idx, lens[i]);
+        fat_print_idx(base, idx, lens[i], &color);
     }
 
-    fat_print_color = CL_RED;
+    color = CL_RED;
     for (int i = 0; lens[i] > 0; i++) {
-        fat_print_idxstr(base, &idxStr, lens[i]);
+        fat_print_idxstr(base, &idxStr, lens[i], &color);
     }
 }
 
 void fat_print_header_legend(void) {
     clcl();
 
-    fat_print_color = CL_RED;
-    fat_print_legend("relative jump (eb3c) + nop (90)");
-    fat_print_legend("OEM Name");
-    fat_print_legend("bytes per sector");
-    fat_print_legend("sectors per cluster");
-    fat_print_legend("FAT table's 1st sector (reserved sectors)");
-    fat_print_legend("FAT table count");
-    fat_print_legend("Max entries in root table");
-    fat_print_legend("Total sector count");
-    fat_print_legend("Media type");
-    fat_print_legend("sectors per FAT table");
-    fat_print_legend("sectors per track");
-    fat_print_legend("head count");
+    int color = CL_RED;
+    fat_print_legend("relative jump (eb3c) + nop (90)", &color);
+    fat_print_legend("OEM Name", &color);
+    fat_print_legend("bytes per sector", &color);
+    fat_print_legend("sectors per cluster", &color);
+    fat_print_legend("FAT table's 1st sector (reserved sectors)", &color);
+    fat_print_legend("FAT table count", &color);
+    fat_print_legend("Max entries in root table", &color);
+    fat_print_legend("Total sector count", &color);
+    fat_print_legend("Media type", &color);
+    fat_print_legend("sectors per FAT table", &color);
+    fat_print_legend("sectors per track", &color);
+    fat_print_legend("head count", &color);
 
     clcl();
 }
@@ -132,20 +134,26 @@ void fat_print_header_legend(void) {
 void fat_print_header_dump(const fat_ctx_t* ctx) {
     clcl();
 
-    const FatBS* bs = (const FatBS*)fat_region_ptr(ctx, 0);
-    if (bs == NULL)
+    if (ctx == NULL)
+        return;
+
+    // boot sector / EBPB bytes into a local buffer through the I/O layer
+    // (no image pointer). The read only fills the sector cache, so it is
+    // semantically const -- hence the cast.
+    uint8_t bs[512];
+    if (fat_io_read((fat_ctx_t*)ctx, 0, bs, sizeof(bs)) != FAT_OK)
         return;
 
     // 1st line
     int idx = 0;
     const int l[] = {3, 8, 2, 1, 2, -1};
-    fat_print_idx_wide((const uint8_t*)bs, &idx, l);
+    fat_print_idx_wide(bs, &idx, l);
     printf("\n");
 
     // 2nd line
     idx = 16;
     const int l2[] = {1, 2, 2, 1, 2, 2, 2, 4, -1};
-    fat_print_idx_wide((const uint8_t*)bs, &idx, l2);
+    fat_print_idx_wide(bs, &idx, l2);
     printf("\n");
 
     // 3rd line, FAT32 only: totalSectors32 (offset 32) then the FatExtBS32
@@ -153,7 +161,7 @@ void fat_print_header_dump(const fat_ctx_t* ctx) {
     if (fat_get_type(ctx) == FT_FAT32) {
         idx = 32;
         const int l3[] = {4, 4, 2, 2, 4, 2, 2, -1};
-        fat_print_idx_wide((const uint8_t*)bs, &idx, l3);
+        fat_print_idx_wide(bs, &idx, l3);
         printf("\n");
     }
 
@@ -161,15 +169,16 @@ void fat_print_header_dump(const fat_ctx_t* ctx) {
 }
 
 void fat_print_fat(const fat_ctx_t* ctx) {
-    if (ctx == NULL)
+    const fat_geometry_t* geo = fat_geometry(ctx);
+    if (geo == NULL)
         return;
     // only print the FAT table the context reads (FAT #0, or the active
     // FAT32 table)
-    size_t fat_bytes = (size_t)ctx->geo.fat_sectors * ctx->geo.bytes_per_sector;
+    size_t fat_bytes = (size_t)geo->fat_sectors * geo->bytes_per_sector;
     const char* fmt;
     uint32_t entryCount;
     uint32_t maxShow; // cap for FAT32: a full table is unusable output
-    switch (ctx->type) {
+    switch (fat_get_type(ctx)) {
     case FT_FAT16:
         fmt = "%04X ";
         entryCount = (uint32_t)(fat_bytes / 2);
@@ -189,9 +198,12 @@ void fat_print_fat(const fat_ctx_t* ctx) {
     uint32_t shown = 0;
     bool truncated = false;
     for (uint32_t i = 0; i < entryCount; i++) {
-        uint32_t value = fat_raw_fat_entry(ctx, i);
-        if (value == FAT_CLUSTER_NOT_FOUND)
-            break; // FAT region ended
+        uint32_t value;
+        // entries are read through the public accessor: indices
+        // 0..cluster_count+1 are real, past that the table is sector
+        // rounding padding -- stop (the old code broke on region end)
+        if (fat_get_fat_entry(ctx, i, &value) != FAT_OK)
+            break; // no more real FAT entries
         printf(fmt, value);
         if (i % 10 == 9)
             printf("\n");
@@ -209,19 +221,19 @@ void fat_print_fat(const fat_ctx_t* ctx) {
 void fat_print_directory_entry_header_legend(void) {
     clcl();
 
-    fat_print_color = CL_RED;
-    fat_print_legend("Name");
-    fat_print_legend("Attributes");
-    fat_print_legend("(reserved)");
-    fat_print_legend("Creation time (millisec)");
-    fat_print_legend("Creation time");
-    fat_print_legend("Creation date");
-    fat_print_legend("Last access date");
-    fat_print_legend("(ignored in FAT12)");
-    fat_print_legend("Last write time");
-    fat_print_legend("Last write date");
-    fat_print_legend("Starting cluster");
-    fat_print_legend("File size");
+    int color = CL_RED;
+    fat_print_legend("Name", &color);
+    fat_print_legend("Attributes", &color);
+    fat_print_legend("(reserved)", &color);
+    fat_print_legend("Creation time (millisec)", &color);
+    fat_print_legend("Creation time", &color);
+    fat_print_legend("Creation date", &color);
+    fat_print_legend("Last access date", &color);
+    fat_print_legend("(ignored in FAT12)", &color);
+    fat_print_legend("Last write time", &color);
+    fat_print_legend("Last write date", &color);
+    fat_print_legend("Starting cluster", &color);
+    fat_print_legend("File size", &color);
 
     clcl();
 }
@@ -242,4 +254,3 @@ void fat_print_directory_entry_dump(const fat_dirent_t* entry,
     printf("\n");
     clcl();
 }
-

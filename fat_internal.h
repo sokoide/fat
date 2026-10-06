@@ -85,31 +85,51 @@ typedef struct {
 
 // context ----------------------------------------------------------------
 
+// direct-mapped sector cache: 16 slots of one sector each. The slot index
+// is `sector % 16`; collisions evict (flushing a dirty victim to the
+// backend first -- an early flush, permitted before fat_sync).
+#define FAT_CACHE_SLOTS 16
+
+typedef struct {
+    bool valid;
+    bool dirty;
+    uint64_t sector; // sector number this slot currently holds
+    uint8_t* data;   // ctx->cache_buf + slot_index * bytes_per_sector
+} fat_cache_slot_t;
+
 struct fat_ctx {
-    uint8_t* image;      // whole image copy (owned)
-    size_t image_size;
+    fat_io_t* io;       // owned backend (bound on a successful open)
+    size_t image_size;  // io->size() snapshot taken at open
     enum FAT_TYPE type;
-    fat_geometry_t geo;  // validated, host-endian
+    fat_geometry_t geo; // validated, host-endian
     uint16_t fsinfo_sector; // FAT32 BPB FSInfo sector; 0 = none (FAT12/16)
+    uint16_t ext_flags;     // FAT32 BPB_ExtFlags snapshot; 0 otherwise
+    fat_cache_slot_t cache[FAT_CACHE_SLOTS];
+    uint8_t* cache_buf; // FAT_CACHE_SLOTS * geo.bytes_per_sector bytes
 };
 
 // internal region/FAT accessors (fat_core.c) ------------------------------
 
 // Raw FAT[cluster] value, unpacked per the image type (12/16/32-bit wide;
-// FAT32 values masked with 0x0FFFFFFF). FAT_CLUSTER_NOT_FOUND when the FAT
-// region does not cover the index. Caller ensures a valid context.
-uint32_t fat_raw_fat_entry(const fat_ctx_t* ctx, uint32_t cluster);
+// FAT32 values masked with 0x0FFFFFFF), read through the sector cache.
+// Failure modes are distinct:
+//   FAT_OK              -> *out holds the entry
+//   FAT_ERR_IO          -> backend read failure
+//   FAT_ERR_INVALID_BPB -> the FAT region does not cover the index
+// Caller ensures a valid context and index range.
+fat_result_t fat_raw_fat_entry(fat_ctx_t* ctx, uint32_t cluster, uint32_t* out);
 
-// Pointer into the image at byte `offset`, or NULL when out of range.
-const uint8_t* fat_region_ptr(const fat_ctx_t* ctx, size_t offset);
+// Cache-mediated transfers over the backend: any span (a FAT12 entry may
+// straddle a sector boundary), bounds-checked against [0, image_size);
+// zero-length transfers are FAT_OK and touch nothing.
+fat_result_t fat_io_read(fat_ctx_t* ctx, uint64_t offset, void* buf, size_t len);
+fat_result_t fat_io_write(fat_ctx_t* ctx, uint64_t offset, const void* buf,
+                          size_t len);
 
-// Pointer to the FAT table the context reads (FAT #0, or the active FAT32
-// table), or NULL when out of range.
-const uint8_t* fat_fat_ptr(const fat_ctx_t* ctx);
-
-// Core initializer shared with fat_dev.c: validate the BPB, copy `size`
-// bytes of `image` into a fresh context, bind `*out`.
-fat_result_t fat_ctx_init_mem(fat_ctx_t** out, const uint8_t* image,
-                              size_t size);
+// Core initializer: validate the BPB through `io` (exactly one 512-byte
+// boot-sector read; a backend that cannot serve it fails with FAT_ERR_IO)
+// and bind `*out`. On success the context owns `io` (fat_close flushes and
+// closes it); on failure `io` is left untouched -- the caller keeps it.
+fat_result_t fat_ctx_init(fat_io_t* io, fat_ctx_t** out);
 
 #endif

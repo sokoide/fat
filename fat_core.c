@@ -1,6 +1,7 @@
 // fat_core.c -- context lifecycle, BPB validation, FAT12/16/32 decode,
 // directory iteration and path lookup. No stdio, no color: errors are
-// fat_result_t.
+// fat_result_t. Every region access goes through the sector cache over
+// the fat_io_t backend -- no whole-image buffer is ever held.
 
 #include "fat_internal.h"
 #include <stdlib.h>
@@ -18,74 +19,202 @@ static uint32_t rd32(const uint8_t* p) {
            ((uint32_t)p[3] << 24);
 }
 
-const uint8_t* fat_region_ptr(const fat_ctx_t* ctx, size_t offset) {
-    if (ctx == NULL || offset > ctx->image_size)
-        return NULL;
-    return ctx->image + offset;
+// ... and writers (the rd16/rd32 mirror)
+static void wr16(uint8_t* p, uint16_t v) {
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)(v >> 8);
 }
 
-const uint8_t* fat_fat_ptr(const fat_ctx_t* ctx) {
-    if (ctx == NULL)
-        return NULL;
-    size_t fat_offset = (size_t)ctx->geo.fat_start_sector *
-                        ctx->geo.bytes_per_sector;
-    size_t fat_bytes = (size_t)ctx->geo.fat_sectors *
-                       ctx->geo.bytes_per_sector;
-    if (fat_offset > ctx->image_size ||
-        fat_bytes > ctx->image_size - fat_offset)
-        return NULL;
-    return ctx->image + fat_offset;
+static void wr32(uint8_t* p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)((v >> 8) & 0xFF);
+    p[2] = (uint8_t)((v >> 16) & 0xFF);
+    p[3] = (uint8_t)((v >> 24) & 0xFF);
 }
 
-uint32_t fat_raw_fat_entry(const fat_ctx_t* ctx, uint32_t cluster) {
-    const uint8_t* fatp = fat_fat_ptr(ctx);
-    if (fatp == NULL)
-        return FAT_CLUSTER_NOT_FOUND;
+// Read-only public entry points take a const context, yet every read fills
+// the sector cache. The cache is logically-mutable state (a mutable member
+// in C++ terms) and the context object is never const at its definition,
+// so stripping the qualifier is safe.
+static fat_ctx_t* fat_ctx_mut(const fat_ctx_t* ctx) {
+    return (fat_ctx_t*)ctx;
+}
 
+// sector cache ------------------------------------------------------------
+
+// flush one dirty slot to the backend; the slot stays dirty on failure so
+// a later fat_sync retries it
+static fat_result_t cache_flush_slot(fat_ctx_t* ctx, fat_cache_slot_t* s) {
+    if (!s->valid || !s->dirty)
+        return FAT_OK;
+    uint32_t bps = ctx->geo.bytes_per_sector;
+    fat_result_t r = ctx->io->write(ctx->io, s->sector * bps, s->data, bps);
+    if (r != FAT_OK)
+        return r;
+    s->dirty = false;
+    return FAT_OK;
+}
+
+// flush every dirty slot (fat_sync; fat_close does this best-effort)
+static fat_result_t cache_flush_all(fat_ctx_t* ctx) {
+    for (int i = 0; i < FAT_CACHE_SLOTS; i++) {
+        fat_result_t r = cache_flush_slot(ctx, &ctx->cache[i]);
+        if (r != FAT_OK)
+            return r;
+    }
+    return FAT_OK;
+}
+
+// bring `sector` into its direct-mapped slot, flushing a displaced dirty
+// victim first (an early flush ahead of fat_sync is permitted). The slot
+// state is only updated after the fill succeeds, so a failed read leaves
+// the cache exactly as it was.
+static fat_result_t cache_sector(fat_ctx_t* ctx, uint64_t sector,
+                                 fat_cache_slot_t** out) {
+    uint32_t bps = ctx->geo.bytes_per_sector;
+    fat_cache_slot_t* s = &ctx->cache[sector % FAT_CACHE_SLOTS];
+    if (!s->valid || s->sector != sector) {
+        fat_result_t r = cache_flush_slot(ctx, s);
+        if (r != FAT_OK)
+            return r;
+        if (ctx->io->read(ctx->io, sector * bps, s->data, bps) != FAT_OK)
+            return FAT_ERR_IO;
+        s->valid = true;
+        s->dirty = false;
+        s->sector = sector;
+    }
+    *out = s;
+    return FAT_OK;
+}
+
+fat_result_t fat_io_read(fat_ctx_t* ctx, uint64_t offset, void* buf,
+                         size_t len) {
+    if (ctx == NULL || (len > 0 && buf == NULL))
+        return FAT_ERR_INVALID_ARG;
+    if (len == 0)
+        return FAT_OK;
+    if (offset > (uint64_t)ctx->image_size ||
+        (uint64_t)len > (uint64_t)ctx->image_size - offset)
+        return FAT_ERR_IO; // past the backend extent
+
+    uint32_t bps = ctx->geo.bytes_per_sector;
+    uint8_t* o = buf;
+    uint64_t pos = offset;
+    size_t left = len;
+    while (left > 0) {
+        fat_cache_slot_t* s;
+        fat_result_t r = cache_sector(ctx, pos / bps, &s);
+        if (r != FAT_OK)
+            return r;
+        size_t in_off = (size_t)(pos % bps);
+        size_t n = (size_t)bps - in_off;
+        if (n > left)
+            n = left;
+        memcpy(o, s->data + in_off, n);
+        o += n;
+        pos += n;
+        left -= n;
+    }
+    return FAT_OK;
+}
+
+fat_result_t fat_io_write(fat_ctx_t* ctx, uint64_t offset, const void* buf,
+                          size_t len) {
+    if (ctx == NULL || (len > 0 && buf == NULL))
+        return FAT_ERR_INVALID_ARG;
+    if (len == 0)
+        return FAT_OK;
+    if (offset > (uint64_t)ctx->image_size ||
+        (uint64_t)len > (uint64_t)ctx->image_size - offset)
+        return FAT_ERR_IO; // past the backend extent
+
+    uint32_t bps = ctx->geo.bytes_per_sector;
+    const uint8_t* src = buf;
+    uint64_t pos = offset;
+    size_t left = len;
+    while (left > 0) {
+        fat_cache_slot_t* s;
+        fat_result_t r = cache_sector(ctx, pos / bps, &s);
+        if (r != FAT_OK)
+            return r;
+        size_t in_off = (size_t)(pos % bps);
+        size_t n = (size_t)bps - in_off;
+        if (n > left)
+            n = left;
+        memcpy(s->data + in_off, src, n); // write-back: dirty until flushed
+        s->dirty = true;
+        src += n;
+        pos += n;
+        left -= n;
+    }
+    return FAT_OK;
+}
+
+// FAT decode ---------------------------------------------------------------
+
+fat_result_t fat_raw_fat_entry(fat_ctx_t* ctx, uint32_t cluster,
+                               uint32_t* out) {
     // byte span of entry `cluster` per packing (FAT12 packs two 12-bit
     // entries into every 3 bytes)
     size_t fat_bytes = (size_t)ctx->geo.fat_sectors *
                        ctx->geo.bytes_per_sector;
     size_t need;
+    uint64_t ent; // entry offset within the active table
+    size_t width;
     switch (ctx->type) {
     case FT_FAT16:
         need = (size_t)cluster * 2 + 2;
+        ent = (uint64_t)cluster * 2;
+        width = 2;
         break;
     case FT_FAT32:
         need = (size_t)cluster * 4 + 4;
+        ent = (uint64_t)cluster * 4;
+        width = 4;
         break;
     case FT_FAT12:
         need = (size_t)(cluster / 2) * 3 + 3;
+        ent = (uint64_t)cluster * 3 / 2; // floor: the shared-byte pair start
+        width = 2;
         break;
     default:
-        return FAT_CLUSTER_NOT_FOUND;
+        return FAT_ERR_INVALID_BPB;
     }
     if (need > fat_bytes)
-        return FAT_CLUSTER_NOT_FOUND;
+        return FAT_ERR_INVALID_BPB; // FAT region does not cover the index
+
+    uint64_t base = (uint64_t)ctx->geo.fat_start_sector *
+                    ctx->geo.bytes_per_sector;
+    uint8_t raw[4];
+    fat_result_t r = fat_io_read(ctx, base + ent, raw, width);
+    if (r != FAT_OK)
+        return r; // backend read failure
 
     switch (ctx->type) {
     case FT_FAT16:
-        return rd16(fatp + (size_t)cluster * 2);
+        *out = rd16(raw);
+        break;
     case FT_FAT32:
         // the upper 4 bits are reserved flags; masking is mandatory for
         // EOC detection
-        return rd32(fatp + (size_t)cluster * 4) & 0x0FFFFFFF;
+        *out = rd32(raw) & 0x0FFFFFFF;
+        break;
     case FT_FAT12: {
         uint32_t value;
-        const uint8_t* e = &fatp[(size_t)(cluster / 2) * 3];
         if (cluster % 2 == 0) {
-            value = e[0];
-            value |= (e[1] & 0x0F) << 8;
+            value = raw[0];
+            value |= (raw[1] & 0x0F) << 8;
         } else {
-            value = e[2];
-            value <<= 4;
-            value |= (e[1] & 0xF0) >> 4;
+            value = (uint32_t)raw[1] << 4;
+            value |= (raw[0] & 0xF0) >> 4;
         }
-        return value;
+        *out = value;
+        break;
     }
     default:
-        return FAT_CLUSTER_NOT_FOUND;
+        return FAT_ERR_INVALID_BPB;
     }
+    return FAT_OK;
 }
 
 // EOC / bad / reserved classification of a raw FAT value, per image type
@@ -132,6 +261,8 @@ static bool fat_is_reserved(const fat_ctx_t* ctx, uint32_t entry) {
     }
 }
 
+// region geometry ----------------------------------------------------------
+
 // fill a public fat_dirent_t from 32 raw on-disk bytes
 static void dirent_from_raw(const fat_ctx_t* ctx, const uint8_t* raw32,
                             fat_dirent_t* out) {
@@ -154,36 +285,47 @@ static void dirent_from_raw(const fat_ctx_t* ctx, const uint8_t* raw32,
     out->file_size = e->fileSize;
 }
 
-// pointer to data cluster `cluster`, or NULL when out of range
-static const uint8_t* cluster_ptr(const fat_ctx_t* ctx, uint32_t cluster) {
+// byte offset of data cluster `cluster`, or false when the whole cluster
+// does not lie in the image. 64-bit intermediates: cluster *
+// sectors_per_cluster * bytes_per_sector can exceed 32 bits in hostile
+// BPBs.
+static bool cluster_offset(const fat_ctx_t* ctx, uint32_t cluster,
+                           uint64_t* out) {
     if (cluster < 2 || cluster >= 2 + ctx->geo.cluster_count)
-        return NULL;
-    // 64-bit intermediates: cluster * sectors_per_cluster * bytes_per_sector
-    // can exceed 32 bits in hostile BPBs
+        return false;
     uint64_t offset = ((uint64_t)ctx->geo.data_start_sector +
                        (uint64_t)(cluster - 2) * ctx->geo.sectors_per_cluster) *
                       ctx->geo.bytes_per_sector;
     if (offset + fat_cluster_size(ctx) > (uint64_t)ctx->image_size)
-        return NULL;
-    return ctx->image + (size_t)offset;
+        return false;
+    *out = offset;
+    return true;
 }
 
-// shared BPB validation + image copy; fat_open (fat_dev.c) and fat_open_mem
-// both land here
-fat_result_t fat_ctx_init_mem(fat_ctx_t** out, const uint8_t* image,
-                              size_t size) {
+// context construction -------------------------------------------------------
+
+fat_result_t fat_ctx_init(fat_io_t* io, fat_ctx_t** out) {
     if (out == NULL)
         return FAT_ERR_INVALID_ARG;
     *out = NULL;
-    if (image == NULL)
+    // close is the only optional vtable entry (fat.h); a NULL read/write/
+    // size would crash later calls, so it is rejected up front
+    if (io == NULL || io->read == NULL || io->write == NULL ||
+        io->size == NULL)
         return FAT_ERR_INVALID_ARG;
-    if (size < 512)
-        return FAT_ERR_INVALID_BPB;
+
+    // Opening reads exactly one 512-byte sector: the boot sector. A backend
+    // too small to serve it fails right here with FAT_ERR_IO -- a pre-size
+    // check would misreport a short backend as an invalid BPB.
+    uint8_t boot[512];
+    if (io->read(io, 0, boot, sizeof(boot)) != FAT_OK)
+        return FAT_ERR_IO;
+    uint64_t backend_size = io->size(io);
 
     // validate the BPB before trusting any of its values
-    if (image[510] != 0x55 || image[511] != 0xAA)
+    if (boot[510] != 0x55 || boot[511] != 0xAA)
         return FAT_ERR_INVALID_BPB;
-    const FatBS* bs = (const FatBS*)image;
+    const FatBS* bs = (const FatBS*)boot;
     uint16_t bytesPerSector = rd16((const uint8_t*)&bs->bytesPerSector);
     uint8_t sectorsPerCluster = bs->sectorsPerCluster;
     uint16_t reservedSectorCount = rd16((const uint8_t*)&bs->reservedSectorCount);
@@ -252,8 +394,9 @@ fat_result_t fat_ctx_init_mem(fat_ctx_t** out, const uint8_t* image,
     uint32_t rootCluster = 0; // FAT12/16: fixed root region, no chain
     uint16_t fsInfoSector = 0;
     uint32_t activeFat = 0;
+    uint16_t extFlags = 0;
     if (type == FT_FAT32) {
-        uint16_t extFlags = rd16((const uint8_t*)&ext32->extFlags);
+        extFlags = rd16((const uint8_t*)&ext32->extFlags);
         rootCluster = rd32((const uint8_t*)&ext32->rootClus);
         fsInfoSector = rd16((const uint8_t*)&ext32->fsInfo);
         // spec: rootClus must name a valid data cluster
@@ -266,21 +409,24 @@ fat_result_t fat_ctx_init_mem(fat_ctx_t** out, const uint8_t* image,
             return FAT_ERR_INVALID_BPB;
     }
 
-    // the whole volume must actually fit in the buffer
+    // the whole volume must actually fit the backend extent
     uint64_t imageSize = totSec * bytesPerSector;
-    if (imageSize > (uint64_t)size)
+    if (imageSize > backend_size)
         return FAT_ERR_INVALID_BPB;
 
     fat_ctx_t* ctx = malloc(sizeof(*ctx));
     if (ctx == NULL)
         return FAT_ERR_NOMEM;
-    ctx->image = malloc((size_t)imageSize);
-    if (ctx->image == NULL) {
+    memset(ctx, 0, sizeof(*ctx)); // cache slots invalid, ext_flags 0
+    ctx->cache_buf = malloc((size_t)FAT_CACHE_SLOTS * bytesPerSector);
+    if (ctx->cache_buf == NULL) {
         free(ctx);
         return FAT_ERR_NOMEM;
     }
-    memcpy(ctx->image, image, (size_t)imageSize);
-    ctx->image_size = (size_t)imageSize;
+    for (int i = 0; i < FAT_CACHE_SLOTS; i++)
+        ctx->cache[i].data = ctx->cache_buf + (size_t)i * bytesPerSector;
+    ctx->io = io; // owned from here; fat_close flushes and closes it
+    ctx->image_size = (size_t)backend_size;
     ctx->type = type;
     ctx->geo.bytes_per_sector = bytesPerSector;
     ctx->geo.sectors_per_cluster = sectorsPerCluster;
@@ -300,26 +446,35 @@ fat_result_t fat_ctx_init_mem(fat_ctx_t** out, const uint8_t* image,
     ctx->geo.data_start_sector = (uint32_t)dataStart;
     ctx->geo.cluster_count = (uint32_t)clusters;
     ctx->fsinfo_sector = fsInfoSector;
+    ctx->ext_flags = extFlags;
 
     *out = ctx;
     return FAT_OK;
 }
 
-// lifecycle --------------------------------------------------------------
+// lifecycle ----------------------------------------------------------------
 
-fat_result_t fat_open_mem(const uint8_t* image, size_t size,
-                          fat_ctx_t** out) {
-    return fat_ctx_init_mem(out, image, size);
+fat_result_t fat_open_io(fat_io_t* io, fat_ctx_t** out) {
+    return fat_ctx_init(io, out);
+}
+
+fat_result_t fat_sync(fat_ctx_t* ctx) {
+    if (ctx == NULL)
+        return FAT_ERR_INVALID_ARG;
+    return cache_flush_all(ctx);
 }
 
 void fat_close(fat_ctx_t* ctx) {
     if (ctx == NULL)
         return;
-    free(ctx->image);
+    (void)cache_flush_all(ctx); // best-effort; errors belong to fat_sync
+    if (ctx->io != NULL && ctx->io->close != NULL)
+        ctx->io->close(ctx->io); // exactly once, at close
+    free(ctx->cache_buf);
     free(ctx);
 }
 
-// introspection ----------------------------------------------------------
+// introspection ------------------------------------------------------------
 
 enum FAT_TYPE fat_get_type(const fat_ctx_t* ctx) {
     if (ctx == NULL)
@@ -347,14 +502,17 @@ fat_result_t fat_get_fat_entry(const fat_ctx_t* ctx, uint32_t cluster,
     // entries
     if (cluster > ctx->geo.cluster_count + 1)
         return FAT_ERR_INVALID_ARG;
-    uint32_t value = fat_raw_fat_entry(ctx, cluster);
-    if (value == FAT_CLUSTER_NOT_FOUND)
+    uint32_t value;
+    fat_result_t r = fat_raw_fat_entry(fat_ctx_mut(ctx), cluster, &value);
+    if (r == FAT_ERR_IO)
+        return r; // backend read failure
+    if (r != FAT_OK)
         return FAT_ERR_INVALID_BPB; // FAT region does not cover the index
     *out = value;
     return FAT_OK;
 }
 
-// directory iteration ----------------------------------------------------
+// directory iteration --------------------------------------------------------
 
 // the 11-byte on-disk encodings of the dot entries
 static const uint8_t fat_dot11[11] = {'.', ' ', ' ', ' ', ' ', ' ',
@@ -363,7 +521,8 @@ static const uint8_t fat_dotdot11[11] = {'.', '.', ' ', ' ', ' ', ' ',
                                          ' ', ' ', ' ', ' ', ' '};
 
 // stepwise iterator over one directory; the single scan implementation
-// behind both fat_dir_next and fat_iter_dir
+// behind both fat_dir_next and fat_iter_dir. No image pointers are held:
+// each 32-byte entry is read into `raw` through the cache on demand.
 struct fat_dir {
     fat_ctx_t* ctx;
     bool fixed;         // FAT12/16 fixed root region (not a cluster chain)
@@ -373,23 +532,41 @@ struct fat_dir {
     uint32_t slot;      // chain mode: next entry slot within the cluster
     uint32_t visited;   // chain mode: clusters entered so far (loop cap)
     uint32_t fat_next;  // chain mode: FAT value of the current cluster
-    const uint8_t* cluster_data; // chain mode: pointer into the image
+    uint64_t cluster_off; // chain mode: byte offset of the current cluster
     fat_dirent_t entry; // cursor-owned storage handed to the caller
     uint8_t raw[32];    // ditto; valid until the next fat_dir_next/close
 };
 
-// validate one cluster of a directory chain: in-image and not marked bad
+// DOS invariant check: every subdirectory starts with a "." self-entry
+// (first 32 bytes: '.' + 10 spaces, ATTR_DIRECTORY); data or garbage here
+// is not a directory. Reads the 12 leading bytes through the cache.
+static fat_result_t dir_check_dot(fat_ctx_t* ctx, uint32_t cluster) {
+    uint64_t off;
+    if (!cluster_offset(ctx, cluster, &off))
+        return FAT_ERR_INVALID_ARG;
+    uint8_t head[12];
+    fat_result_t r = fat_io_read(ctx, off, head, sizeof(head));
+    if (r != FAT_OK)
+        return r;
+    if (memcmp(head, fat_dot11, 11) != 0 || (head[11] & ATTR_DIRECTORY) == 0)
+        return FAT_ERR_INVALID_ARG;
+    return FAT_OK;
+}
+
+// enter one cluster of a directory chain: in-image and not marked bad
 static fat_result_t dir_cluster_enter(fat_ctx_t* ctx, uint32_t cluster,
-                                      uint32_t* fat_next,
-                                      const uint8_t** data) {
-    const uint8_t* p = cluster_ptr(ctx, cluster);
-    if (p == NULL)
+                                      uint32_t* fat_next, uint64_t* data_off) {
+    uint64_t off;
+    if (!cluster_offset(ctx, cluster, &off))
         return FAT_ERR_BAD_CLUSTER;
-    uint32_t fat = fat_raw_fat_entry(ctx, cluster);
-    if (fat == FAT_CLUSTER_NOT_FOUND || fat_is_bad(ctx, fat))
+    uint32_t fat;
+    fat_result_t r = fat_raw_fat_entry(ctx, cluster, &fat);
+    if (r == FAT_ERR_IO)
+        return r;
+    if (r != FAT_OK || fat_is_bad(ctx, fat))
         return FAT_ERR_BAD_CLUSTER;
     *fat_next = fat;
-    *data = p;
+    *data_off = off;
     return FAT_OK;
 }
 
@@ -406,9 +583,12 @@ fat_result_t fat_dir_open(fat_ctx_t* ctx, uint32_t dir_cluster,
 
     if (dir_cluster == FAT_CLUSTER_ROOT && ctx->type != FT_FAT32) {
         // the FAT12/16 root directory is a fixed region, not a chain
-        size_t root_offset = (size_t)ctx->geo.root_dir_sector *
-                             ctx->geo.bytes_per_sector;
-        if (fat_region_ptr(ctx, root_offset) == NULL) {
+        uint64_t root_offset = (uint64_t)ctx->geo.root_dir_sector *
+                               ctx->geo.bytes_per_sector;
+        uint64_t root_bytes = (uint64_t)ctx->geo.root_dir_sectors *
+                              ctx->geo.bytes_per_sector;
+        if (root_offset > (uint64_t)ctx->image_size ||
+            root_bytes > (uint64_t)ctx->image_size - root_offset) {
             free(d);
             return FAT_ERR_INVALID_BPB;
         }
@@ -427,21 +607,18 @@ fat_result_t fat_dir_open(fat_ctx_t* ctx, uint32_t dir_cluster,
         return FAT_ERR_INVALID_ARG;
     }
 
-    // DOS invariant: every subdirectory starts with a "." self-entry (first
-    // 32 bytes: '.' + 10 spaces, ATTR_DIRECTORY); data or garbage here is
-    // not a directory. The root is exempt -- neither the fixed region nor
-    // the FAT32 root chain carries dot entries.
+    // The root is exempt from the dot check -- neither the fixed region
+    // nor the FAT32 root chain carries dot entries.
     if (!(ctx->type == FT_FAT32 && dir_cluster == ctx->geo.root_cluster)) {
-        const uint8_t* p = cluster_ptr(ctx, dir_cluster);
-        if (p == NULL || memcmp(p, fat_dot11, 11) != 0 ||
-            (p[11] & ATTR_DIRECTORY) == 0) {
+        fat_result_t r = dir_check_dot(ctx, dir_cluster);
+        if (r != FAT_OK) {
             free(d);
-            return FAT_ERR_INVALID_ARG;
+            return r;
         }
     }
 
     fat_result_t r =
-        dir_cluster_enter(ctx, dir_cluster, &d->fat_next, &d->cluster_data);
+        dir_cluster_enter(ctx, dir_cluster, &d->fat_next, &d->cluster_off);
     if (r != FAT_OK) {
         free(d);
         return r;
@@ -460,23 +637,22 @@ fat_result_t fat_dir_next(fat_dir_t* d, const fat_dirent_t** out,
         return FAT_ERR_END_OF_DIR; // sticky exhaustion
 
     if (d->fixed) {
-        const fat_ctx_t* ctx = d->ctx;
-        size_t root_offset = (size_t)ctx->geo.root_dir_sector *
-                             ctx->geo.bytes_per_sector;
-        const uint8_t* p = fat_region_ptr(ctx, root_offset);
-        if (p == NULL)
-            return FAT_ERR_INVALID_BPB;
+        fat_ctx_t* ctx = d->ctx;
+        uint64_t base = (uint64_t)ctx->geo.root_dir_sector *
+                        ctx->geo.bytes_per_sector;
         while (d->root_next < ctx->geo.root_entries) {
-            const uint8_t* raw =
-                p + (size_t)d->root_next++ * sizeof(DirectoryEntry);
+            uint64_t off =
+                base + (uint64_t)d->root_next++ * sizeof(DirectoryEntry);
+            fat_result_t r = fat_io_read(ctx, off, d->raw, sizeof(d->raw));
+            if (r != FAT_OK)
+                return r;
             // 0x00: no more entries, 0xE5: deleted
-            if (raw[0] == 0x00)
+            if (d->raw[0] == 0x00)
                 break;
-            if (raw[0] == 0xE5)
+            if (d->raw[0] == 0xE5)
                 continue;
-            if (raw[11] == ATTR_LONG_NAME)
+            if (d->raw[11] == ATTR_LONG_NAME)
                 continue; // long file name entry
-            memcpy(d->raw, raw, sizeof(d->raw));
             dirent_from_raw(d->ctx, d->raw, &d->entry);
             *out = &d->entry;
             if (raw32 != NULL)
@@ -492,18 +668,20 @@ fat_result_t fat_dir_next(fat_dir_t* d, const fat_dirent_t** out,
     for (;;) {
         bool end_of_dir = false;
         while (d->slot < entriesPerCluster) {
-            const uint8_t* raw =
-                d->cluster_data + (size_t)d->slot++ * sizeof(DirectoryEntry);
+            uint64_t off =
+                d->cluster_off + (uint64_t)d->slot++ * sizeof(DirectoryEntry);
+            fat_result_t r = fat_io_read(d->ctx, off, d->raw, sizeof(d->raw));
+            if (r != FAT_OK)
+                return r;
             // 0x00: no more entries, 0xE5: deleted
-            if (raw[0] == 0x00) {
+            if (d->raw[0] == 0x00) {
                 end_of_dir = true;
                 break;
             }
-            if (raw[0] == 0xE5)
+            if (d->raw[0] == 0xE5)
                 continue;
-            if (raw[11] == ATTR_LONG_NAME)
+            if (d->raw[11] == ATTR_LONG_NAME)
                 continue; // long file name entry
-            memcpy(d->raw, raw, sizeof(d->raw));
             dirent_from_raw(d->ctx, d->raw, &d->entry);
             *out = &d->entry;
             if (raw32 != NULL)
@@ -526,7 +704,7 @@ fat_result_t fat_dir_next(fat_dir_t* d, const fat_dirent_t** out,
         if (next < 2 || next >= 2 + d->ctx->geo.cluster_count)
             return FAT_ERR_BAD_CLUSTER;
         fat_result_t r =
-            dir_cluster_enter(d->ctx, next, &d->fat_next, &d->cluster_data);
+            dir_cluster_enter(d->ctx, next, &d->fat_next, &d->cluster_off);
         if (r != FAT_OK)
             return r;
         d->cluster = next;
@@ -560,7 +738,7 @@ fat_result_t fat_iter_dir(fat_ctx_t* ctx, uint32_t dir_cluster,
     return r == FAT_ERR_END_OF_DIR ? FAT_OK : r;
 }
 
-// 8.3 name conversion ----------------------------------------------------
+// 8.3 name conversion --------------------------------------------------------
 
 fat_result_t fat_name_from_83(const uint8_t name11[11], uint8_t attributes,
                               char* out, size_t out_len) {
@@ -641,7 +819,7 @@ fat_result_t fat_name_to_83(const char* name, uint8_t name11[11]) {
     return FAT_OK;
 }
 
-// timestamps -------------------------------------------------------------
+// timestamps -----------------------------------------------------------------
 
 fat_result_t fat_dos_date_to_tm(uint16_t dos_date, uint16_t dos_time,
                                 uint8_t dos_tenth, struct tm* out) {
@@ -677,7 +855,7 @@ fat_result_t fat_dos_date_to_tm(uint16_t dos_date, uint16_t dos_time,
     return FAT_OK;
 }
 
-// FSInfo (FAT32 only) ------------------------------------------------------
+// FSInfo (FAT32 only) ----------------------------------------------------------
 
 fat_result_t fat_fsinfo(const fat_ctx_t* ctx, fat_fsinfo_t* out) {
     if (ctx == NULL || out == NULL)
@@ -691,19 +869,22 @@ fat_result_t fat_fsinfo(const fat_ctx_t* ctx, fat_fsinfo_t* out) {
     if (ctx->fsinfo_sector == 0)
         return FAT_OK;
     uint64_t offset = (uint64_t)ctx->fsinfo_sector * ctx->geo.bytes_per_sector;
-    const uint8_t* p = fat_region_ptr(ctx, (size_t)offset);
-    if (p == NULL || ctx->image_size - (size_t)offset < 512)
+    if (offset + 512 > (uint64_t)ctx->image_size)
         return FAT_OK; // sector absent from the image
-    if (rd32(p) != 0x41615252 ||       // "RRaA"
-        rd32(p + 484) != 0x61417272 || // "rrAa"
-        rd32(p + 508) != 0xAA550000)
+    uint8_t sec[512];
+    fat_result_t r = fat_io_read(fat_ctx_mut(ctx), offset, sec, sizeof(sec));
+    if (r != FAT_OK)
+        return r;
+    if (rd32(sec) != 0x41615252 ||       // "RRaA"
+        rd32(sec + 484) != 0x61417272 || // "rrAa"
+        rd32(sec + 508) != 0xAA550000)
         return FAT_OK; // invalid signature: report unknown
-    out->free_cluster_count = rd32(p + 488);
-    out->next_free_cluster = rd32(p + 492);
+    out->free_cluster_count = rd32(sec + 488);
+    out->next_free_cluster = rd32(sec + 492);
     return FAT_OK;
 }
 
-// path lookup ------------------------------------------------------------
+// path lookup ------------------------------------------------------------------
 
 typedef struct {
     const uint8_t* name11; // 11-byte on-disk name to match
@@ -845,7 +1026,7 @@ fat_result_t fat_lookup(fat_ctx_t* ctx, uint32_t start_cluster,
     return FAT_ERR_INVALID_ARG;
 }
 
-// file read --------------------------------------------------------------
+// file read --------------------------------------------------------------------
 
 fat_result_t fat_read_file(fat_ctx_t* ctx, const fat_dirent_t* file,
                            uint8_t** out, size_t* out_size) {
@@ -885,14 +1066,24 @@ fat_result_t fat_read_file(fat_ctx_t* ctx, const fat_dirent_t* file,
     uint32_t remaining = file->file_size;
     uint32_t copied = 0;
     for (uint32_t visited = 0;; visited++) {
-        const uint8_t* p = cluster_ptr(ctx, cluster);
-        uint32_t fat = p != NULL ? fat_raw_fat_entry(ctx, cluster)
-                                 : FAT_CLUSTER_NOT_FOUND;
-        if (p == NULL || fat == FAT_CLUSTER_NOT_FOUND || fat_is_bad(ctx, fat))
+        uint64_t coff;
+        bool in_image = cluster_offset(ctx, cluster, &coff);
+        uint32_t fat = 0;
+        fat_result_t fr = in_image ? fat_raw_fat_entry(ctx, cluster, &fat)
+                                   : FAT_ERR_INVALID_BPB;
+        if (fr == FAT_ERR_IO) {
+            free(buf);
+            return fr; // backend read failure
+        }
+        if (!in_image || fr != FAT_OK || fat_is_bad(ctx, fat))
             break; // broken
 
         uint32_t n = remaining < cluster_size ? remaining : cluster_size;
-        memcpy(buf + copied, p, n);
+        fat_result_t r = fat_io_read(ctx, coff, buf + copied, n);
+        if (r != FAT_OK) {
+            free(buf);
+            return r;
+        }
         copied += n;
         remaining -= n;
         if (remaining == 0) {
@@ -930,7 +1121,7 @@ fat_result_t fat_read_file(fat_ctx_t* ctx, const fat_dirent_t* file,
     return FAT_ERR_BAD_CLUSTER;
 }
 
-// streaming file access ----------------------------------------------------
+// streaming file access ----------------------------------------------------------
 
 // read cursor over one file's cluster chain; the dirent is copied at open,
 // the context is borrowed (fat_close(ctx) before fat_file_close is a
@@ -978,16 +1169,19 @@ uint64_t fat_file_size(const fat_file_t* f) {
 // follow `steps` FAT links from `first`, with fat_read_file's guards:
 // bad/free/reserved values, EOC short of the target, bounds, visited cap
 // and Brent cycle detection (O(1) space, one extra compare per step)
-static fat_result_t chain_step(const fat_ctx_t* ctx, uint32_t first,
+static fat_result_t chain_step(fat_ctx_t* ctx, uint32_t first,
                                uint32_t steps, uint32_t* out) {
     uint32_t cluster = first;
     uint32_t tortoise = first;
     uint32_t power = 1;
     uint32_t lam = 1;
     for (uint32_t i = 0; i < steps; i++) {
-        uint32_t fat = fat_raw_fat_entry(ctx, cluster);
-        if (fat == FAT_CLUSTER_NOT_FOUND || fat_is_bad(ctx, fat) ||
-            fat_is_eoc(ctx, fat) || fat == 0 || fat_is_reserved(ctx, fat))
+        uint32_t fat;
+        fat_result_t r = fat_raw_fat_entry(ctx, cluster, &fat);
+        if (r == FAT_ERR_IO)
+            return r;
+        if (r != FAT_OK || fat_is_bad(ctx, fat) || fat_is_eoc(ctx, fat) ||
+            fat == 0 || fat_is_reserved(ctx, fat))
             return FAT_ERR_BAD_CLUSTER;
         cluster = fat;
         if (cluster < 2 || cluster >= 2 + ctx->geo.cluster_count)
@@ -1058,12 +1252,14 @@ fat_result_t fat_file_read(fat_file_t* f, uint8_t* buf, size_t len,
     uint32_t steps = 0;
 
     while (left > 0) {
-        const uint8_t* p = cluster_ptr(f->ctx, cluster);
-        if (p == NULL)
+        uint64_t coff;
+        if (!cluster_offset(f->ctx, cluster, &coff))
             return FAT_ERR_BAD_CLUSTER;
         uint32_t avail = cluster_size - offset_in;
         uint64_t n = left < avail ? left : avail;
-        memcpy(o, p + offset_in, (size_t)n);
+        fat_result_t r = fat_io_read(f->ctx, coff + offset_in, o, (size_t)n);
+        if (r != FAT_OK)
+            return r;
         o += n;
         left -= n;
         offset_in += (uint32_t)n;
@@ -1071,10 +1267,12 @@ fat_result_t fat_file_read(fat_file_t* f, uint8_t* buf, size_t len,
             break;
 
         // need the next cluster: follow the FAT with fat_read_file's guards
-        uint32_t fat = fat_raw_fat_entry(f->ctx, cluster);
-        if (fat == FAT_CLUSTER_NOT_FOUND || fat_is_bad(f->ctx, fat) ||
-            fat_is_eoc(f->ctx, fat) || fat == 0 ||
-            fat_is_reserved(f->ctx, fat))
+        uint32_t fat;
+        r = fat_raw_fat_entry(f->ctx, cluster, &fat);
+        if (r == FAT_ERR_IO)
+            return r;
+        if (r != FAT_OK || fat_is_bad(f->ctx, fat) || fat_is_eoc(f->ctx, fat) ||
+            fat == 0 || fat_is_reserved(f->ctx, fat))
             return FAT_ERR_BAD_CLUSTER; // chain ends before the file does
         cluster = fat;
         index++;
@@ -1105,39 +1303,7 @@ void fat_file_close(fat_file_t* f) {
     free(f); // NULL-safe
 }
 
-// write support ------------------------------------------------------------
-
-// host-endian little-endian writers (the rd16/rd32 mirror)
-static void wr16(uint8_t* p, uint16_t v) {
-    p[0] = (uint8_t)(v & 0xFF);
-    p[1] = (uint8_t)(v >> 8);
-}
-
-static void wr32(uint8_t* p, uint32_t v) {
-    p[0] = (uint8_t)(v & 0xFF);
-    p[1] = (uint8_t)((v >> 8) & 0xFF);
-    p[2] = (uint8_t)((v >> 16) & 0xFF);
-    p[3] = (uint8_t)((v >> 24) & 0xFF);
-}
-
-// mutable image pointer spanning [offset, offset+len), or NULL when out of
-// range -- the write-side counterpart of fat_region_ptr: every write goes
-// through a bounds check shaped like the matching read
-static uint8_t* fat_mut_ptr(fat_ctx_t* ctx, uint64_t offset, uint64_t len) {
-    if (offset > ctx->image_size || len > ctx->image_size - offset)
-        return NULL;
-    return ctx->image + (size_t)offset;
-}
-
-// mutable data cluster pointer (cluster_ptr's write-side counterpart)
-static uint8_t* cluster_mut_ptr(fat_ctx_t* ctx, uint32_t cluster) {
-    if (cluster < 2 || cluster >= 2 + ctx->geo.cluster_count)
-        return NULL;
-    uint64_t offset = ((uint64_t)ctx->geo.data_start_sector +
-                       (uint64_t)(cluster - 2) * ctx->geo.sectors_per_cluster) *
-                      ctx->geo.bytes_per_sector;
-    return fat_mut_ptr(ctx, offset, fat_cluster_size(ctx));
-}
+// write support -------------------------------------------------------------------
 
 // the exact EOC constant per image type (what fat_alloc_cluster marks)
 static uint32_t fat_eoc_const(const fat_ctx_t* ctx) {
@@ -1154,23 +1320,50 @@ static uint32_t fat_eoc_const(const fat_ctx_t* ctx) {
 // FSInfo free-count / next-free write-back (FAT32 only). A sector whose
 // signatures do not validate is left untouched, and an unknown free count
 // stays unknown (symmetric with fat_fsinfo's read-side degradation).
-static void fsinfo_adjust(fat_ctx_t* ctx, int64_t free_delta,
-                          const uint32_t* next_free) {
+static fat_result_t fsinfo_adjust(fat_ctx_t* ctx, int64_t free_delta,
+                                  const uint32_t* next_free) {
     if (ctx->type != FT_FAT32 || ctx->fsinfo_sector == 0)
-        return;
+        return FAT_OK;
     uint64_t offset = (uint64_t)ctx->fsinfo_sector * ctx->geo.bytes_per_sector;
-    uint8_t* p = fat_mut_ptr(ctx, offset, 512);
-    if (p == NULL)
-        return;
-    if (rd32(p) != 0x41615252 ||       // "RRaA"
-        rd32(p + 484) != 0x61417272 || // "rrAa"
-        rd32(p + 508) != 0xAA550000)
-        return; // invalid signatures: keep the unknown state
-    uint32_t free_count = rd32(p + 488);
-    if (free_count != 0xFFFFFFFF)
-        wr32(p + 488, (uint32_t)((int64_t)free_count + free_delta));
-    if (next_free != NULL)
-        wr32(p + 492, *next_free);
+    if (offset + 512 > (uint64_t)ctx->image_size)
+        return FAT_OK; // sector absent from the image
+
+    uint8_t sig[4];
+    fat_result_t r = fat_io_read(ctx, offset, sig, sizeof(sig));
+    if (r != FAT_OK)
+        return r;
+    if (rd32(sig) != 0x41615252) // "RRaA"
+        return FAT_OK; // invalid signatures: keep the unknown state
+    r = fat_io_read(ctx, offset + 484, sig, sizeof(sig));
+    if (r != FAT_OK)
+        return r;
+    if (rd32(sig) != 0x61417272) // "rrAa"
+        return FAT_OK;
+    r = fat_io_read(ctx, offset + 508, sig, sizeof(sig));
+    if (r != FAT_OK)
+        return r;
+    if (rd32(sig) != 0xAA550000)
+        return FAT_OK;
+
+    uint8_t fc[4];
+    r = fat_io_read(ctx, offset + 488, fc, sizeof(fc));
+    if (r != FAT_OK)
+        return r;
+    uint32_t free_count = rd32(fc);
+    if (free_count != 0xFFFFFFFF) {
+        wr32(fc, (uint32_t)((int64_t)free_count + free_delta));
+        r = fat_io_write(ctx, offset + 488, fc, sizeof(fc));
+        if (r != FAT_OK)
+            return r;
+    }
+    if (next_free != NULL) {
+        uint8_t nf[4];
+        wr32(nf, *next_free);
+        r = fat_io_write(ctx, offset + 492, nf, sizeof(nf));
+        if (r != FAT_OK)
+            return r;
+    }
+    return FAT_OK;
 }
 
 fat_result_t fat_set_fat_entry(fat_ctx_t* ctx, uint32_t cluster,
@@ -1209,12 +1402,9 @@ fat_result_t fat_set_fat_entry(fat_ctx_t* ctx, uint32_t cluster,
     // base is derived from reserved_sectors here to cover every k)
     uint32_t first_table = 0;
     uint32_t table_count = ctx->geo.fat_count;
-    if (ctx->type == FT_FAT32) {
-        uint16_t extFlags = rd16(ctx->image + 40); // BPB_ExtFlags
-        if (extFlags & 0x0080) { // no mirroring: active FAT number only
-            first_table = extFlags & 0x000F;
-            table_count = 1;
-        }
+    if (ctx->type == FT_FAT32 && (ctx->ext_flags & 0x0080)) {
+        first_table = ctx->ext_flags & 0x000F;
+        table_count = 1;
     }
 
     size_t fat_bytes = (size_t)ctx->geo.fat_sectors *
@@ -1226,37 +1416,53 @@ fat_result_t fat_set_fat_entry(fat_ctx_t* ctx, uint32_t cluster,
         uint64_t base = ((uint64_t)ctx->geo.reserved_sectors +
                          (uint64_t)t * ctx->geo.fat_sectors) *
                         ctx->geo.bytes_per_sector;
-        uint8_t* fatp = fat_mut_ptr(ctx, base, fat_bytes);
-        if (fatp == NULL)
-            return FAT_ERR_INVALID_BPB;
+        fat_result_t r;
         switch (ctx->type) {
-        case FT_FAT16:
-            wr16(fatp + (size_t)cluster * 2, (uint16_t)value);
+        case FT_FAT16: {
+            uint8_t raw[2];
+            wr16(raw, (uint16_t)value);
+            r = fat_io_write(ctx, base + (uint64_t)cluster * 2, raw,
+                             sizeof(raw));
             break;
+        }
         case FT_FAT32: {
-            uint8_t* e = fatp + (size_t)cluster * 4;
+            uint8_t raw[4];
+            uint64_t ent = base + (uint64_t)cluster * 4;
             // the upper 4 bits are reserved flags: keep each table's own
             // on-disk value (read-modify-write)
-            wr32(e, (rd32(e) & 0xF0000000u) | value);
+            r = fat_io_read(ctx, ent, raw, sizeof(raw));
+            if (r != FAT_OK)
+                return r;
+            wr32(raw, (rd32(raw) & 0xF0000000u) | value);
+            r = fat_io_write(ctx, ent, raw, sizeof(raw));
             break;
         }
         case FT_FAT12: {
             // read-modify-write: neighbouring entries share a byte (the
             // same packing fat_raw_fat_entry decodes; odd entries start at
             // floor(cluster*3/2), one byte past (cluster/2)*3)
-            uint8_t* e = fatp + (size_t)cluster * 3 / 2;
+            uint8_t pair[2];
+            uint64_t ent = base + (uint64_t)cluster * 3 / 2;
+            r = fat_io_read(ctx, ent, pair, sizeof(pair));
+            if (r != FAT_OK)
+                return r;
             if (cluster % 2 == 0) {
-                e[0] = (uint8_t)(value & 0xFF);
-                e[1] = (uint8_t)((e[1] & 0xF0) | ((value >> 8) & 0x0F));
+                pair[0] = (uint8_t)(value & 0xFF);
+                pair[1] =
+                    (uint8_t)((pair[1] & 0xF0) | ((value >> 8) & 0x0F));
             } else {
-                e[0] = (uint8_t)((e[0] & 0x0F) | ((value & 0x0F) << 4));
-                e[1] = (uint8_t)((value >> 4) & 0xFF);
+                pair[0] =
+                    (uint8_t)((pair[0] & 0x0F) | ((value & 0x0F) << 4));
+                pair[1] = (uint8_t)((value >> 4) & 0xFF);
             }
+            r = fat_io_write(ctx, ent, pair, sizeof(pair));
             break;
         }
         default:
             return FAT_ERR_INVALID_ARG;
         }
+        if (r != FAT_OK)
+            return r;
     }
     return FAT_OK;
 }
@@ -1282,8 +1488,12 @@ fat_result_t fat_alloc_cluster(fat_ctx_t* ctx, uint32_t* out) {
         uint32_t c = start + i;
         if (c > total + 1)
             c -= total; // wrap to the lowest entries
-        if (fat_raw_fat_entry(ctx, c) == 0)
-            found = c;
+        uint32_t v;
+        fat_result_t rr = fat_raw_fat_entry(ctx, c, &v);
+        if (rr == FAT_ERR_IO)
+            return rr;
+        if (rr == FAT_OK && v == 0)
+            found = c; // an index the FAT region does not cover is not free
     }
     if (found == 0)
         return FAT_ERR_DISK_FULL; // the scan is read-only: image unchanged
@@ -1295,7 +1505,9 @@ fat_result_t fat_alloc_cluster(fat_ctx_t* ctx, uint32_t* out) {
     // keep the FSInfo in step: one fewer free cluster, and the hint moves
     // to the scan's next candidate
     uint32_t next = found + 1 > total + 1 ? 2 : found + 1;
-    fsinfo_adjust(ctx, -1, &next);
+    r = fsinfo_adjust(ctx, -1, &next);
+    if (r != FAT_OK)
+        return r;
     *out = found;
     return FAT_OK;
 }
@@ -1312,8 +1524,11 @@ fat_result_t fat_free_chain(fat_ctx_t* ctx, uint32_t head) {
     uint32_t freed = 0;
     uint32_t c = head;
     for (uint32_t visited = 0;; visited++) {
-        uint32_t fat = fat_raw_fat_entry(ctx, c);
-        if (fat == FAT_CLUSTER_NOT_FOUND)
+        uint32_t fat;
+        fat_result_t rr = fat_raw_fat_entry(ctx, c, &fat);
+        if (rr == FAT_ERR_IO)
+            return rr;
+        if (rr != FAT_OK)
             return FAT_ERR_BAD_CLUSTER;
         fat_result_t r = fat_set_fat_entry(ctx, c, 0);
         if (r != FAT_OK)
@@ -1333,8 +1548,7 @@ fat_result_t fat_free_chain(fat_ctx_t* ctx, uint32_t head) {
     }
 
     // the freed head is the best next-free candidate
-    fsinfo_adjust(ctx, freed, &head);
-    return FAT_OK;
+    return fsinfo_adjust(ctx, (int64_t)freed, &head);
 }
 
 // one-pass directory scan for fat_add_dirent: the first live name
@@ -1357,34 +1571,38 @@ static fat_result_t dir_scan(fat_ctx_t* ctx, uint32_t dir_cluster,
     if (dir_cluster == FAT_CLUSTER_ROOT && ctx->type != FT_FAT32) {
         // the FAT12/16 root directory is a fixed region, not a chain
         out->fixed = true;
-        size_t region_bytes = (size_t)ctx->geo.root_dir_sectors *
-                              ctx->geo.bytes_per_sector;
-        size_t slots = region_bytes / sizeof(DirectoryEntry);
+        uint64_t region_bytes = (uint64_t)ctx->geo.root_dir_sectors *
+                                ctx->geo.bytes_per_sector;
+        size_t slots = (size_t)(region_bytes / sizeof(DirectoryEntry));
         if (slots > ctx->geo.root_entries)
             slots = ctx->geo.root_entries;
         uint64_t offset = (uint64_t)ctx->geo.root_dir_sector *
                           ctx->geo.bytes_per_sector;
-        const uint8_t* p = fat_region_ptr(ctx, (size_t)offset);
-        if (p == NULL || region_bytes > ctx->image_size - (size_t)offset)
+        if (offset > (uint64_t)ctx->image_size ||
+            region_bytes > (uint64_t)ctx->image_size - offset)
             return FAT_ERR_INVALID_BPB;
         for (size_t s = 0; s < slots; s++) {
-            const uint8_t* raw = p + s * sizeof(DirectoryEntry);
-            if (raw[0] == 0x00) { // never used: nothing beyond is live
+            uint64_t off = offset + (uint64_t)s * sizeof(DirectoryEntry);
+            // the 12 leading bytes carry everything the scan decides on
+            uint8_t head[12];
+            fat_result_t r = fat_io_read(ctx, off, head, sizeof(head));
+            if (r != FAT_OK)
+                return r;
+            if (head[0] == 0x00) { // never used: nothing beyond is live
                 out->have_free = true;
-                out->free_offset = (size_t)offset + s * sizeof(DirectoryEntry);
+                out->free_offset = (size_t)off;
                 break;
             }
-            if (raw[0] == 0xE5) {
+            if (head[0] == 0xE5) {
                 if (!out->have_deleted) {
                     out->have_deleted = true;
-                    out->deleted_offset =
-                        (size_t)offset + s * sizeof(DirectoryEntry);
+                    out->deleted_offset = (size_t)off;
                 }
                 continue;
             }
-            if (raw[11] == ATTR_LONG_NAME)
+            if (head[11] == ATTR_LONG_NAME)
                 continue; // long file name fragment, not an 8.3 name
-            if (memcmp(raw, name11, 11) == 0) {
+            if (memcmp(head, name11, 11) == 0) {
                 out->exists = true;
                 return FAT_OK;
             }
@@ -1401,44 +1619,43 @@ static fat_result_t dir_scan(fat_ctx_t* ctx, uint32_t dir_cluster,
     if (!(ctx->type == FT_FAT32 && cluster == ctx->geo.root_cluster)) {
         // DOS invariant: every subdirectory starts with a "." self-entry
         // (same check as fat_dir_open)
-        const uint8_t* p = cluster_ptr(ctx, cluster);
-        if (p == NULL || memcmp(p, fat_dot11, 11) != 0 ||
-            (p[11] & ATTR_DIRECTORY) == 0)
-            return FAT_ERR_INVALID_ARG;
+        fat_result_t r = dir_check_dot(ctx, cluster);
+        if (r != FAT_OK)
+            return r;
     }
 
     uint32_t entries_per_cluster =
         fat_cluster_size(ctx) / (uint32_t)sizeof(DirectoryEntry);
     uint32_t fat_next;
-    const uint8_t* data;
-    fat_result_t r = dir_cluster_enter(ctx, cluster, &fat_next, &data);
+    uint64_t data_off;
+    fat_result_t r = dir_cluster_enter(ctx, cluster, &fat_next, &data_off);
     if (r != FAT_OK)
         return r;
     uint32_t visited = 1;
     for (;;) {
-        size_t cluster_offset = (size_t)(data - ctx->image);
         bool end_of_dir = false;
         for (uint32_t slot = 0; slot < entries_per_cluster; slot++) {
-            const uint8_t* raw =
-                data + (size_t)slot * sizeof(DirectoryEntry);
-            if (raw[0] == 0x00) { // never used: the directory ends here
+            uint64_t off = data_off + (uint64_t)slot * sizeof(DirectoryEntry);
+            uint8_t head[12];
+            r = fat_io_read(ctx, off, head, sizeof(head));
+            if (r != FAT_OK)
+                return r;
+            if (head[0] == 0x00) { // never used: the directory ends here
                 out->have_free = true;
-                out->free_offset =
-                    cluster_offset + (size_t)slot * sizeof(DirectoryEntry);
+                out->free_offset = (size_t)off;
                 end_of_dir = true;
                 break;
             }
-            if (raw[0] == 0xE5) {
+            if (head[0] == 0xE5) {
                 if (!out->have_deleted) {
                     out->have_deleted = true;
-                    out->deleted_offset =
-                        cluster_offset + (size_t)slot * sizeof(DirectoryEntry);
+                    out->deleted_offset = (size_t)off;
                 }
                 continue;
             }
-            if (raw[11] == ATTR_LONG_NAME)
+            if (head[11] == ATTR_LONG_NAME)
                 continue; // long file name fragment, not an 8.3 name
-            if (memcmp(raw, name11, 11) == 0) {
+            if (memcmp(head, name11, 11) == 0) {
                 out->exists = true;
                 return FAT_OK;
             }
@@ -1460,7 +1677,7 @@ static fat_result_t dir_scan(fat_ctx_t* ctx, uint32_t dir_cluster,
         uint32_t next = fat;
         if (next < 2 || next >= 2 + ctx->geo.cluster_count)
             return FAT_ERR_BAD_CLUSTER;
-        r = dir_cluster_enter(ctx, next, &fat_next, &data);
+        r = dir_cluster_enter(ctx, next, &fat_next, &data_off);
         if (r != FAT_OK)
             return r;
         cluster = next;
@@ -1514,7 +1731,7 @@ fat_result_t fat_add_dirent(fat_ctx_t* ctx, uint32_t dir_cluster,
     e.lastWriteDate = tmpl->last_write_date;
     e.fileSize = tmpl->file_size;
 
-    size_t offset;
+    uint64_t offset;
     if (scan.have_deleted)
         offset = scan.deleted_offset; // the deleted slot is reused first
     else if (scan.have_free)
@@ -1528,23 +1745,36 @@ fat_result_t fat_add_dirent(fat_ctx_t* ctx, uint32_t dir_cluster,
         r = fat_alloc_cluster(ctx, &nc);
         if (r != FAT_OK)
             return r;
-        uint8_t* p = cluster_mut_ptr(ctx, nc);
-        if (p == NULL)
+        uint64_t cl_off;
+        if (!cluster_offset(ctx, nc, &cl_off))
             return FAT_ERR_INVALID_BPB;
-        memset(p, 0, fat_cluster_size(ctx));
+        // zero it in sector-sized chunks (a cluster can be far larger than
+        // any sane stack buffer)
+        uint8_t zero[4096];
+        memset(zero, 0, sizeof(zero));
+        uint64_t cluster_bytes = fat_cluster_size(ctx);
+        uint64_t done = 0;
+        while (done < cluster_bytes) {
+            uint64_t left = cluster_bytes - done;
+            size_t n = left > sizeof(zero) ? sizeof(zero) : (size_t)left;
+            r = fat_io_write(ctx, cl_off + done, zero, n);
+            if (r != FAT_OK) {
+                fat_free_chain(ctx, nc);
+                return r;
+            }
+            done += n;
+        }
         r = fat_set_fat_entry(ctx, scan.tail, nc);
         if (r != FAT_OK) {
             fat_free_chain(ctx, nc);
             return r;
         }
-        offset = (size_t)(p - ctx->image); // slot 0 of the new cluster
+        offset = cl_off; // slot 0 of the new cluster
     }
 
-    uint8_t* slot = fat_mut_ptr(ctx, offset, sizeof(DirectoryEntry));
-    if (slot == NULL)
-        return FAT_ERR_INVALID_BPB;
-    memcpy(slot, &e, sizeof(DirectoryEntry));
-    return FAT_OK;
+    uint8_t raw32[sizeof(DirectoryEntry)];
+    memcpy(raw32, &e, sizeof(raw32));
+    return fat_io_write(ctx, offset, raw32, sizeof(raw32));
 }
 
 // allocate the data chain for `size` bytes and copy them in, cluster by
@@ -1578,12 +1808,16 @@ static fat_result_t write_data_chain(fat_ctx_t* ctx, const uint8_t* data,
             }
         }
         size_t n = left < cluster_size ? (size_t)left : (size_t)cluster_size;
-        uint8_t* p = cluster_mut_ptr(ctx, nc);
-        if (p == NULL) {
+        uint64_t off;
+        if (!cluster_offset(ctx, nc, &off)) {
             fat_free_chain(ctx, *head);
             return FAT_ERR_INVALID_BPB;
         }
-        memcpy(p, data + (size - left), n);
+        r = fat_io_write(ctx, off, data + (size - left), n);
+        if (r != FAT_OK) {
+            fat_free_chain(ctx, *head);
+            return r;
+        }
         left -= n;
         prev = nc;
     }
@@ -1639,7 +1873,7 @@ fat_result_t fat_write_file(fat_ctx_t* ctx, uint32_t dir_cluster,
     return FAT_OK;
 }
 
-// error strings ----------------------------------------------------------
+// error strings ------------------------------------------------------------
 
 const char* fat_strerror(fat_result_t r) {
     switch (r) {

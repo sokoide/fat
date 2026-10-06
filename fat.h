@@ -81,12 +81,16 @@ typedef struct {
 
 // lifecycle -----------------------------------------------------------
 
-// Load the whole image from `path`, validate the BPB, bind `*out`.
-// FAT12, FAT16 and FAT32 images are supported.
+// Open the image at `path` through a file backend (fat_io_file),
+// validate the BPB, bind `*out`. FAT12, FAT16 and FAT32 images are
+// supported. The image is not loaded whole: accesses go through the
+// sector cache, and writes reach the file no later than
+// fat_sync()/fat_close().
 fat_result_t fat_open(const char* path, fat_ctx_t** out);
 
-// Same, from a memory image. The buffer is copied; the caller keeps
-// ownership of `image`. Enables in-process synthetic/mutated images.
+// Same, through a RAM backend (fat_io_mem) over a private copy of the
+// buffer; the caller keeps ownership of `image`. Enables in-process
+// synthetic/mutated images.
 fat_result_t fat_open_mem(const uint8_t* image, size_t size, fat_ctx_t** out);
 
 // Release everything. Safe on NULL. The context is unusable afterwards.
@@ -233,10 +237,11 @@ fat_result_t fat_read_file(fat_ctx_t* ctx, const fat_dirent_t* file,
                            uint8_t** out, size_t* out_size);
 
 // write support -------------------------------------------------------------
-// All write APIs mutate the in-memory image owned by `ctx` (the copy made
-// at fat_open/fat_open_mem); the original file is untouched until
-// fat_write() flushes. Read cursors (fat_file_t/fat_dir_t) observe the
-// mutated image, but keeping them open across structural changes (chain
+// All write APIs mutate the sector cache owned by `ctx`; mutations reach
+// the backend on fat_sync()/fat_close() (see the I/O abstraction below).
+// The fat_open_mem backend is a private copy, so the caller's buffer is
+// untouched either way. Read cursors (fat_file_t/fat_dir_t) observe the
+// mutated cache, but keeping them open across structural changes (chain
 // alloc/free, dirent writes) is undefined -- close them first.
 
 // Set FAT[cluster] = value in every FAT copy the spec requires: all
@@ -284,7 +289,61 @@ fat_result_t fat_write_file(fat_ctx_t* ctx, uint32_t dir_cluster,
                             const char* name, const uint8_t* data,
                             size_t size, const fat_dirent_t* tmpl);
 
-// Flush the whole in-memory image to `path` (created/truncated).
+// Export the whole logical image (backend as seen through the cache) to
+// `path` (created/truncated). This is not a cache flush to the backend --
+// that is fat_sync().
 fat_result_t fat_write(const fat_ctx_t* ctx, const char* path);
+
+// I/O abstraction ------------------------------------------------------------
+// Region accesses never touch a whole-image buffer: they go through a
+// backend (fat_io_t) and a sector cache owned by the context. Writes are
+// write-back: they live in the cache and are flushed to the backend by
+// fat_sync()/fat_close() at the latest -- dirty sectors may be flushed
+// earlier when the cache evicts them. Ship backends: RAM (fat_io_mem,
+// used by fat_open_mem) and file (fat_io_file, used by fat_open). Embed
+// fat_io_t in your own struct to mount block devices, FUSE, etc.
+
+// Backend vtable. Embed it as the FIRST member of your struct; the
+// library always calls e.g. io->read(io, ...), so a member can recover
+// the outer struct with a plain downcast:
+//   typedef struct { fat_io_t io; int fd; } my_io_t;
+// Backends are fixed-size: size() must not change over the backend's
+// lifetime. Transfers past size() fail with FAT_ERR_IO; zero-length
+// transfers succeed. close() may be NULL (nothing to release); otherwise
+// it is called exactly once, when the owning fat_ctx_t is closed.
+typedef struct fat_io {
+    fat_result_t (*read)(struct fat_io* io, uint64_t offset, void* buf,
+                         size_t len);
+    fat_result_t (*write)(struct fat_io* io, uint64_t offset,
+                          const void* buf, size_t len);
+    uint64_t (*size)(const struct fat_io* io);
+    void (*close)(struct fat_io* io);
+} fat_io_t;
+
+// RAM backend over a private copy of `image` (the caller keeps the
+// original buffer; library writes mutate the copy only).
+fat_result_t fat_io_mem(fat_io_t** out, const uint8_t* image, size_t size);
+
+// stdio file backend. The file must exist; it is opened read/write when
+// permitted (else read-only, and writes fail with FAT_ERR_IO when dirty
+// sectors are flushed). Library writes reach the file no later than
+// fat_sync()/fat_close().
+fat_result_t fat_io_file(fat_io_t** out, const char* path);
+
+// Open through an explicit backend: validate the BPB and bind `*out`.
+// Opening reads exactly one 512-byte sector (the boot sector) via the
+// backend; a backend that cannot serve it fails with FAT_ERR_IO (a
+// backend smaller than one sector therefore fails to open). On success
+// the context owns `io` -- fat_close flushes dirty sectors and calls
+// io->close exactly once. On failure the caller keeps ownership of `io`.
+// Every other API behaves identically on top of any backend.
+fat_result_t fat_open_io(fat_io_t* io, fat_ctx_t** out);
+
+// Flush dirty cache sectors to the backend (NULL ctx is
+// FAT_ERR_INVALID_ARG). Backend write failures surface here as
+// FAT_ERR_IO (fat_close is best-effort: check errors via fat_sync
+// first). The cache is coherent with itself only -- external backend
+// modifications between calls are not picked up.
+fat_result_t fat_sync(fat_ctx_t* ctx);
 
 #endif

@@ -62,7 +62,9 @@ make check-all  # regenerate all three fixtures with mtools, then check
 | fat_dump.c    | pretty printers (BPB / FAT / directory entries)          |
 | color.c       | terminal coloring for the dump views                     |
 | main.c        | demo CLI                                                 |
-| testmain.c    | test suite (mtools is used as an oracle where possible)  |
+| tests/        | test suite: one file per area (read / write / io / lfn / |
+|               | mtools oracle), a tiny EXPECT framework in test_util.h   |
+|               | with per-test failure isolation, plus the shared helpers |
 
 ## More info
 

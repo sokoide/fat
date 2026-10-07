@@ -896,3 +896,30 @@ TDD実施: リードが§20詳細設計+`fat.h`契約コメント確定 → **p7
 ### 31.6 残課題
 
 - ウェーブ3（テストのtests/分割＋軽量フレームワーク＋自己説明的化）は後続コミット。
+
+### 31.7 ウェーブ3: テストのtests/分割＋軽量フレームワーク（同日実施）
+
+testmain.c（6,551行・121テスト・assert 1,541個）を廃止し、tests/ 下にグループ分割＋自己説明的な軽量フレームワークへ再構築。テストの役割を「凍結された安全網」から「学習教材の一部」へ変更（ユーザー承認済み・計画どおりの裁定）。
+
+**構成**（7ファイル・計7,035行）:
+- `tests/test_util.h/.c` — フレームワーク本体＋共有ヘルパー約30（open_fixture/mutated_copy/set_fat12/32_entry/make_pattern/assert_write_roundtrip/assert_listing_matches_mdir等を1箇所に集約）
+- `tests/test_main.c` — runner＋フィクスチャガード（FNV-1aハッシュ往復）
+- `tests/test_read.c`（35）/ `test_io.c`（10）/ `test_write.c`（39）/ `test_lfn.c`（27）/ `test_oracle.c`（8）— 旧main()の実行順をグループ単位に再編（read→io→write→lfn→oracle）
+
+**フレームワーク機能**:
+- `EXPECT_EQ/TRUE/STR_EQ/MEMEQ`: 失敗時はテスト名・file:line・期待値/実測値を表示し、setjmp/longjmpで**そのテストだけ**打ち切ってスイート継続（旧assertは1失敗=suite全体即死・後続テストとフィクスチャガードが死んでいた）
+- `REGISTER`/`REGISTER_AS` + `NEED_FAT16/FAT32/MTOOLS`: スキップ判定をrunnerが一元化（旧9箇所の条件分岐コピペ解消）。明示的レジストリ方式・リンカmagicなし
+- `OUT_CANARY`(0x5A5A)を名称化
+
+**変換方針**: テスト本体は「移動＋assert→EXPECT機械変換」のみ（リテラル・呼び出し順・コメント・/tmpスクラッチ名・生hexピン配列すべて原文どおり）。これにより挙動の同一性を構造的に保証。
+
+**検証**:
+- クリーンビルド後`make check` = **242 ok (121×2)・警告ゼロ**（通常+ASan/UBSan）・"121 passed, 0 skipped, 0 failed"
+- 意図的破壊テスト: test_openのroot_entriesピンを0x70→0x71に壊すと「test_open FAILED / test_read.c:117: EXPECT_EQ(g->root_entries, 0x71): got 112, want 113」を表示し、**スイートは継続**（120 passed・ガード実行）・exit 1。復元後242 ok再確認
+- `make demo12/16/32` 全exit 0・`demof12.fat` md5不変
+
+**次期候補（見送り・学習教材としての更なる研磨）**: ピンの壁のデータテーブル化（test_openのジオメトリ17連等）、巨大テストのシナリオ分割、/tmpスクラッチ名20種の`with_tmp_image`ヘルパ化、テスト内0x5A5AリテラルのOUT_CANARY置換。
+
+### 31.8 残課題
+
+- なし（ウェーブ1〜3すべて完了。残るはpushのみ=ユーザー判断）。

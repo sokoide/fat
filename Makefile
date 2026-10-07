@@ -9,7 +9,13 @@ SRCS = main.c \
 	   fat_dev.c \
 	   fat_dump.c \
 	   color.c
-TESTSRCS = testmain.c \
+TESTSRCS = tests/test_main.c \
+		   tests/test_util.c \
+		   tests/test_read.c \
+		   tests/test_io.c \
+		   tests/test_write.c \
+		   tests/test_lfn.c \
+		   tests/test_oracle.c \
 		   fat_core.c \
 		   fat_dev.c \
 		   fat_dump.c \
@@ -51,9 +57,11 @@ $(SANOUTDIR)/$(TESTTARGET): $(SANOUTOBJS) | $(SANOUTDIR)
 	$(CC) $(SANFLAGS) $^ -o $@ $(LDFLAGS)
 
 $(OUTDIR)/%.o : %.c | $(OUTDIR)
+	@mkdir -p $(dir $@) # tests/ objects land in build/tests/
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(SANOUTDIR)/%.o : %.c | $(SANOUTDIR)
+	@mkdir -p $(dir $@)
 	$(CC) $(SANFLAGS) -c $< -o $@
 
 $(OUTDIR) $(SANOUTDIR):

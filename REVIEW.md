@@ -882,3 +882,17 @@ TDD実施: リードが§20詳細設計+`fat.h`契約コメント確定 → **p7
 ### 31.4 残課題
 
 - ウェーブ2（fat.h公開API統合: `fat_iter_dir`削除・カーソル一本化）、ウェーブ3（テスト分割+軽量フレームワーク）は後続コミットで実施。
+
+### 31.5 ウェーブ2: fat_iter_dirの公開APIからの削除（同日実施）
+
+承認済みのAPI統合（「API統合も許可（推奨）」）。ディレクトリ列挙を`fat_dir_t`カーソルに一本化し、コールバック型API（`fat_iter_cb`/`fat_iter_dir`）をfat.hから削除。
+
+- **fat.h**: `fat_iter_cb` typedefと`fat_iter_dir`宣言を削除。列挙セマンティクス（0xE5/0x00スキップ・LFN join・orphanフォールバック・チェーンガード）のdocをカーソル側（`fat_dir_t`/`fat_dir_open`/`fat_dir_next`）へ統合。読み取りAPI（`fat_read_file`一括 vs `fat_file_t`ストリーム）は教育的に別物のため両方温存（計画どおり）。
+- **fat_core.c**: `fat_iter_dir`実装を削除。`fat_rmdir`の空検査（旧`rmdir_cb`/`RmdirScan`）はカーソルループの`dir_has_live_entry`へ。`lookup_in_dir`はウェーブ1で`dir_scan`直行化済みのため影響なし。
+- **main.c**: `iterate_directory`をカーソルループ化（コールバック関数ポインタはmain.c内型で受ける）。
+- **testmain.c**: 最小修正のみ（ウェーブ3で再構築予定）: カーソル駆動の`iter_dir`ブリッジを追加して16呼び出し点を機械置換。B7比較テスト（カーソル vs 列挙）は両者が同一カーソルを駆動する比較となった旨をコメントに明記（順序・sticky排 Exhaustの契約ピンは維持）。
+- **検証**: `make check` 242 ok (121×2)・警告ゼロ。`make demo12/16/32` 全exit 0・stderr空・`demof12.fat` md5不変（`0b0ed64d…`）。
+
+### 31.6 残課題
+
+- ウェーブ3（テストのtests/分割＋軽量フレームワーク＋自己説明的化）は後続コミット。

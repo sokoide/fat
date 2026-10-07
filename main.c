@@ -18,7 +18,8 @@ static const char* type_name(const fat_ctx_t* ctx);
 static void callback_ls(const fat_dirent_t* entry, const uint8_t* raw32,
                         void* user);
 static void iterate_directory(fat_ctx_t* ctx, uint32_t dir_cluster,
-                              fat_iter_cb cb);
+                              void (*cb)(const fat_dirent_t*,
+                                         const uint8_t*, void*));
 static fat_result_t lookup_quiet(fat_ctx_t* ctx, const char* path,
                                  fat_dirent_t* out);
 static void dump_section(fat_ctx_t* ctx, const char* path);
@@ -55,13 +56,24 @@ static void callback_ls(const fat_dirent_t* entry, const uint8_t* raw32,
     }
 }
 
-// iterate one directory (FAT_CLUSTER_ROOT for the root), reporting errors
+// iterate one directory (FAT_CLUSTER_ROOT for the root) over the cursor,
+// reporting errors
 static void iterate_directory(fat_ctx_t* ctx, uint32_t dir_cluster,
-                              fat_iter_cb cb) {
-    fat_result_t ret = fat_iter_dir(ctx, dir_cluster, cb, NULL);
+                              void (*cb)(const fat_dirent_t*,
+                                         const uint8_t*, void*)) {
+    fat_dir_t* dir = NULL;
+    fat_result_t ret = fat_dir_open(ctx, dir_cluster, &dir);
     if (ret != FAT_OK) {
         fprintf(stderr, "iterate directory: %s\n", fat_strerror(ret));
+        return;
     }
+    const fat_dirent_t* entry;
+    const uint8_t* raw32;
+    while ((ret = fat_dir_next(dir, &entry, &raw32)) == FAT_OK)
+        cb(entry, raw32, NULL);
+    if (ret != FAT_ERR_END_OF_DIR)
+        fprintf(stderr, "iterate directory: %s\n", fat_strerror(ret));
+    fat_dir_close(dir);
 }
 
 // resolve `path` from the root without any diagnostic output; the demo

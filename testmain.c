@@ -98,6 +98,29 @@ static fat_ctx_t* open_image(const char* name)
     return ctx;
 }
 
+/* fat_iter_dir left the public API (cursor-only iteration, REVIEW.md §31);
+ * this cursor-driven bridge keeps the suite's callback-style listings
+ * until the test restructure retires them. */
+typedef void (*iter_cb)(const fat_dirent_t* entry, const uint8_t* raw32,
+                        void* user_data);
+
+static fat_result_t iter_dir(fat_ctx_t* ctx, uint32_t dir_cluster,
+                             iter_cb cb, void* user_data)
+{
+    if (ctx == NULL || cb == NULL)
+        return FAT_ERR_INVALID_ARG;
+    fat_dir_t* d = NULL;
+    fat_result_t r = fat_dir_open(ctx, dir_cluster, &d);
+    if (r != FAT_OK)
+        return r;
+    const fat_dirent_t* entry;
+    const uint8_t* raw32;
+    while ((r = fat_dir_next(d, &entry, &raw32)) == FAT_OK)
+        cb(entry, raw32, user_data);
+    fat_dir_close(d);
+    return r == FAT_ERR_END_OF_DIR ? FAT_OK : r;
+}
+
 static fat_ctx_t* open_fixture(void)
 {
     return open_image(IMG_NAME);
@@ -178,7 +201,7 @@ static void count_root(const fat_dirent_t* entry, const uint8_t* raw32,
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    int dots;      /* "." and ".." (delivered by fat_iter_dir, not skipped) */
+    int dots;      /* "." and ".." (delivered by iteration, not skipped) */
     int subdirs;
     int files;
     int bad_name;  /* non-dot entry not named SUBDIRn */
@@ -277,7 +300,7 @@ static void test_root_iterate(void)
     fat_ctx_t* ctx = open_fixture();
     RootCounts counts = {0, 0, 0, 0, 0, 0, 0, 0, 0};
 
-    assert(fat_iter_dir(ctx, FAT_CLUSTER_ROOT, count_root, &counts) ==
+    assert(iter_dir(ctx, FAT_CLUSTER_ROOT, count_root, &counts) ==
            FAT_OK);
     /* DEMOF12 + hello.txt + test_5kb.txt + dir1 + dir2 */
     assert(counts.labels == 1);
@@ -301,7 +324,7 @@ static void test_dir2_iterate(void)
 
     /* cluster 11 (full, 32 slots) -> cluster 43: 33 subdirs, no files */
     Dir2Counts counts = {0, 0, 0, 0};
-    assert(fat_iter_dir(ctx, de.first_cluster, count_dir2, &counts) ==
+    assert(iter_dir(ctx, de.first_cluster, count_dir2, &counts) ==
            FAT_OK);
     assert(counts.dots == 2);
     assert(counts.subdirs == 33);
@@ -646,15 +669,15 @@ static void test_ctx_lifecycle(void)
     b = open_fixture();
     assert(a != b);
 
-    assert(fat_iter_dir(a, FAT_CLUSTER_ROOT, count_root, &ca) == FAT_OK);
-    assert(fat_iter_dir(b, FAT_CLUSTER_ROOT, count_root, &cb) == FAT_OK);
+    assert(iter_dir(a, FAT_CLUSTER_ROOT, count_root, &ca) == FAT_OK);
+    assert(iter_dir(b, FAT_CLUSTER_ROOT, count_root, &cb) == FAT_OK);
     assert(ca.labels == 1 && ca.files == 2 && ca.dirs == 2);
     assert(cb.labels == 1 && cb.files == 2 && cb.dirs == 2);
 
     /* closing one context must not disturb the other */
     fat_close(a);
     memset(&cb, 0, sizeof(cb));
-    assert(fat_iter_dir(b, FAT_CLUSTER_ROOT, count_root, &cb) == FAT_OK);
+    assert(iter_dir(b, FAT_CLUSTER_ROOT, count_root, &cb) == FAT_OK);
     assert(cb.labels == 1 && cb.files == 2 && cb.dirs == 2);
     fat_close(b);
 
@@ -838,7 +861,7 @@ static void test_open_mem_errors(void)
     assert(fat_open_mem(img, size, &ctx) == FAT_OK);
     free(img);
     Dir2Counts counts = {0, 0, 0, 0};
-    assert(fat_iter_dir(ctx, 11, count_dir2, &counts) == FAT_ERR_BAD_CLUSTER);
+    assert(iter_dir(ctx, 11, count_dir2, &counts) == FAT_ERR_BAD_CLUSTER);
     fat_close(ctx);
     ctx = NULL;
 
@@ -1113,7 +1136,7 @@ static void test_fat32_file_stream(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* B7: fat_dir_t cursors vs fat_iter_dir                               */
+/* B7: raw fat_dir_next stepping vs the iter_dir bridge loop           */
 /* ------------------------------------------------------------------ */
 
 #define COLLECT_MAX 64 /* biggest listing: the 44-entry FAT32 root */
@@ -1139,14 +1162,16 @@ static void collect_entries(const fat_dirent_t* entry, const uint8_t* raw32,
     list->n++;
 }
 
-/* The cursor must enumerate exactly what fat_iter_dir enumerates on the
- * same cluster -- same entries in the same order -- then report
- * FAT_ERR_END_OF_DIR, stickily. */
+/* Stepping fat_dir_next by hand must enumerate exactly what the iter_dir
+ * bridge collects on the same cluster -- same entries in the same order --
+ * then report FAT_ERR_END_OF_DIR, stickily. (Since the API consolidation
+ * both drive the same cursor; the comparison still pins the loop's
+ * ordering and exhaustion contract.) */
 static void assert_dir_cursor_matches_iter(fat_ctx_t* ctx, uint32_t cluster)
 {
     EntryList list;
     memset(&list, 0, sizeof(list));
-    assert(fat_iter_dir(ctx, cluster, collect_entries, &list) == FAT_OK);
+    assert(iter_dir(ctx, cluster, collect_entries, &list) == FAT_OK);
     assert(list.overflow == 0);
 
     fat_dir_t* d = NULL;
@@ -1259,7 +1284,7 @@ static fat_result_t fuzz_pipeline(const uint8_t* img, size_t size,
             fat_close(ctx); /* a context bound on failure is released */
         return r;
     }
-    (void)fat_iter_dir(ctx, FAT_CLUSTER_ROOT, fuzz_noop_cb, NULL);
+    (void)iter_dir(ctx, FAT_CLUSTER_ROOT, fuzz_noop_cb, NULL);
     if (fat_lookup(ctx, FAT_CLUSTER_ROOT, "test_5kb.txt", &de) == FAT_OK) {
         uint8_t* data = NULL;
         size_t n = 0;
@@ -1497,7 +1522,7 @@ static void assert_listing_matches_mdir(fat_ctx_t* ctx, const char* img_name,
 
     OurListing ours;
     memset(&ours, 0, sizeof(ours));
-    assert(fat_iter_dir(ctx, cluster, list_ours_cb, &ours) == FAT_OK);
+    assert(iter_dir(ctx, cluster, list_ours_cb, &ours) == FAT_OK);
 
     if (ours.n != tn)
         fprintf(stderr, "listing size mismatch for ::%s: ours %d mdir %d\n",
@@ -1776,7 +1801,7 @@ static void test_fat16_root_iterate(void)
     fat_ctx_t* ctx = open_image(IMG16_NAME);
     Root16Counts counts = {0, 0, 0, 0, 0, 0, 0};
 
-    assert(fat_iter_dir(ctx, FAT_CLUSTER_ROOT, count_root16, &counts) ==
+    assert(iter_dir(ctx, FAT_CLUSTER_ROOT, count_root16, &counts) ==
            FAT_OK);
     /* DEMOF16 + hello.txt + test_5kb.txt + dir1 */
     assert(counts.labels == 1);
@@ -1959,7 +1984,7 @@ static void test_fat32_root_iterate(void)
     Root32Counts counts = {0, 0, 0, 0, 0, 0, 0, 0, 0};
 
     /* 44 entries spread over the 3-cluster root chain 2->54->55 */
-    assert(fat_iter_dir(ctx, FAT_CLUSTER_ROOT, count_root32, &counts) ==
+    assert(iter_dir(ctx, FAT_CLUSTER_ROOT, count_root32, &counts) ==
            FAT_OK);
     assert(counts.labels == 1);
     assert(counts.files == 42); /* hello + test_5kb + 40 fillers */
@@ -2128,7 +2153,7 @@ static void count_any_cb(const fat_dirent_t* entry, const uint8_t* raw32,
 static int count_dir_entries(fat_ctx_t* ctx, uint32_t cluster)
 {
     int n = 0;
-    assert(fat_iter_dir(ctx, cluster, count_any_cb, &n) == FAT_OK);
+    assert(iter_dir(ctx, cluster, count_any_cb, &n) == FAT_OK);
     return n;
 }
 
@@ -3572,7 +3597,7 @@ static void test_read_fail_inject(void)
         fat_ctx_t* ctx = NULL;
         assert(fat_open_io(&io.io, &ctx) == FAT_OK);
         int n = 0;
-        assert(fat_iter_dir(ctx, FAT_CLUSTER_ROOT, count_any_cb, &n) ==
+        assert(iter_dir(ctx, FAT_CLUSTER_ROOT, count_any_cb, &n) ==
                FAT_ERR_IO);
         fat_close(ctx);
         assert(io.close_calls == 1);
@@ -5370,7 +5395,7 @@ static void test_lfn_read_single(void)
 
     /* same joining through the callback iterator */
     LfnNameProbe probe = {"onelong.name", 0};
-    assert(fat_iter_dir(ctx, FAT_CLUSTER_ROOT, lfn_probe_cb, &probe) ==
+    assert(iter_dir(ctx, FAT_CLUSTER_ROOT, lfn_probe_cb, &probe) ==
            FAT_OK);
     assert(probe.found);
 
@@ -6269,7 +6294,7 @@ static void test_fat32_lfn_read_chain(void)
     assert(fat_open_mem(img, size, &ctx) == FAT_OK);
     free(img);
     LfnNameProbe probe = {"f32 long file.txt", 0};
-    assert(fat_iter_dir(ctx, FAT_CLUSTER_ROOT, lfn_probe_cb, &probe) ==
+    assert(iter_dir(ctx, FAT_CLUSTER_ROOT, lfn_probe_cb, &probe) ==
            FAT_OK);
     assert(probe.found);
     fat_dirent_t de;

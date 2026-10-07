@@ -60,11 +60,6 @@ typedef struct {
     uint32_t file_size;
 } fat_dirent_t;
 
-// iteration callback: parsed entry + the 32 raw on-disk bytes (dump views).
-// raw32 is only valid during the callback.
-typedef void (*fat_iter_cb)(const fat_dirent_t* entry, const uint8_t* raw32,
-                            void* user_data);
-
 // opaque context; internal definition lives in fat_internal.h
 typedef struct fat_ctx fat_ctx_t;
 
@@ -115,17 +110,7 @@ uint32_t fat_cluster_size(const fat_ctx_t* ctx);           // bytes per data clu
 fat_result_t fat_get_fat_entry(const fat_ctx_t* ctx, uint32_t cluster,
                                uint32_t* out);
 
-// directory iteration --------------------------------------------------
-
-// Iterate `dir_cluster` (FAT_CLUSTER_ROOT for the root directory).
-// Deleted (0xE5) and never-used (0x00) slots are skipped as before; LFN
-// (attr 0x0F) entries are joined into the long name of the 8.3 entry they
-// precede (sequence order and the 8.3-name checksum verified). An orphaned
-// or invalid LFN run is ignored and the entry falls back to its 8.3 name;
-// the callback still receives the 8.3 entry's raw 32 bytes. Guards against
-// broken/looping chains.
-fat_result_t fat_iter_dir(fat_ctx_t* ctx, uint32_t dir_cluster,
-                          fat_iter_cb cb, void* user_data);
+// directory iteration (fat_dir_t cursors, below) ------------------------
 
 // path lookup -----------------------------------------------------------
 
@@ -236,12 +221,17 @@ void fat_file_close(fat_file_t* f);
 // directory cursors ---------------------------------------------------------
 
 // Opaque stepwise directory iterator. Skips deleted (0xE5) and never-used
-// (0x00) entries and joins LFN runs into long names exactly like
-// fat_iter_dir.
+// (0x00) slots; LFN (attr 0x0F) entries are joined into the long name of
+// the 8.3 entry they precede (sequence order and the 8.3-name checksum
+// verified). An orphaned or invalid LFN run is ignored and the entry falls
+// back to its 8.3 name; raw32 still receives the 8.3 entry's bytes. Guards
+// against broken/looping chains.
 typedef struct fat_dir fat_dir_t;
 
-// Open `dir_cluster` (FAT_CLUSTER_ROOT for the root) for stepwise
-// iteration. Validation matches fat_iter_dir.
+// Open `dir_cluster` (FAT_CLUSTER_ROOT for the root, any subdirectory
+// cluster otherwise) for stepwise iteration. A subdirectory must carry
+// the "." self-entry invariant; a broken root region or cluster chain
+// fails here or at the first fat_dir_next that hits it.
 fat_result_t fat_dir_open(fat_ctx_t* ctx, uint32_t dir_cluster,
                           fat_dir_t** out);
 

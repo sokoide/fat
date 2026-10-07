@@ -878,8 +878,8 @@ static const uint8_t fat_dotdot11[11] = {'.', '.', ' ', ' ', ' ', ' ',
                                          ' ', ' ', ' ', ' ', ' '};
 
 // stepwise iterator over one directory; the single scan implementation
-// behind both fat_dir_next and fat_iter_dir. No image pointers are held:
-// each 32-byte entry is read into `raw` through the cache on demand.
+// behind fat_dir_next. No image pointers are held: each 32-byte entry is
+// read into `raw` through the cache on demand.
 struct fat_dir {
     fat_ctx_t* ctx;
     bool fixed;         // FAT12/16 fixed root region (not a cluster chain)
@@ -1099,25 +1099,6 @@ fat_result_t fat_dir_next(fat_dir_t* d, const fat_dirent_t** out,
 
 void fat_dir_close(fat_dir_t* d) {
     free(d); // NULL-safe
-}
-
-fat_result_t fat_iter_dir(fat_ctx_t* ctx, uint32_t dir_cluster,
-                          fat_iter_cb cb, void* user_data) {
-    if (ctx == NULL || cb == NULL)
-        return FAT_ERR_INVALID_ARG;
-
-    // thin loop over the cursor: one scan implementation, no duplicated
-    // chain/root logic
-    fat_dir_t* d = NULL;
-    fat_result_t r = fat_dir_open(ctx, dir_cluster, &d);
-    if (r != FAT_OK)
-        return r;
-    const fat_dirent_t* entry;
-    const uint8_t* raw32;
-    while ((r = fat_dir_next(d, &entry, &raw32)) == FAT_OK)
-        cb(entry, raw32, user_data);
-    fat_dir_close(d);
-    return r == FAT_ERR_END_OF_DIR ? FAT_OK : r;
 }
 
 // 8.3 name conversion --------------------------------------------------------
@@ -2516,20 +2497,26 @@ fat_result_t fat_unlink(fat_ctx_t* ctx, uint32_t dir_cluster,
     return dir_slot_delete(ctx, &scan, raw_first_cluster(ctx->type, raw));
 }
 
-// rmdir emptiness: "." and ".." never count (fat_iter_dir already skips
-// deleted, never-used and LFN slots)
-typedef struct {
-    bool non_dot;
-} RmdirScan;
-
-static void rmdir_cb(const fat_dirent_t* entry, const uint8_t* raw32,
-                     void* user_data) {
-    (void)entry;
-    RmdirScan* s = (RmdirScan*)user_data;
-    if (memcmp(raw32, fat_dot11, 11) == 0 ||
-        memcmp(raw32, fat_dotdot11, 11) == 0)
-        return;
-    s->non_dot = true;
+// rmdir emptiness check over the cursor: "." and ".." never count (the
+// iteration itself skips deleted, never-used and LFN slots)
+static fat_result_t dir_has_live_entry(fat_ctx_t* ctx, uint32_t cluster,
+                                       bool* non_dot) {
+    *non_dot = false;
+    fat_dir_t* d = NULL;
+    fat_result_t r = fat_dir_open(ctx, cluster, &d);
+    if (r != FAT_OK)
+        return r;
+    const fat_dirent_t* entry;
+    const uint8_t* raw32;
+    while ((r = fat_dir_next(d, &entry, &raw32)) == FAT_OK) {
+        if (memcmp(raw32, fat_dot11, 11) != 0 &&
+            memcmp(raw32, fat_dotdot11, 11) != 0) {
+            *non_dot = true;
+            break;
+        }
+    }
+    fat_dir_close(d);
+    return r == FAT_ERR_END_OF_DIR ? FAT_OK : r;
 }
 
 fat_result_t fat_rmdir(fat_ctx_t* ctx, uint32_t dir_cluster,
@@ -2565,12 +2552,11 @@ fat_result_t fat_rmdir(fat_ctx_t* ctx, uint32_t dir_cluster,
     if (cluster < 2 || cluster == ctx->geo.root_cluster)
         return FAT_ERR_INVALID_ARG;
 
-    RmdirScan rs;
-    memset(&rs, 0, sizeof(rs));
-    r = fat_iter_dir(ctx, cluster, rmdir_cb, &rs);
+    bool non_dot;
+    r = dir_has_live_entry(ctx, cluster, &non_dot);
     if (r != FAT_OK)
         return r;
-    if (rs.non_dot)
+    if (non_dot)
         return FAT_ERR_DIR_NOT_EMPTY;
 
     return dir_slot_delete(ctx, &scan, cluster);

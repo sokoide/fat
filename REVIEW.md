@@ -849,3 +849,36 @@ TDD実施: リードが§20詳細設計+`fat.h`契約コメント確定 → **p7
 ### 30.4 README.md更新（同日追記）
 
 - 旧冒頭の「FAT12 lib」を実態（FAT12/16/32読み書きライブラリ）に合わせて全面更新: 機能一覧（LFN・NTRes描画・書き込み・I/Oバックエンド）、前提ツール、`make run`/`demo12/16/32`/`demo-all`/`check`/`check-all`の使い分け、リポジトリレイアウト表、`fat.h`（旧記載の`fat.c`は存在しないファイルだった）とREVIEW.mdへの導線。`make run` exit 0を確認。
+
+## 31. 学習教材化リファクタ — ウェーブ1: fat_core.c内部重複除去（2026-10-07 実施）
+
+ユーザー指示「学習教材としてシンプル・簡潔・追いやすいコードに。適切なら短く」への第一弾。公開API・テスト・フィクスチャは一切不変（ウェーブ2/3で別対応）。242テストが安全網となり、全変更は挙動不変。
+
+### 31.1 統合内容
+
+- **`FatTypeInfo`テーブル**（`reserved_min`/`bad`/`eoc_min`/`eoc_const`）: `fat_is_bad`/`fat_is_eoc`/`fat_is_reserved`/`fat_eoc_const`・`fat_set_fat_entry`の値上限判定を並列switchから1テーブル参照へ。
+- **`fat_entry_span`**: FATエントリのバイト配置計算（FAT12の3バイト2エントリ詰め込み含む）を読み書き双方で共有。`fat_raw_fat_entry`/`fat_set_fat_entry`のpacking数学が1箇所に。
+- **`chain_link_t chain_link()`**: EOC/追従可能/破損の3値分類を、6箇所のチェーンガードの共通核に。bad値は型依存の数値範囲のため意図的に分類外とし、必要サイトは`fat_is_bad`を併用（各サイトのエラー契約——`fat_read_file`のループ頂bad検査、dir系の1ステップ遅延検出、`fat_file_write`のガード原文維持——は全て保存）。
+- **Brentサイクル検出の構造体化**（`Brent`/`brent_init`/`brent_revisited`）: 4箇所のインライン実装を置き換え、比較優先のステップ進行を1実装に。
+- **`io_transfer`**: `fat_io_read`/`fat_io_write`を方向フラグ1実装へ（差分はmemcpy方向とdirtyフラグのみ）。
+- **`fsinfo_read_valid`**: FSInfo署名三重検証（"RRaA"/"rrAa"/0xAA550000）を`fat_fsinfo`読み取りと`fsinfo_adjust`書き戻しで共有。`fsinfo_adjust`は4×4バイト読みから512バイト1回読みへ（テストで無影響確認済み）。
+- **`raw_first_cluster`/`raw_set_first_cluster`**: FAT32のfirst-cluster分割バイト（20/21高・26/27低）の decode/encode を4箇所（`dirent_from_raw`/`dirent_slot_patch`/add_direntフィル/`fat_unlink`/`fat_rmdir`）から1対に。旧`dirent_first_cluster`は削除。
+- **`name_route`**: 8.3 vs LFN名前経路判定（セパレータ拒否→8.3変換→LFN上限）を`fat_add_dirent`/`fat_write_file`で共有。
+- **`fat_errstr[]`配列**: `fat_strerror`のswitchをenum順インデックス配列へ。
+- **`root_region_check`+`dir_walk_start`**: `fat_dir_open`と`dir_scan`の重複プロローグ（固定ルート範囲検査・sentinel解決・bounds・dot不変量・チェーン突入）を共有。
+- **lookup統合**: `lookup_cb`/`LookupArg`（コールバック経由の名前一致）を削除し、`lookup_in_dir`を`dir_scan`の名前クエリ（`DirScan.match_lfn`/`match_has_lfn`追加）で再構成。名前一致規則（LFN優先・8.3別名フォールバック・ASCII大小区別なし・ラベル除外）が`dir_scan_feed`の1実装に。
+- **死蔵チェック削除**: `cluster_size == 0`検査5箇所（`fat_ctx_init`がbps≥512・spc≥1を保証済みのため到達不能）。`fat_name_from_83`のextLen再計算も単一化。
+
+### 31.2 温存した教材の核
+
+クラッシュ整合順序（dirent→chain解放、LFN run→8.3、data chain→dirent、shrink=size→free、grow=data→size）、`fat_ctx_init`のBPB検証列、`lfn_join`検証、FAT12/FAT32のread-modify-write、`fat_file_write`のガード（元実装にBrent/boundsがないことの同値論証は学習者に過剰なため原文維持）。
+
+### 31.3 検証結果
+
+- クリーンビルド後`make check` = **242 ok (121×2)・警告ゼロ**（`-Wall -Wextra -Wshadow -Wstrict-prototypes`、通常+ASan/UBSan）。
+- `make demo12/16/32` 全exit 0・stderr空。元コード（stash）とリファクタ後の`demof12.fat` md5完全一致（`0b0ed64d…`=コミット済みフィクスチャ。§29.4記載の`f9d775d1…`は§30.1フィクスチャ再生成前の旧値）。
+- `fat_core.c` 2987行 → 2919行（純減68行。ヘルパ化に伴う設計意図コメントの追加が行数削減を一部相殺——重複実装の数は構造的に半減）。
+
+### 31.4 残課題
+
+- ウェーブ2（fat.h公開API統合: `fat_iter_dir`削除・カーソル一本化）、ウェーブ3（テスト分割+軽量フレームワーク）は後続コミットで実施。
